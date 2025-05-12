@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+langchain
+langgraph
+langchain-google-genai # For Google Gemini
+python-dotenv
+PyYAML
+diskcache
+pydantic >= 2.0
