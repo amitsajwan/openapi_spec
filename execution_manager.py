@@ -3,7 +3,7 @@ import logging
 from typing import Any, Callable, Awaitable, Dict, Optional
 from collections import defaultdict
 
-from langgraph.graph import CompiledGraph
+# from langgraph.graph import CompiledGraph # Removed CompiledGraph import
 from langgraph.types import Interrupt # To catch Interrupts raised by nodes
 from langgraph.checkpoint.base import BaseCheckpointSaver # For type hinting
 
@@ -23,7 +23,7 @@ class GraphExecutionManager:
     """
     def __init__(
         self,
-        runnable_graph: CompiledGraph,
+        runnable_graph: Any, # MODIFIED: Type hint to Any
         # websocket_callback signature: (event_type: str, data: Dict, graph2_thread_id: Optional[str])
         # This callback is provided by main.py. It sends messages back to the client
         # AND is now responsible for updating Graph 1's BotState via planning_checkpointer.
@@ -31,9 +31,9 @@ class GraphExecutionManager:
         planning_checkpointer: BaseCheckpointSaver, # Checkpointer for Graph 1 (BotState)
         main_planning_session_id: str # Session ID for Graph 1, used for context
     ):
-        self.runnable_graph: CompiledGraph = runnable_graph
+        self.runnable_graph: Any = runnable_graph # MODIFIED: Type hint to Any
         self.websocket_callback = websocket_callback
-        self.planning_checkpointer = planning_checkpointer # Stored for potential future use
+        self.planning_checkpointer = planning_checkpointer # Stored for potential future use if manager needs to update Graph 1 state directly
         self.main_planning_session_id = main_planning_session_id # Stored for context, logging
         
         # Resume queues are keyed by the main_planning_session_id, as one Graph 1 session
@@ -50,6 +50,12 @@ class GraphExecutionManager:
         `resume_data` typically includes information to identify the confirmation
         (e.g., a 'confirmation_key' from the Interrupt) and the user's decision/input.
         """
+        # Ensure the queue exists for this main_session_id before trying to put data
+        if main_session_id not in self.resume_queues:
+             self.resume_queues[main_session_id] = asyncio.Queue() # Initialize if not present
+             logger.info(f"Initialized resume queue for Main Session ID: {main_session_id} on first submit.")
+
+
         if main_session_id in self.resume_queues: # Check against the provided main_session_id
             try:
                 await self.resume_queues[main_session_id].put(resume_data)
@@ -59,24 +65,24 @@ class GraphExecutionManager:
                 logger.error(f"Error putting resume data onto queue for Main Session ID {main_session_id}: {e}")
                 return False
         else:
-            logger.warning(f"No active resume queue found for Main Session ID: {main_session_id}. Cannot submit resume data for its Graph 2.")
+            # This case should be less likely now with the initialization above, but kept for safety.
+            logger.warning(f"No active resume queue found for Main Session ID: {main_session_id} despite attempt to initialize. Cannot submit resume data for its Graph 2.")
             return False
 
     async def execute_workflow(
         self,
         initial_graph_values: Dict[str, Any], # Initial values for ExecutionGraphState fields
         config: Dict[str, Any], # Must include {"configurable": {"thread_id": "..."}} for Graph 2's LangGraph instance
-        # main_session_id parameter is effectively self.main_planning_session_id for this instance.
-        # It's passed to ensure clarity if this method were called from a context without `self`.
     ) -> Optional[Dict[str, Any]]: # Returns final state values as a dictionary, or None on critical error
         
         graph2_thread_id = config.get("configurable", {}).get("thread_id")
         if not graph2_thread_id:
             # Use self.main_planning_session_id for the callback's session context here
+            # The callback needs the Graph 2 thread ID as its third argument for its own context.
             await self.websocket_callback(
                 "execution_error", 
                 {"error": "ConfigurationError: thread_id is missing in config for ExecutionGraph (Graph 2)."}, 
-                self.main_planning_session_id # Context for the callback
+                graph2_thread_id # Pass graph2_thread_id even if None, callback might handle it
             )
             # This error is critical for Graph 2, so raise it.
             raise ValueError("thread_id is missing in config['configurable']['thread_id'] for ExecutionGraph (Graph 2).")
@@ -119,6 +125,10 @@ class GraphExecutionManager:
                 
                 try:
                     # Use self.main_planning_session_id to get the correct resume queue
+                    # Ensure queue is initialized if this is the first time it's accessed for this session_id
+                    if self.main_planning_session_id not in self.resume_queues:
+                        self.resume_queues[self.main_planning_session_id] = asyncio.Queue()
+
                     resume_data = await asyncio.wait_for(self.resume_queues[self.main_planning_session_id].get(), timeout=600.0) # 10 min timeout
                     logger.info(f"Graph 2 Workflow resumed for its ThreadID '{graph2_thread_id}' with data for '{interrupted_node_name}'. Data: {str(resume_data)[:100]}")
 
