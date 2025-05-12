@@ -108,22 +108,17 @@ async def send_websocket_message(
     websocket: WebSocket,
     msg_type: str,
     content: Any,
-    session_id: str, # This is the main session_id (Graph 1's thread_id)
+    session_id: str, 
     source_graph: Optional[Literal["system", "graph1_planning", "graph2_execution"]] = "graph1_planning",
-    graph2_thread_id: Optional[str] = None # Specific thread_id for Graph 2 if message originates there
+    graph2_thread_id: Optional[str] = None 
 ):
-    """
-    Helper function to send JSON messages over WebSocket.
-    `session_id` is always Graph 1's session.
-    `graph2_thread_id` is used if the message is from a specific Graph 2 instance.
-    """
     try:
         if websocket.client_state == WebSocketState.CONNECTED:
             payload = {
                 "type": msg_type,
                 "source": source_graph,
                 "content": content,
-                "session_id": session_id, # Main session ID for client tracking
+                "session_id": session_id, 
                 "graph2_thread_id": graph2_thread_id if graph2_thread_id else session_id 
             }
             await websocket.send_json(payload)
@@ -136,17 +131,17 @@ async def send_websocket_message(
 @app.websocket("/ws/openapi_agent")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    session_id = str(uuid.uuid4()) # This is Graph 1's session_id / thread_id
+    session_id = str(uuid.uuid4()) 
     logger.info(f"WebSocket connection accepted. Session ID (Graph 1): {session_id}")
 
     if langgraph_planning_app is None or api_executor_instance is None or planning_checkpointer is None:
         await send_websocket_message(websocket, "error", "Backend agent, API executor, or checkpointer not initialized. Check server logs.", session_id, "system")
-        await websocket.close(code=1011) # Internal server error
+        await websocket.close(code=1011) 
         return
 
     await send_websocket_message(websocket, "info", {"message": "Connection established. Ready for OpenAPI spec or queries."}, session_id, "system")
     
-    current_bot_state: Optional[BotState] = None # Holds the state for Graph 1
+    current_bot_state: Optional[BotState] = None 
 
     default_put_metadata = {"source": "manual_checkpoint_update", "step": -1} 
 
@@ -160,7 +155,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
         if event_type in ["execution_completed", "execution_failed", "workflow_timeout"]:
             logger.info(f"[{session_id}] Graph 2 (ThreadID: {graph2_thread_id_param}) reported terminal state: {event_type}. Updating Graph 1 BotState.")
-            graph1_config = {"configurable": {"thread_id": session_id, "checkpoint_ns": ""}}
+            # MODIFIED: Add channel_versions to graph1_config
+            graph1_config = {"configurable": {"thread_id": session_id, "checkpoint_ns": "", "channel_versions": {}}}
             try:
                 checkpoint_data = planning_checkpointer.get(graph1_config) 
                 if checkpoint_data: 
@@ -179,16 +175,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     if data.get("final_state", {}).get("error"):
                          bot_state_to_update.response = bot_state_to_update.response or str(data["final_state"]["error"])
 
-                    # MODIFIED: Add 'id' and 'ts' to the checkpoint structure for put()
                     updated_checkpoint_content = {
-                        "id": str(uuid.uuid4()), # Generate a new unique ID for this checkpoint save
+                        "id": str(uuid.uuid4()), 
                         "ts": datetime.now(timezone.utc).isoformat(),
                         "channel_values": bot_state_to_update.model_dump(exclude_none=True),
                         "pending_sends": checkpoint_data.get("pending_sends", []) 
                     }
 
                     planning_checkpointer.put(
-                        graph1_config, 
+                        graph1_config, # Already includes channel_versions
                         updated_checkpoint_content, 
                         default_put_metadata, 
                         {}  
@@ -229,7 +224,8 @@ async def websocket_endpoint(websocket: WebSocket):
             if is_resume_for_graph2 and resume_payload_for_graph2:
                 execution_manager_instance = active_graph2_executors.get(session_id)
                 if execution_manager_instance:
-                    graph1_config_for_resume_check = {"configurable": {"thread_id": session_id, "checkpoint_ns": ""}}
+                    # MODIFIED: Add channel_versions here as well for the .get()
+                    graph1_config_for_resume_check = {"configurable": {"thread_id": session_id, "checkpoint_ns": "", "channel_versions": {}}}
                     latest_checkpoint_data = planning_checkpointer.get(graph1_config_for_resume_check)
                     temp_bot_state_for_resume: Optional[BotState] = None
                     if latest_checkpoint_data:
@@ -257,7 +253,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     await send_websocket_message(websocket, "warning", "Cannot resume: No active execution workflow found for this session.", session_id, "system")
                 continue 
 
-            planning_graph_config = {"configurable": {"thread_id": session_id, "checkpoint_ns": ""}}
+            # MODIFIED: Add channel_versions to planning_graph_config
+            planning_graph_config = {"configurable": {"thread_id": session_id, "checkpoint_ns": "", "channel_versions": {}}}
             
             checkpoint_data = planning_checkpointer.get(planning_graph_config)
             if checkpoint_data: 
@@ -328,7 +325,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 await send_websocket_message(websocket, "error", f"Planning Agent error: {str(e_planning_graph)[:150]}", session_id, "system")
                 if current_bot_state:
                     bot_state_dump = current_bot_state.model_dump(exclude_none=True)
-                    # MODIFIED: Add 'id' and 'ts' to the checkpoint structure for put()
                     checkpoint_to_save_on_error = {
                         "id": str(uuid.uuid4()),
                         "ts": datetime.now(timezone.utc).isoformat(),
@@ -336,7 +332,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "pending_sends": [] 
                     }
                     planning_checkpointer.put(
-                        planning_graph_config, 
+                        planning_graph_config, # Already includes channel_versions
                         checkpoint_to_save_on_error,
                         default_put_metadata,
                         {}  
@@ -376,7 +372,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         ).model_dump(exclude_none=True)
 
                         graph2_thread_id = f"{session_id}_exec_{uuid.uuid4().hex[:6]}" 
-                        execution_graph_config = {"configurable": {"thread_id": graph2_thread_id, "checkpoint_ns": ""}} 
+                        # MODIFIED: Add channel_versions to execution_graph_config
+                        execution_graph_config = {"configurable": {"thread_id": graph2_thread_id, "checkpoint_ns": "", "channel_versions": {}}} 
                         
                         logger.info(f"[{session_id}] ExecutionManager (Graph 2) created for its ThreadID '{graph2_thread_id}'. Starting workflow stream as a background task.")
                         await send_websocket_message(websocket, "info", f"Execution phase started (ID: {graph2_thread_id}). Monitoring API calls...", session_id, "graph2_execution", graph2_thread_id)
@@ -396,22 +393,18 @@ async def websocket_endpoint(websocket: WebSocket):
             
             if current_bot_state:
                 bot_state_dump = current_bot_state.model_dump(exclude_none=True)
-                # MODIFIED: Add 'id' and 'ts' to the checkpoint structure for put()
                 checkpoint_to_save = {
-                    "id": str(uuid.uuid4()), # Generate a new unique ID for this checkpoint save
+                    "id": str(uuid.uuid4()), 
                     "ts": datetime.now(timezone.utc).isoformat(),
                     "channel_values": bot_state_dump,
                     "pending_sends": [] 
                 }
-                # This check is a bit redundant if BotState doesn't have pending_sends,
-                # but harmless. The main thing is that the top-level checkpoint_to_save
-                # has pending_sends.
                 if "pending_sends" in bot_state_dump: 
                      checkpoint_to_save["pending_sends"] = bot_state_dump.pop("pending_sends", [])
 
 
                 planning_checkpointer.put(
-                    planning_graph_config, 
+                    planning_graph_config, # Already includes channel_versions
                     checkpoint_to_save,
                     default_put_metadata,
                     {}  
