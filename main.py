@@ -6,7 +6,7 @@ import os
 import sys
 import asyncio
 from typing import Any, Dict, Optional, Callable, Awaitable, Literal
-from datetime import datetime, timezone # Added for timestamp
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse
@@ -17,8 +17,8 @@ from starlette.websockets import WebSocketState
 from models import BotState, GraphOutput as PlanSchema, ExecutionGraphState
 
 # --- Graph 1 (Planning) Components ---
-from graph import build_graph
-from llm_config import initialize_llms # Assuming you have this file
+from graph import build_graph 
+from llm_config import initialize_llms 
 
 # --- Graph 2 (Execution) Components ---
 from execution_graph_definition import ExecutionGraphDefinition
@@ -28,8 +28,6 @@ from execution_manager import GraphExecutionManager
 from api_executor import APIExecutor as UserAPIExecutor
 
 # --- Utilities & Checkpointing ---
-from langgraph.checkpoint.memory import MemorySaver # Using MemorySaver for Graph 1
-from langgraph.checkpoint.base import BaseCheckpointSaver # For type hinting
 from utils import SCHEMA_CACHE
 
 # Logging Setup
@@ -47,17 +45,14 @@ if not os.path.exists(STATIC_DIR):
     os.makedirs(STATIC_DIR)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# Global instances, initialized on startup
-langgraph_planning_app: Optional[Any] = None # Compiled LangGraph for Graph 1
+langgraph_planning_app: Optional[Any] = None 
 api_executor_instance: Optional[UserAPIExecutor] = None
-planning_checkpointer: Optional[BaseCheckpointSaver] = None # Checkpointer for Graph 1
-# Stores active Graph 2 execution managers, keyed by Graph 1's session_id
 active_graph2_executors: Dict[str, GraphExecutionManager] = {}
 
 
 @app.on_event("startup")
 async def startup_event():
-    global langgraph_planning_app, api_executor_instance, planning_checkpointer
+    global langgraph_planning_app, api_executor_instance
     logger.info("FastAPI startup: Initializing LLMs, API Executor, and Planning Graph (Graph 1)...")
     try:
         router_llm_instance, worker_llm_instance = initialize_llms()
@@ -68,23 +63,19 @@ async def startup_event():
         )
         logger.info("User's APIExecutor instance created successfully.")
 
-        planning_checkpointer = MemorySaver() # Initialize checkpointer for Graph 1
-        logger.info("Planning Graph (Graph 1) checkpointer (MemorySaver) initialized.")
-
         langgraph_planning_app = build_graph(
             router_llm_instance,
             worker_llm_instance,
             api_executor_instance,
-            planning_checkpointer # Pass the checkpointer to Graph 1 builder
+            None # Pass None for checkpointer to build_graph
         )
-        logger.info("Main Planning LangGraph (Graph 1) built and compiled successfully.")
+        logger.info("Main Planning LangGraph (Graph 1) built and compiled (NO CHECKPOINTER).")
     except Exception as e:
         logger.critical(f"CRITICAL FAILURE during startup: {e}", exc_info=True)
         langgraph_planning_app = None
         if api_executor_instance and hasattr(api_executor_instance, 'close'):
             await api_executor_instance.close()
         api_executor_instance = None
-        planning_checkpointer = None # Ensure it's None if setup fails
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -98,7 +89,7 @@ async def shutdown_event():
     
     if SCHEMA_CACHE and hasattr(SCHEMA_CACHE, 'close'):
         try:
-            SCHEMA_CACHE.close() # Assuming SCHEMA_CACHE is the diskcache.Cache instance
+            SCHEMA_CACHE.close() 
             logger.info("Schema cache (DiskCache) closed.")
         except Exception as e:
             logger.error(f"Error closing schema cache: {e}", exc_info=True)
@@ -134,65 +125,46 @@ async def websocket_endpoint(websocket: WebSocket):
     session_id = str(uuid.uuid4()) 
     logger.info(f"WebSocket connection accepted. Session ID (Graph 1): {session_id}")
 
-    if langgraph_planning_app is None or api_executor_instance is None or planning_checkpointer is None:
-        await send_websocket_message(websocket, "error", "Backend agent, API executor, or checkpointer not initialized. Check server logs.", session_id, "system")
+    if langgraph_planning_app is None or api_executor_instance is None:
+        await send_websocket_message(websocket, "error", "Backend agent or API executor not initialized. Check server logs.", session_id, "system")
         await websocket.close(code=1011) 
         return
 
     await send_websocket_message(websocket, "info", {"message": "Connection established. Ready for OpenAPI spec or queries."}, session_id, "system")
     
-    current_bot_state: Optional[BotState] = None 
-
-    default_put_metadata = {"source": "manual_checkpoint_update", "step": -1} 
+    # This BotState will be reset for each new message if no checkpointer is used for Graph 1
+    # For simplicity with no checkpointing, we re-initialize it per message cycle,
+    # but retain some key fields like schema if already parsed in this session.
+    # A more sophisticated session management would be needed for true continuity without LangGraph checkpointing.
+    # For now, this demonstrates the "no checkpointing for Graph 1" approach.
+    # We'll keep a session-scoped BotState that resets most fields per message.
+    _session_bot_state_store: Dict[str, Any] = {} # Simple store for schema across messages in one session
 
 
     async def graph2_ws_callback_with_state_update(
         event_type: str,
         data: Dict[str, Any],
-        graph2_thread_id_param: Optional[str] 
+        graph2_thread_id_param: Optional[str],
+        bot_state_instance: BotState # Pass the current BotState instance
     ):
         await send_websocket_message(websocket, event_type, data, session_id, "graph2_execution", graph2_thread_id_param)
 
         if event_type in ["execution_completed", "execution_failed", "workflow_timeout"]:
-            logger.info(f"[{session_id}] Graph 2 (ThreadID: {graph2_thread_id_param}) reported terminal state: {event_type}. Updating Graph 1 BotState.")
-            # MODIFIED: Use 'channel_version' (singular) as per error
-            graph1_config = {"configurable": {"thread_id": session_id, "checkpoint_ns": "", "channel_version": {}}}
-            try:
-                checkpoint_data = planning_checkpointer.get(graph1_config) 
-                if checkpoint_data: 
-                    raw_channel_values = checkpoint_data.get("channel_values", {}) 
-                    bot_state_to_update = BotState.model_validate(raw_channel_values)
-                    
-                    if event_type == "execution_completed":
-                        bot_state_to_update.workflow_execution_status = "completed"
-                    elif event_type == "workflow_timeout":
-                        bot_state_to_update.workflow_execution_status = "failed" 
-                        bot_state_to_update.response = data.get("message", "Workflow timed out.")
-                    else: 
-                        bot_state_to_update.workflow_execution_status = "failed"
-                    
-                    bot_state_to_update.workflow_execution_results = data.get("final_state", {})
-                    if data.get("final_state", {}).get("error"):
-                         bot_state_to_update.response = bot_state_to_update.response or str(data["final_state"]["error"])
-
-                    updated_checkpoint_content = {
-                        "id": str(uuid.uuid4()), 
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                        "channel_values": bot_state_to_update.model_dump(exclude_none=True),
-                        "pending_sends": checkpoint_data.get("pending_sends", []) 
-                    }
-
-                    planning_checkpointer.put(
-                        graph1_config, # Already includes channel_version
-                        updated_checkpoint_content, 
-                        default_put_metadata, 
-                        {}  
-                    )
-                    logger.info(f"[{session_id}] Graph 1 BotState updated and checkpointed with Graph 2 final status: {bot_state_to_update.workflow_execution_status}")
-                else:
-                    logger.warning(f"[{session_id}] Could not retrieve Graph 1 BotState for update after Graph 2 finished (checkpoint was empty).")
-            except Exception as e_update:
-                logger.error(f"[{session_id}] Error updating Graph 1 BotState after Graph 2 finished: {e_update}", exc_info=True)
+            logger.info(f"[{session_id}] Graph 2 (ThreadID: {graph2_thread_id_param}) reported terminal state: {event_type}. Updating in-memory BotState for current request.")
+            
+            if event_type == "execution_completed":
+                bot_state_instance.workflow_execution_status = "completed"
+            elif event_type == "workflow_timeout":
+                bot_state_instance.workflow_execution_status = "failed" 
+                bot_state_instance.response = data.get("message", "Workflow timed out.")
+            else: 
+                bot_state_instance.workflow_execution_status = "failed"
+            
+            bot_state_instance.workflow_execution_results = data.get("final_state", {})
+            if data.get("final_state", {}).get("error"):
+                 bot_state_instance.response = bot_state_instance.response or str(data["final_state"]["error"])
+            
+            logger.info(f"[{session_id}] In-memory BotState updated with Graph 2 final status: {bot_state_instance.workflow_execution_status}")
 
     try:
         while True:
@@ -202,6 +174,27 @@ async def websocket_endpoint(websocket: WebSocket):
 
             if not user_input_text:
                 continue
+            
+            # Initialize BotState for this message cycle
+            # Preserve schema-related info if it was parsed in this session
+            current_bot_state = BotState(
+                session_id=session_id,
+                user_input=user_input_text,
+                openapi_spec_text=_session_bot_state_store.get("openapi_spec_text"),
+                openapi_schema=_session_bot_state_store.get("openapi_schema"),
+                schema_cache_key=_session_bot_state_store.get("schema_cache_key"),
+                schema_summary=_session_bot_state_store.get("schema_summary"),
+                identified_apis=_session_bot_state_store.get("identified_apis", []),
+                payload_descriptions=_session_bot_state_store.get("payload_descriptions", {})
+                # Other fields will default or be set by the router/graph
+            )
+            # Reset transient fields for the new cycle
+            current_bot_state.response = None
+            current_bot_state.final_response = "" 
+            current_bot_state.next_step = None
+            current_bot_state.intent = None 
+            if current_bot_state.scratchpad: current_bot_state.scratchpad.pop('graph_to_send', None)
+
 
             is_resume_for_graph2 = False
             resume_payload_for_graph2: Optional[Dict[str, Any]] = None
@@ -224,16 +217,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if is_resume_for_graph2 and resume_payload_for_graph2:
                 execution_manager_instance = active_graph2_executors.get(session_id)
                 if execution_manager_instance:
-                    # MODIFIED: Use 'channel_version' (singular)
-                    graph1_config_for_resume_check = {"configurable": {"thread_id": session_id, "checkpoint_ns": "", "channel_version": {}}}
-                    latest_checkpoint_data = planning_checkpointer.get(graph1_config_for_resume_check)
-                    temp_bot_state_for_resume: Optional[BotState] = None
-                    if latest_checkpoint_data:
-                        try:
-                            temp_bot_state_for_resume = BotState.model_validate(latest_checkpoint_data.get("channel_values", {}))
-                        except Exception: pass
-                    
-                    if temp_bot_state_for_resume and temp_bot_state_for_resume.workflow_execution_status == "paused_for_confirmation":
+                    if current_bot_state.workflow_execution_status == "paused_for_confirmation":
                         logger.info(f"[{session_id}] User provided resume data for Graph 2. Submitting to Execution Manager.")
                         submitted = await execution_manager_instance.submit_resume_data(
                             main_session_id=session_id, 
@@ -241,11 +225,11 @@ async def websocket_endpoint(websocket: WebSocket):
                         )
                         if submitted:
                             await send_websocket_message(websocket, "info", "Resume data submitted to execution workflow. It will attempt to continue.", session_id, "graph2_execution")
-                            if current_bot_state: current_bot_state.workflow_execution_status = "running"
+                            current_bot_state.workflow_execution_status = "running"
                         else:
                              await send_websocket_message(websocket, "error", "Failed to submit resume data to the execution workflow.", session_id, "graph2_execution")
                     else:
-                        status_msg = temp_bot_state_for_resume.workflow_execution_status if temp_bot_state_for_resume else (current_bot_state.workflow_execution_status if current_bot_state else 'Unknown')
+                        status_msg = current_bot_state.workflow_execution_status
                         logger.warning(f"[{session_id}] Received resume data, but workflow status is '{status_msg}', not 'paused_for_confirmation'.")
                         await send_websocket_message(websocket, "warning", f"Cannot resume: Workflow is not currently paused for confirmation (current status: {status_msg}).", session_id, "system")
                 else:
@@ -253,48 +237,27 @@ async def websocket_endpoint(websocket: WebSocket):
                     await send_websocket_message(websocket, "warning", "Cannot resume: No active execution workflow found for this session.", session_id, "system")
                 continue 
 
-            # MODIFIED: Use 'channel_version' (singular)
-            planning_graph_config = {"configurable": {"thread_id": session_id, "checkpoint_ns": "", "channel_version": {}}}
+            await send_websocket_message(websocket, "status", "Processing with Planning Graph...", session_id, "graph1_planning")
+            planning_graph_config = {"configurable": {"thread_id": session_id}} 
             
-            checkpoint_data = planning_checkpointer.get(planning_graph_config)
-            if checkpoint_data: 
-                try:
-                    raw_channel_values = checkpoint_data.get("channel_values", {})
-                    current_bot_state = BotState.model_validate(raw_channel_values)
-                except Exception as e_load_state:
-                    logger.warning(f"[{session_id}] Error loading BotState from checkpoint: {e_load_state}. Initializing new.", exc_info=False)
-                    current_bot_state = BotState(session_id=session_id)
-            else: 
-                current_bot_state = BotState(session_id=session_id)
-
-            current_bot_state.user_input = user_input_text
-            current_bot_state.response = None
-            current_bot_state.final_response = "" 
-            current_bot_state.next_step = None
-            current_bot_state.intent = None 
-            if current_bot_state.scratchpad: current_bot_state.scratchpad.pop('graph_to_send', None)
-
 
             try:
                 graph1_input_for_astream = current_bot_state.model_dump(exclude_none=True)
-                if "pending_sends" not in graph1_input_for_astream:
-                     graph1_input_for_astream["pending_sends"] = []
-
 
                 async for event in langgraph_planning_app.astream_events(graph1_input_for_astream, config=planning_graph_config, version="v1"): 
                     if event["event"] == "on_chain_end" or event["event"] == "on_tool_end": 
                         node_output_data = event["data"].get("output")
-                        if isinstance(node_output_data, BotState):
-                            current_bot_state = node_output_data
+                        if isinstance(node_output_data, BotState): 
+                            current_bot_state = node_output_data # Replace if full state is output
                         elif isinstance(node_output_data, dict): 
-                            try:
-                                current_bot_state = BotState.model_validate(node_output_data)
-                            except Exception as e_val:
-                                logger.error(f"[{session_id}] Error validating Graph 1 node output into BotState: {e_val}. Output: {str(node_output_data)[:200]}")
+                            # MODIFIED: Correctly update BotState from dict
+                            current_bot_state_dict = current_bot_state.model_dump(exclude_none=True)
+                            current_bot_state_dict.update(node_output_data)
+                            current_bot_state = BotState.model_validate(current_bot_state_dict)
                         
-                        if current_bot_state and current_bot_state.response:
+                        if current_bot_state.response:
                              await send_websocket_message(websocket, "intermediate", current_bot_state.response, session_id, "graph1_planning")
-                        if current_bot_state and current_bot_state.scratchpad and 'graph_to_send' in current_bot_state.scratchpad:
+                        if current_bot_state.scratchpad and 'graph_to_send' in current_bot_state.scratchpad:
                             graph_json_plan_to_send = current_bot_state.scratchpad.pop('graph_to_send', None)
                             if graph_json_plan_to_send:
                                 try:
@@ -304,62 +267,60 @@ async def websocket_endpoint(websocket: WebSocket):
                     
                     if event["event"] == "on_graph_end": 
                         final_planning_output_data = event["data"].get("output") 
-                        if final_planning_output_data and isinstance(final_planning_output_data, dict):
-                             current_bot_state = BotState.model_validate(final_planning_output_data)
-                        elif isinstance(final_planning_output_data, BotState): 
-                             current_bot_state = final_planning_output_data
-                        logger.info(f"[{session_id}] Planning Graph (Graph 1) finished run. Final response: '{str(current_bot_state.final_response if current_bot_state else 'N/A')[:100]}...'")
+                        if isinstance(final_planning_output_data, BotState):
+                            current_bot_state = final_planning_output_data
+                        elif final_planning_output_data and isinstance(final_planning_output_data, dict):
+                             # MODIFIED: Correctly update BotState from dict
+                            current_bot_state_dict = current_bot_state.model_dump(exclude_none=True)
+                            current_bot_state_dict.update(final_planning_output_data)
+                            current_bot_state = BotState.model_validate(current_bot_state_dict)
+                        logger.info(f"[{session_id}] Planning Graph (Graph 1) finished run. Final response: '{str(current_bot_state.final_response)[:100]}...'")
                         break 
-                
-                if not current_bot_state: 
-                    logger.error(f"[{session_id}] CRITICAL: BotState is None after Planning Graph (Graph 1) stream. This indicates a severe issue.");
-                    await send_websocket_message(websocket, "error", "Critical error in planning agent.", session_id, "system")
-                    continue
                 
                 final_response_from_graph1 = current_bot_state.final_response or current_bot_state.response 
                 if final_response_from_graph1:
                     await send_websocket_message(websocket, "final", final_response_from_graph1, session_id, "graph1_planning")
 
+                # If a spec was parsed, store its details in the session store
+                if current_bot_state.input_is_spec and current_bot_state.openapi_schema:
+                    _session_bot_state_store["openapi_spec_text"] = current_bot_state.openapi_spec_text
+                    _session_bot_state_store["openapi_schema"] = current_bot_state.openapi_schema
+                    _session_bot_state_store["schema_cache_key"] = current_bot_state.schema_cache_key
+                    _session_bot_state_store["schema_summary"] = current_bot_state.schema_summary
+                    _session_bot_state_store["identified_apis"] = current_bot_state.identified_apis
+                    _session_bot_state_store["payload_descriptions"] = current_bot_state.payload_descriptions
+
+
             except Exception as e_planning_graph:
                 logger.critical(f"[{session_id}] Planning Graph (Graph 1) execution error: {e_planning_graph}", exc_info=True)
                 await send_websocket_message(websocket, "error", f"Planning Agent error: {str(e_planning_graph)[:150]}", session_id, "system")
-                if current_bot_state:
-                    bot_state_dump = current_bot_state.model_dump(exclude_none=True)
-                    checkpoint_to_save_on_error = {
-                        "id": str(uuid.uuid4()),
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                        "channel_values": bot_state_dump,
-                        "pending_sends": [] 
-                    }
-                    planning_checkpointer.put(
-                        planning_graph_config, # Already includes channel_version
-                        checkpoint_to_save_on_error,
-                        default_put_metadata,
-                        {}  
-                    )
                 continue
 
-            if current_bot_state and current_bot_state.workflow_execution_status == "pending_start":
+            if current_bot_state.workflow_execution_status == "pending_start":
                 logger.info(f"[{session_id}] Planning Graph signaled 'pending_start'. Initiating Execution Graph (Graph 2).")
-                execution_plan_from_graph1: Optional[PlanSchema] = getattr(current_bot_state, 'execution_graph', None)
+                execution_plan_from_graph1: Optional[PlanSchema] = current_bot_state.execution_graph
 
                 if not execution_plan_from_graph1 or not isinstance(execution_plan_from_graph1, PlanSchema):
                     logger.error(f"[{session_id}] Cannot start Execution Graph: 'execution_graph' (plan) is missing or invalid in BotState.")
                     await send_websocket_message(websocket, "error", "Execution plan from planning phase is missing or invalid.", session_id, "system")
-                    if current_bot_state: current_bot_state.workflow_execution_status = "failed"
+                    current_bot_state.workflow_execution_status = "failed"
                 elif not api_executor_instance: 
                     logger.error(f"[{session_id}] Cannot start Execution Graph: api_executor_instance is not available.")
                     await send_websocket_message(websocket, "error", "Internal Server Error: API Executor not ready.", session_id, "system")
-                    if current_bot_state: current_bot_state.workflow_execution_status = "failed"
+                    current_bot_state.workflow_execution_status = "failed"
                 else:
                     try:
                         exec_graph_def = ExecutionGraphDefinition(execution_plan_from_graph1, api_executor_instance)
                         runnable_exec_graph = exec_graph_def.get_runnable_graph()
                         
+                        # Pass the current_bot_state instance to the callback factory
+                        bound_graph2_callback = lambda event_type_cb, data_cb, g2_thread_id_cb: \
+                            graph2_ws_callback_with_state_update(event_type_cb, data_cb, g2_thread_id_cb, current_bot_state)
+
                         exec_manager = GraphExecutionManager(
                             runnable_graph=runnable_exec_graph,
-                            websocket_callback=graph2_ws_callback_with_state_update, 
-                            planning_checkpointer=planning_checkpointer, 
+                            websocket_callback=bound_graph2_callback, 
+                            planning_checkpointer=None, # Not used by Graph 2 manager directly
                             main_planning_session_id=session_id 
                         )
                         active_graph2_executors[session_id] = exec_manager
@@ -372,12 +333,11 @@ async def websocket_endpoint(websocket: WebSocket):
                         ).model_dump(exclude_none=True)
 
                         graph2_thread_id = f"{session_id}_exec_{uuid.uuid4().hex[:6]}" 
-                        # MODIFIED: Use 'channel_version' (singular)
-                        execution_graph_config = {"configurable": {"thread_id": graph2_thread_id, "checkpoint_ns": "", "channel_version": {}}} 
+                        execution_graph_config = {"configurable": {"thread_id": graph2_thread_id}} 
                         
                         logger.info(f"[{session_id}] ExecutionManager (Graph 2) created for its ThreadID '{graph2_thread_id}'. Starting workflow stream as a background task.")
                         await send_websocket_message(websocket, "info", f"Execution phase started (ID: {graph2_thread_id}). Monitoring API calls...", session_id, "graph2_execution", graph2_thread_id)
-                        if current_bot_state: current_bot_state.workflow_execution_status = "running"
+                        current_bot_state.workflow_execution_status = "running"
 
                         asyncio.create_task(
                             exec_manager.execute_workflow(exec_initial_values, execution_graph_config)
@@ -385,32 +345,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     except ValueError as ve: 
                         logger.error(f"[{session_id}] Value error setting up Execution Graph (Graph 2): {ve}", exc_info=True)
                         await send_websocket_message(websocket, "error", f"Setup error for execution: {str(ve)[:150]}", session_id, "system")
-                        if current_bot_state: current_bot_state.workflow_execution_status = "failed"
+                        current_bot_state.workflow_execution_status = "failed"
                     except Exception as e_exec_setup:
                         logger.error(f"[{session_id}] Failed to create/start Execution Graph (Graph 2): {e_exec_setup}", exc_info=True)
                         await send_websocket_message(websocket, "error", f"Failed to start execution phase: {str(e_exec_setup)[:150]}", session_id, "system")
-                        if current_bot_state: current_bot_state.workflow_execution_status = "failed"
+                        current_bot_state.workflow_execution_status = "failed"
             
-            if current_bot_state:
-                bot_state_dump = current_bot_state.model_dump(exclude_none=True)
-                checkpoint_to_save = {
-                    "id": str(uuid.uuid4()), 
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "channel_values": bot_state_dump,
-                    "pending_sends": [] 
-                }
-                if "pending_sends" in bot_state_dump: 
-                     checkpoint_to_save["pending_sends"] = bot_state_dump.pop("pending_sends", [])
-
-
-                planning_checkpointer.put(
-                    planning_graph_config, # Already includes channel_version
-                    checkpoint_to_save,
-                    default_put_metadata,
-                    {}  
-                )
-                logger.debug(f"[{session_id}] Graph 1 BotState checkpointed. Workflow status: {current_bot_state.workflow_execution_status}")
-
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected: {session_id}.")
     except Exception as e_outer_loop:
