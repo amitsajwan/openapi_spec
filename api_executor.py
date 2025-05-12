@@ -37,6 +37,7 @@ class APIExecutor:
     def _construct_url(self, endpoint: str) -> str:
         """Constructs the full URL, prepending base_url if endpoint is relative."""
         if self.base_url and not endpoint.startswith(('http://', 'https://')):
+            # Ensure no double slashes if base_url ends with / and endpoint starts with /
             return self.base_url.rstrip('/') + '/' + endpoint.lstrip('/')
         return endpoint
 
@@ -79,17 +80,27 @@ class APIExecutor:
         # Prepare headers: start with default, update with custom, then specific request headers
         final_headers = self.default_headers.copy()
         if headers:
-            final_headers.update({str(k): str(v) for k, v in headers.items()}) # Ensure headers are strings
+            # Ensure all header keys and values are strings, as httpx expects
+            final_headers.update({str(k): str(v) for k, v in headers.items()})
 
         # Ensure Content-Type for relevant methods if payload exists and not already set
         if request_method in ["POST", "PUT", "PATCH"] and payload is not None:
-            if 'content-type' not in (key.lower() for key in final_headers.keys()):
+            # Check for content-type in a case-insensitive way
+            if not any(key.lower() == 'content-type' for key in final_headers.keys()):
                 final_headers['Content-Type'] = 'application/json'
         
-        # Log the request details (be careful with sensitive data in payload/headers in production logs)
-        log_payload_preview = str(payload)[:200] + "..." if payload and len(str(payload)) > 200 else payload
+        # Logging request details
+        # MODIFIED: Payload logging is now conditional on DEBUG level for security.
+        payload_log_message = "Payload: [Omitted in INFO, available in DEBUG]"
+        if logger.isEnabledFor(logging.DEBUG):
+            log_payload_preview = str(payload)[:200] + "..." if payload and len(str(payload)) > 200 else payload
+            payload_log_message = f"Payload Preview: {log_payload_preview}"
+
         logger.info(f"Executing API call for OpID '{operationId}': {request_method} {final_url}")
-        logger.debug(f"OpID '{operationId}' - Query Params: {query_params}, Headers: {final_headers}, Payload Preview: {log_payload_preview}")
+        logger.debug(
+            f"OpID '{operationId}' - Query Params: {query_params}, Headers: {final_headers}, {payload_log_message}"
+        )
+
 
         response_data = {
             "status_code": None,
@@ -108,17 +119,25 @@ class APIExecutor:
                 "params": query_params, # httpx handles query params correctly
                 "headers": final_headers,
             }
+            # Add payload if method requires it and payload is provided
             if request_method in ["POST", "PUT", "PATCH", "DELETE"] and payload is not None:
-                if final_headers.get('Content-Type', '').lower() == 'application/json':
+                # Check content type from final_headers (case-insensitive)
+                current_content_type = ""
+                for k, v in final_headers.items():
+                    if k.lower() == 'content-type':
+                        current_content_type = v.lower()
+                        break
+                
+                if 'application/json' in current_content_type:
                     request_kwargs["json"] = payload # httpx handles JSON serialization
-                else: # For other content types like form data (not fully handled here)
+                else: # For other content types like form data (not fully handled here, assumes string/bytes)
                     request_kwargs["data"] = payload
 
 
             http_response: httpx.Response = await self._client.request(**request_kwargs)
 
             response_data["status_code"] = http_response.status_code
-            response_data["response_headers"] = dict(http_response.headers)
+            response_data["response_headers"] = dict(http_response.headers) # Convert Headers object to dict
 
             # Attempt to parse JSON, otherwise get raw text
             content_type = http_response.headers.get("content-type", "").lower()
@@ -126,31 +145,34 @@ class APIExecutor:
                 try:
                     response_data["response_body"] = http_response.json()
                 except json.JSONDecodeError:
-                    logger.warning(f"OpID '{operationId}': Failed to decode JSON response despite content-type. Raw text: {http_response.text[:200]}...")
-                    response_data["response_body"] = http_response.text
+                    logger.warning(f"OpID '{operationId}': Failed to decode JSON response despite content-type. Status: {http_response.status_code}. Raw text preview: {http_response.text[:200]}...")
+                    response_data["response_body"] = http_response.text # Store raw text if JSON parsing fails
             else:
                 response_data["response_body"] = http_response.text
             
-            # Raise an exception for bad status codes (4xx or 5xx) to be caught by the generic handler
-            # http_response.raise_for_status() # Or handle specific statuses as needed
+            # Optionally, raise an exception for bad status codes (4xx or 5xx) to be caught by the generic handler below.
+            # http_response.raise_for_status() # Uncomment if you want to handle all HTTP errors this way.
 
+            # Log warning for non-2xx status codes if not raising exception above
             if not (200 <= http_response.status_code < 300):
-                 logger.warning(f"OpID '{operationId}': Received non-2xx status: {http_response.status_code}. Response: {str(response_data['response_body'])[:200]}...")
+                 logger.warning(f"OpID '{operationId}': Received non-2xx status: {http_response.status_code}. Response preview: {str(response_data['response_body'])[:200]}...")
                  # You might want to set response_data["error"] here based on status
-                 # For now, workflow_executor checks status_code.
+                 # For now, the calling workflow_executor or manager checks status_code.
 
         except httpx.TimeoutException as e_timeout:
             logger.error(f"OpID '{operationId}': Timeout during API call to {final_url}: {e_timeout}")
             response_data["error"] = f"Timeout: {str(e_timeout)}"
-            response_data["status_code"] = 408 # Request Timeout (conceptual)
+            response_data["status_code"] = 408 # Request Timeout (conceptual, httpx might not set this)
         except httpx.RequestError as e_request: # Catches connection errors, invalid URLs etc.
             logger.error(f"OpID '{operationId}': Request error during API call to {final_url}: {e_request}")
             response_data["error"] = f"Request Error: {str(e_request)}"
-            response_data["status_code"] = 503 # Service Unavailable (conceptual for connection issues)
-        except Exception as e_general:
+            # Conceptual status code for service unavailable due to request issues
+            response_data["status_code"] = 503 if response_data["status_code"] is None else response_data["status_code"]
+        except Exception as e_general: # Catch any other unexpected errors
             logger.critical(f"OpID '{operationId}': Unexpected error during API call to {final_url}: {e_general}", exc_info=True)
             response_data["error"] = f"Unexpected Error: {str(e_general)}"
-            response_data["status_code"] = 500 # Internal Server Error (conceptual)
+            # Conceptual status code for internal server error
+            response_data["status_code"] = 500 if response_data["status_code"] is None else response_data["status_code"]
         finally:
             end_time = time.perf_counter()
             response_data["execution_time"] = round(end_time - start_time, 4)
@@ -163,6 +185,9 @@ async def main_test():
     # This is a dummy base URL for a publicly available test API
     # For your actual use, you'd configure this based on the OpenAPI spec's servers block
     # or expect absolute URLs in the node definitions.
+    
+    # Configure logging to see DEBUG messages for payload preview
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
     # Test with a public API
     executor = APIExecutor(base_url="https://jsonplaceholder.typicode.com")
@@ -200,8 +225,8 @@ async def main_test():
     await executor.close() # Important to close the client
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     # To run the test: python api_executor.py
+    # Ensure logging is configured to DEBUG to see payload previews in test.
     # asyncio.run(main_test()) # This line is commented out to prevent execution when imported.
     # If you want to test, uncomment the line above and run `python api_executor.py` from your terminal.
     pass
