@@ -260,53 +260,419 @@ async def websocket_endpoint(websocket: WebSocket):
 
             logger.debug(f"[{session_id}] Persisted BotState. Store status: {_session_bot_state_store.get('workflow_execution_status')}")
 
-            if _session_bot_state_store.get("workflow_execution_status") == "pending_start":
-                logger.info(f"[{session_id}] Store signals 'pending_start'. Initiating Graph 2.")
-                exec_plan_dict = _session_bot_state_store.get("execution_graph")
-                exec_plan = PlanSchema.model_validate(exec_plan_dict) if exec_plan_dict else None
+            Gemini Advanced
 
-                if exec_plan and api_executor_instance:
-                    try:
-                        current_graph2_thread_id_for_session = f"{session_id}_exec_{uuid.uuid4().hex[:8]}"
-                        logger.info(f"[{session_id}] Generated G2 Thread ID for this run: {current_graph2_thread_id_for_session}")
+2.5 Pro (preview)
 
-                        # REMOVED: websocket_callback and graph2_thread_id from ExecutionGraphDefinition constructor
-                        exec_graph_def = ExecutionGraphDefinition(
-                            graph_execution_plan=exec_plan,
-                            api_executor=api_executor_instance
-                        )
-                        active_graph2_definitions[current_graph2_thread_id_for_session] = exec_graph_def
-                        runnable_exec_graph = exec_graph_def.get_runnable_graph()
-                        
-                        exec_manager = GraphExecutionManager(
-                            runnable_graph=runnable_exec_graph,
-                            graph_definition=exec_graph_def, 
-                            websocket_callback=graph2_ws_callback_for_session,
-                            planning_checkpointer=None, # Checkpointer for Graph 2 if needed
-                            main_planning_session_id=session_id 
-                        )
-                        active_graph2_executors[current_graph2_thread_id_for_session] = exec_manager
-                        
-                        exec_initial_vals = ExecutionGraphState(
-                            initial_input=_session_bot_state_store.get("workflow_extracted_data", {}),
-                            # Other fields like api_results, extracted_ids, confirmed_data start empty via default_factory
-                        ).model_dump(exclude_none=True)
-                        
-                        exec_graph_config = {"configurable": {"thread_id": current_graph2_thread_id_for_session}}
-                        
-                        await send_websocket_message(websocket, "info", {"message":f"Execution phase starting (G2 Thread ID: {current_graph2_thread_id_for_session})."}, session_id, "graph2_execution", current_graph2_thread_id_for_session)
-                        _session_bot_state_store["workflow_execution_status"] = "running" 
+Conversation with Gemini
 
-                        asyncio.create_task(exec_manager.execute_workflow(exec_initial_vals, exec_graph_config))
-                    
-                    except Exception as e_exec_setup:
-                        g2_tid_err = current_graph2_thread_id_for_session or "UNKNOWN_G2_TID"
-                        logger.error(f"[{session_id}] Failed to start Graph 2 (G2 Thread ID: {g2_tid_err}): {e_exec_setup}", exc_info=True)
-                        await send_websocket_message(websocket, "error", {"error":f"Execution setup error: {str(e_exec_setup)[:150]}"}, session_id, "system", g2_tid_err)
-                        _session_bot_state_store["workflow_execution_status"] = "failed"
+api_executor
+PY
+
+core_logic
+PY
+
+execution_...definition
+PY
+
+graph
+PY
+
+llm_config
+PY
+
+main
+PY
+
+models
+PY
+
+requirements
+TXT
+
+router
+PY
+
+index.html
+HTML
+Understand this, keep it I will ask
+
+
+
+
+Show thinking
+Okay, I have understood the files you've provided. I'm ready for your questions.
+
+
+Sources and related content
+
+execution_manager
+PY
+Take this also
+
+
+
+
+Show thinking
+Okay, I've taken that file as well. I'm ready for your questions.
+
+
+Sources and related content
+When I run execute workflow, I don't get infront ui side what api are executed
+
+
+
+
+Show thinking
+It seems the information about individual APIs being executed during a workflow isn't being explicitly sent to the user interface (UI) in real-time. Here's a breakdown of why that might be happening and where to look in the code:
+
+How Workflow Execution Information Flows (or Doesn't Flow) to the UI:
+
+Backend Logging vs. UI Messages:
+
+The api_executor.py file, which handles the direct execution of API calls, includes detailed logging about each request (URL, method, payload, response). Similarly, execution_graph_definition.py logs the start and end of each node (which typically corresponds to an API call) in the execution graph.   
+However, these are primarily backend logs and are not automatically translated into messages sent to the UI.
+WebSocket Communication (main.py):
+
+The main.py file uses WebSockets to communicate with the UI. The send_websocket_message function is key here.
+The graph2_ws_callback function in main.py is designed to receive updates from the GraphExecutionManager (which runs the workflow defined in Graph 2) and forward them to the UI.
+Currently, the event types handled by this callback and sent to the UI seem to be higher-level workflow events such as:
+human_intervention_required (when the workflow pauses for user confirmation)
+execution_completed
+execution_failed
+workflow_timeout
+When the execution phase starts, an "info" message like "Execution phase starting..." is sent.
+Execution Management (execution_manager.py):
+
+The GraphExecutionManager in execution_manager.py is responsible for running the sequence of API calls defined in the execution plan.
+It uses the websocket_callback to send the high-level events mentioned above.
+While it processes nodes one by one, it doesn't appear to send a specific WebSocket message to the UI each time an individual API call within the workflow starts or finishes with its result, beyond the backend logging.
+User Interface (index.html):
+
+The index.html file defines a "Workflow Execution Log" section (<div id="workflowLogMessages">) where such messages would be displayed.
+The corresponding JavaScript (script.js, linked in index.html) would handle incoming WebSocket messages and update this log. It would currently be set up to display messages for the event types that main.py and execution_manager.py are sending.
+Why API Execution Details Might Not Appear on the UI:
+
+Based on the code structure:
+
+There isn't a specific mechanism implemented to send a WebSocket message from the backend to the frontend detailing the start, progress, or completion of each individual API call during the workflow execution. The communication is focused on broader workflow state changes.
+Potential Areas for Modification to Display API Execution Details:
+
+To show each API call as it's executed on the UI, you would likely need to:
+
+Backend Changes:
+
+In execution_graph_definition.py, within the _make_node_runnable method (which wraps the execution of each API call), you could add calls to self.websocket_callback (passed down or accessed appropriately) before and after the await self.api_executor.execute_api(...) line.
+Before: Send a message like {"type": "api_call_start", "content": {"operationId": node_definition.operationId, "method": node_definition.method, "path": node_definition.path}}.
+After: Send a message like {"type": "api_call_end", "content": {"operationId": node_definition.operationId, "status_code": api_call_result.get("status_code"), "response_preview": str(api_call_result.get("response_body"))[:100]}}.
+Alternatively, the GraphExecutionManager in execution_manager.py could be modified if the LangGraph framework provides events for individual node transitions that could be captured and sent via the websocket_callback.
+Frontend Changes (in script.js which is referenced by index.html):
+
+The JavaScript code that handles incoming WebSocket messages would need to be updated to recognize these new message types (api_call_start, api_call_end).
+Upon receiving these messages, it should format the information and append it to the workflowLogMessages div in index.html.
+By implementing these changes, you can create a more granular log of API executions on the UI.
+
+
+Sources and related content
+Ok give files with updates
+
+
+
+
+Show thinking
+Okay, I'll provide the updated files with the necessary changes to display API execution details on the UI.
+
+Here's a summary of the modifications:
+
+execution_graph_definition.py:
+
+The ExecutionGraphDefinition class will now store the websocket_callback and the graph2_thread_id.
+The _make_node_runnable method will use this callback to send api_call_start and api_call_end messages to the UI before and after an API call is made.
+main.py:
+
+When an ExecutionGraphDefinition instance is created, it will be provided with the graph2_ws_callback and the specific graph2_thread_id for the current execution.
+index.html:
+
+I will add comments within a <script> tag in index.html outlining the JavaScript changes needed in your static/script.js file to handle these new WebSocket message types (api_call_start, api_call_end) and display them in the "Workflow Execution Log".
+Here are the updated files:
+
+Python
+
+# execution_graph_definition.py
+import asyncio
+import logging
+from typing import Any, Callable, Awaitable, Dict, Optional, Tuple, Union
+
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+# Interrupt is not raised by nodes anymore in this pattern, but imported for clarity if needed elsewhere.
+# from langgraph.types import Interrupt
+
+from models import GraphOutput, Node, Edge, InputMapping, OutputMapping, ExecutionGraphState
+from api_executor import APIExecutor
+
+logger = logging.getLogger(__name__)
+
+# _get_value_from_path and _set_value_by_path remain the same
+
+def _get_value_from_path(data_dict: Optional[Dict[str, Any]], path: str) -> Any:
+    if not path or not isinstance(data_dict, dict):
+        return None
+    if path.startswith("$."):
+        path = path[2:]
+    keys = path.split('.')
+    current_val = data_dict
+    for key_part in keys:
+        if isinstance(current_val, dict):
+            if key_part not in current_val:
+                return None
+            current_val = current_val.get(key_part)
+        elif isinstance(current_val, list):
+            try:
+                idx = int(key_part)
+                if 0 <= idx < len(current_val):
+                    current_val = current_val[idx]
                 else:
-                    err = "Plan missing" if not exec_plan else "API executor missing"
-                    logger.error(f"[{session_id}] Cannot start Graph 2: {err}.")
-                    await send_websocket_message(websocket, "error", {"error":f"Cannot start execution: {err}."}, session_id, "system")
-                    _session_bot_state_store["workflow_execution_status"] = "failed"
-    
+                    return None
+            except ValueError:
+                return None
+        else:
+            return None
+    return current_val
+
+def _set_value_by_path(data_dict: Dict[str, Any], path: str, value: Any):
+    if not path:
+        return
+    keys = path.split('.')
+    current_level = data_dict
+    for i, key in enumerate(keys[:-1]):
+        if key not in current_level or not isinstance(current_level.get(key), dict):
+            current_level[key] = {}
+        current_level = current_level[key]
+    if keys:
+        current_level[keys[-1]] = value
+
+class ExecutionGraphDefinition:
+    def __init__(
+        self,
+        graph_execution_plan: GraphOutput,
+        api_executor: APIExecutor,
+        websocket_callback: Optional[Callable[[str, Dict[str, Any], Optional[str]], Awaitable[None]]] = None, # MODIFIED
+        graph2_thread_id: Optional[str] = None # MODIFIED
+    ):
+        self.graph_plan = graph_execution_plan
+        self.api_executor = api_executor
+        self.websocket_callback = websocket_callback # MODIFIED
+        self.graph2_thread_id = graph2_thread_id # MODIFIED
+        self.runnable_graph: Any = self._build_and_compile_graph()
+        logger.info("ExecutionGraphDefinition initialized and Graph 2 compiled.")
+
+    async def _send_ws_update(self, event_type: str, data: Dict[str, Any]): # MODIFIED_ADD
+        """Helper to send websocket updates if callback is configured."""
+        if self.websocket_callback and self.graph2_thread_id:
+            try:
+                await self.websocket_callback(event_type, data, self.graph2_thread_id)
+            except Exception as e:
+                logger.error(f"Error sending WS update ({event_type}) for thread {self.graph2_thread_id}: {e}")
+
+    def _resolve_placeholders(self, template_string: str, state: ExecutionGraphState) -> str:
+        if not isinstance(template_string, str):
+            return str(template_string)
+        resolved_string = template_string
+        extracted_ids_dict = state.extracted_ids
+        initial_input_dict = state.initial_input if isinstance(state.initial_input, dict) else {}
+        for key, value in extracted_ids_dict.items():
+            if value is not None:
+                resolved_string = resolved_string.replace(f"{{{key}}}", str(value))
+        for key, value in initial_input_dict.items():
+            if value is not None:
+                 resolved_string = resolved_string.replace(f"{{{key}}}", str(value))
+        return resolved_string
+
+    def _apply_input_mappings(
+        self,
+        node_definition: Node,
+        state: ExecutionGraphState,
+        resolved_path_params: Dict[str, Any],
+        resolved_query_params: Dict[str, Any],
+        resolved_body_payload_for_field_mapping: Dict[str, Any],
+        resolved_headers: Dict[str, Any]
+    ) -> None:
+        if not node_definition.input_mappings:
+            return
+        current_extracted_ids = state.extracted_ids
+        for mapping in node_definition.input_mappings:
+            source_value = _get_value_from_path(current_extracted_ids, mapping.source_data_path)
+            if source_value is None:
+                logger.warning(f"Node '{node_definition.effective_id}': InputMapping - Could not find source data for path '{mapping.source_data_path}'. Skipping.")
+                continue
+            if mapping.target_parameter_in == "path":
+                resolved_path_params[mapping.target_parameter_name] = str(source_value)
+            elif mapping.target_parameter_in == "query":
+                resolved_query_params[mapping.target_parameter_name] = source_value
+            elif mapping.target_parameter_in == "header":
+                resolved_headers[mapping.target_parameter_name] = str(source_value)
+            elif mapping.target_parameter_in.startswith("body."):
+                field_path_in_body = mapping.target_parameter_in.split("body.", 1)[1]
+                _set_value_by_path(resolved_body_payload_for_field_mapping, field_path_in_body, source_value)
+
+    def _prepare_api_request_components(
+        self, node_definition: Node, state: ExecutionGraphState
+    ) -> Tuple[str, Dict[str, Any], Any, Dict[str, Any]]:
+        path_template = node_definition.path or ""
+        payload_template = node_definition.payload
+        if isinstance(payload_template, dict):
+            payload_template = payload_template.copy()
+
+        resolved_path_from_template = self._resolve_placeholders(path_template, state)
+        body_after_placeholder_resolution: Any
+        if isinstance(payload_template, dict):
+            body_after_placeholder_resolution = {
+                key: (self._resolve_placeholders(value, state) if isinstance(value, str) else value)
+                for key, value in payload_template.items()
+            }
+        elif payload_template is not None:
+            body_after_placeholder_resolution = self._resolve_placeholders(str(payload_template), state)
+        else:
+            body_after_placeholder_resolution = {}
+
+        final_path_params: Dict[str, Any] = {}
+        final_query_params: Dict[str, Any] = {}
+        final_headers: Dict[str, Any] = {}
+        body_for_field_mappings = body_after_placeholder_resolution if isinstance(body_after_placeholder_resolution, dict) else {}
+
+        self._apply_input_mappings(
+            node_definition, state, final_path_params, final_query_params,
+            body_for_field_mappings, final_headers
+        )
+
+        final_body_payload = body_for_field_mappings
+        if not isinstance(body_after_placeholder_resolution, dict) and body_for_field_mappings:
+            final_body_payload = body_for_field_mappings
+        elif isinstance(body_after_placeholder_resolution, dict):
+             final_body_payload = body_for_field_mappings
+        else:
+            final_body_payload = body_after_placeholder_resolution
+
+        for mapping in node_definition.input_mappings or []:
+            if mapping.target_parameter_in == "body":
+                current_extracted_ids = state.extracted_ids
+                source_value = _get_value_from_path(current_extracted_ids, mapping.source_data_path)
+                if source_value is not None:
+                    final_body_payload = source_value
+                    break
+        
+        final_api_path = resolved_path_from_template
+        if final_path_params:
+            temp_extracted_ids_for_path = state.extracted_ids.copy()
+            temp_extracted_ids_for_path.update(final_path_params)
+            initial_input_dict = state.initial_input if isinstance(state.initial_input, dict) else {}
+            for k,v in initial_input_dict.items():
+                if k not in temp_extracted_ids_for_path:
+                    temp_extracted_ids_for_path[k] = v
+            temp_state_for_path_re_resolution = ExecutionGraphState(
+                extracted_ids=temp_extracted_ids_for_path,
+                api_results={}, confirmed_data={}, initial_input={}
+            )
+            final_api_path = self._resolve_placeholders(path_template, temp_state_for_path_re_resolution)
+        return final_api_path, final_query_params, final_body_payload, final_headers
+
+    def _apply_confirmed_data_to_request(
+        self, node_definition: Node, state: ExecutionGraphState,
+        current_body_payload: Any, current_query_params: Dict[str, Any], current_headers: Dict[str, Any]
+    ) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
+        operationId = node_definition.effective_id
+        confirmation_key = f"confirmed_{operationId}"
+        updated_body = current_body_payload.copy() if isinstance(current_body_payload, dict) else current_body_payload
+        updated_params = current_query_params.copy()
+        updated_headers = current_headers.copy()
+        current_confirmed_data = state.confirmed_data
+        
+        # Check if this specific operation was confirmed (decision is True)
+        if current_confirmed_data.get(confirmation_key): # This implies decision was True
+            confirmed_details = current_confirmed_data.get(f"{confirmation_key}_details", {})
+            if "modified_payload" in confirmed_details: # User might have modified the payload
+                updated_body = confirmed_details["modified_payload"]
+                logger.info(f"Node '{operationId}': Applied modified payload from user confirmation.")
+            # Add similar checks for modified_query_params, modified_headers if UI supports modifying them
+        return updated_body, updated_params, updated_headers
+
+    async def _execute_api_and_process_outputs(
+        self, node_definition: Node, api_path: str,
+        query_params: Dict[str, Any], body_payload: Any, headers: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        effective_id = node_definition.effective_id
+        api_call_method = node_definition.method or "GET"
+
+        # MODIFIED_ADD: Send api_call_start event
+        await self._send_ws_update("api_call_start", {
+            "operationId": node_definition.operationId,
+            "effective_id": effective_id,
+            "method": api_call_method,
+            "path": api_path, # Resolved path
+            "payload_preview": str(body_payload)[:200] + "..." if body_payload and len(str(body_payload)) > 200 else body_payload,
+            "query_params": query_params,
+        })
+
+        api_call_result_dict = await self.api_executor.execute_api(
+            operationId=effective_id, method=api_call_method, endpoint=api_path,
+            payload=body_payload, query_params=query_params, headers=headers
+        )
+        
+        # MODIFIED_ADD: Send api_call_end event
+        status_code = api_call_result_dict.get("status_code")
+        response_body_preview = str(api_call_result_dict.get("response_body"))[:200] + "..." \
+            if api_call_result_dict.get("response_body") and len(str(api_call_result_dict.get("response_body"))) > 200 \
+            else api_call_result_dict.get("response_body")
+
+        await self._send_ws_update("api_call_end", {
+            "operationId": node_definition.operationId,
+            "effective_id": effective_id,
+            "method": api_call_method,
+            "path": api_path,
+            "status_code": status_code,
+            "response_preview": response_body_preview,
+            "error": api_call_result_dict.get("error"),
+            "execution_time": api_call_result_dict.get("execution_time")
+        })
+
+        extracted_data_for_state = {}
+        is_successful = isinstance(status_code, int) and 200 <= status_code < 300
+        if is_successful and node_definition.output_mappings:
+            response_body = api_call_result_dict.get("response_body")
+            if isinstance(response_body, dict):
+                for mapping in node_definition.output_mappings:
+                    extracted_value = _get_value_from_path(response_body, mapping.source_data_path)
+                    if extracted_value is not None:
+                        extracted_data_for_state[mapping.target_data_key] = extracted_value
+            elif response_body is not None:
+                 logger.warning(f"Node '{effective_id}': Response body type {type(response_body)} not dict. Cannot apply output mappings.")
+        return api_call_result_dict, (extracted_data_for_state if extracted_data_for_state else None)
+
+    def _make_node_runnable(
+        self, node_definition: Node
+    ) -> Callable[[ExecutionGraphState], Awaitable[Dict[str, Any]]]:
+        """
+        Creates an awaitable function for a given API node definition.
+        The graph will interrupt *before* this node if requires_confirmation is true.
+        This node, when run, checks if it was confirmed.
+        """
+        async def node_executor(state: ExecutionGraphState) -> Dict[str, Any]:
+            effective_id = node_definition.effective_id
+            logger.info(f"--- [Graph 2] Node Start: {effective_id} (OpID: {node_definition.operationId}) ---")
+            
+            output_state_update: Dict[str, Any] = {} 
+
+            try:
+                api_path, query_params, body_payload, headers = self._prepare_api_request_components(node_definition, state)
+                
+                if node_definition.requires_confirmation:
+                    confirmation_key = f"confirmed_{effective_id}"
+                    if not state.confirmed_data.get(confirmation_key): 
+                        skip_message = f"Node '{effective_id}' requires confirmation, but it was not found or was negative in confirmed_data. Skipping execution."
+                        logger.warning(skip_message)
+                        output_state_update["error"] = skip_message 
+                        output_state_update["api_results"] = {effective_id: {"status_code": "SKIPPED_NO_CONFIRMATION", "error": skip_message}}
+                        # MODIFIED_ADD: Send skip event
+                        await self._send_ws_update("api_call_skipped", {
+                            "operationId":
