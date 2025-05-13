@@ -67,6 +67,7 @@
                 <p><strong>Operation ID:</strong> <span id="modalOperationId">N/A</span></p>
                 <p><strong>Method:</strong> <span id="modalMethod">N/A</span></p>
                 <p><strong>Path:</strong> <code id="modalPath">N/A</code></p>
+                 <p><strong>Graph2 Thread ID:</strong> <code id="modalGraph2ThreadId" style="font-size: 0.8em; color: #555;">N/A</code></p>
                 <div class="payload-editor">
                     <label for="modalPayload"><strong>Request Payload (JSON):</strong></label>
                     <textarea id="modalPayload" rows="10" placeholder="Enter or modify JSON payload..."></textarea>
@@ -74,14 +75,12 @@
             </div>
             <div class="modal-actions">
                 <button id="modalConfirmButton" class="action-button primary-button">Confirm & Proceed</button>
-                <button id="modalCancelButton" class="action-button tertiary-button" onclick="hideConfirmationModal()">Cancel</button>
-            </div>
+                <button id="modalCancelButton" class="action-button tertiary-button" onclick="cancelConfirmationModal()">Cancel</button> </div>
         </div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
     <script>
-        // Initialize Mermaid.js
         if (typeof mermaid !== 'undefined') {
             mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
         } else {
@@ -89,5 +88,234 @@
         }
     </script>
     <script src="/static/script.js"></script>
+    <script>
+        // JAVASCRIPT CHANGES FOR YOUR static/script.js FILE:
+        // (Integrating this into your existing script.js)
+
+        /*
+        In your static/script.js, ensure your WebSocket message handler
+        (e.g., `handleWebSocketMessage` or `websocket.onmessage`) is updated
+        to process these new/modified event types from "graph2_execution":
+
+        - "tool_start": Indicates an API call node is starting.
+            - `data.content.node_name`: The ID of the node/tool.
+            - `data.content.input_preview`: A preview of the input to the tool.
+        - "tool_end": Indicates an API call node has finished.
+            - `data.content.node_name`: The ID of the node/tool.
+            - `data.content.status_code`: HTTP status if applicable.
+            - `data.content.error`: Any error message.
+            - `data.content.execution_time`: Time taken.
+            - `data.content.response_preview`: Preview of the API response.
+            - `data.content.raw_output`: Preview of the full output passed to the next state.
+        - "human_intervention_required": (Existing) When workflow pauses.
+            - The `details_for_ui` will contain info for the modal.
+            - `data.graph2_thread_id` should be captured and used when sending the "resume_exec" command.
+        - "execution_completed", "execution_failed", "workflow_timeout": (Existing) High-level workflow status.
+
+        Example snippet for `handleWebSocketMessage` in your `script.js`:
+
+        function handleWebSocketMessage(event) {
+            const data = JSON.parse(event.data);
+            console.log("WS RX:", data); // Debugging
+
+            const chatMessages = document.getElementById('chatMessages');
+            const workflowLog = document.getElementById('workflowLogMessages');
+
+            if (data.source === "graph1_planning") {
+                // ... your existing logic for Graph 1 messages (intermediate, final, graph_update, status, info, error)
+                // Example for 'final' message from Graph 1:
+                if (data.type === "final" || data.type === "intermediate") {
+                    appendMessage(chatMessages, data.content.message || JSON.stringify(data.content), "Agent");
+                } else if (data.type === "graph_update") {
+                    // ... update graphJsonViewPre and renderMermaid ...
+                } // ... etc.
+            } else if (data.source === "graph2_execution") {
+                let logEntry = document.createElement('div');
+                logEntry.classList.add('log-message');
+                // Store G2 thread ID for context, useful if multiple G2 runs are logged
+                logEntry.dataset.graph2ThreadId = data.graph2_thread_id || 'N/A'; 
+                let contentHtml = '';
+
+                switch (data.type) {
+                    case "tool_start":
+                        contentHtml = `<strong>Tool Start (Node: ${escapeHtml(data.content.node_name)}):</strong><br>
+                                       Input Preview: <pre>${escapeHtml(data.content.input_preview)}</pre>`;
+                        logEntry.classList.add('log-tool-start');
+                        break;
+                    case "tool_end":
+                        contentHtml = `<strong>Tool End (Node: ${escapeHtml(data.content.node_name)}):</strong><br>
+                                       Status: ${escapeHtml(data.content.status_code)} (Took: ${escapeHtml(data.content.execution_time)}s)<br>
+                                       Response Preview: <pre>${escapeHtml(data.content.response_preview)}</pre>`;
+                        if (data.content.error) {
+                            contentHtml += `<br><strong class="log-error-text">Tool Error: ${escapeHtml(data.content.error)}</strong>`;
+                            logEntry.classList.add('log-error');
+                        } else {
+                            logEntry.classList.add('log-success');
+                        }
+                        // contentHtml += `<br>Raw Output: <pre>${escapeHtml(data.content.raw_output)}</pre>`; // Optional: for more debug info
+                        break;
+                    case "human_intervention_required":
+                        contentHtml = `<strong>Workflow Paused (G2 Thread: ${escapeHtml(data.graph2_thread_id)}):</strong> Waiting for confirmation for node ${escapeHtml(data.content.node_name)}.`;
+                        logEntry.classList.add('log-pause');
+                        showConfirmationModal(data.content.details_for_ui, data.graph2_thread_id); // Pass G2 thread ID
+                        break;
+                    case "execution_completed":
+                        contentHtml = `<strong>Workflow Execution Completed (G2 Thread: ${escapeHtml(data.graph2_thread_id)}).</strong><br>Final state keys: <pre>${escapeHtml(Object.keys(data.content.final_state || {}).join(', '))}</pre>`;
+                        logEntry.classList.add('log-workflow-end', 'log-success');
+                        setRunWorkflowButtonState(true);
+                        break;
+                    case "execution_failed":
+                        contentHtml = `<strong class="log-error-text">Workflow Execution Failed (G2 Thread: ${escapeHtml(data.graph2_thread_id)}).</strong><br>Error: <pre>${escapeHtml(JSON.stringify(data.content.final_state?.error || data.content.error || 'Unknown error'))}</pre>`;
+                        logEntry.classList.add('log-workflow-end', 'log-error');
+                        setRunWorkflowButtonState(true);
+                        break;
+                    case "workflow_timeout":
+                        contentHtml = `<strong class="log-warning-text">Workflow Timeout (G2 Thread: ${escapeHtml(data.graph2_thread_id)}):</strong> ${escapeHtml(data.content.message || 'Timeout waiting for user action.')}`;
+                        logEntry.classList.add('log-workflow-end', 'log-warning');
+                        setRunWorkflowButtonState(true);
+                        break;
+                    case "info": // General info from graph2_execution
+                        contentHtml = `<strong>Info (G2 Thread: ${escapeHtml(data.graph2_thread_id)}):</strong> ${escapeHtml(data.content.message || JSON.stringify(data.content))}`;
+                        logEntry.classList.add('log-info');
+                        break;
+                    case "error": // General error from graph2_execution
+                         contentHtml = `<strong class="log-error-text">Error (G2 Thread: ${escapeHtml(data.graph2_thread_id)}):</strong> ${escapeHtml(data.content.error || JSON.stringify(data.content))}`;
+                        logEntry.classList.add('log-error');
+                        break;
+                    default:
+                        console.log("Unhandled G2 event type:", data.type, data.content);
+                        return; // Do not add to log if not explicitly handled
+                }
+                if (contentHtml) {
+                    logEntry.innerHTML = contentHtml;
+                    workflowLog.appendChild(logEntry);
+                    workflowLog.scrollTop = workflowLog.scrollHeight;
+                }
+            } else {
+                 // Handle other sources or general messages if necessary
+                 appendMessage(chatMessages, `(${data.source || 'System'}) ${data.type}: ${JSON.stringify(data.content)}`, "System");
+            }
+            // Hide thinking indicator after processing a message
+            document.getElementById('thinkingIndicator').style.display = 'none';
+        }
+
+        function escapeHtml(unsafe) {
+            // ... (same escapeHtml function as before)
+            if (typeof unsafe !== 'string') {
+                if (unsafe === null || unsafe === undefined) return '';
+                try { unsafe = JSON.stringify(unsafe, null, 0); } // Compact stringify
+                catch (e) { unsafe = String(unsafe); }
+            }
+            return unsafe
+                 .replace(/&/g, "&amp;")
+                 .replace(/</g, "&lt;")
+                 .replace(/>/g, "&gt;")
+                 .replace(/"/g, "&quot;")
+                 .replace(/'/g, "&#039;");
+        }
+        
+        // --- Confirmation Modal Logic (ensure it uses the graph2_thread_id) ---
+        let currentGraph2ThreadIdForConfirmation = null;
+        let currentConfirmationKey = null; // Store the confirmation key
+
+        function showConfirmationModal(details, graph2ThreadId) {
+            document.getElementById('modalOperationId').textContent = details.operationId || 'N/A';
+            document.getElementById('modalMethod').textContent = details.method || 'N/A';
+            document.getElementById('modalPath').textContent = details.path || 'N/A';
+            document.getElementById('modalPayload').value = JSON.stringify(details.payload_to_confirm, null, 2) || '{}';
+            document.getElementById('modalGraph2ThreadId').textContent = graph2ThreadId || 'N/A'; // Display G2 thread ID
+
+            currentGraph2ThreadIdForConfirmation = graph2ThreadId; // Store for sending resume command
+            currentConfirmationKey = details.confirmation_key; // Store the key
+
+            document.getElementById('confirmationModal').style.display = 'flex';
+        }
+
+        function hideConfirmationModal() {
+            document.getElementById('confirmationModal').style.display = 'none';
+            currentGraph2ThreadIdForConfirmation = null; // Clear it
+            currentConfirmationKey = null; // Clear it
+        }
+        
+        function cancelConfirmationModal() { // New function for explicit cancel
+            if (!currentGraph2ThreadIdForConfirmation || !currentConfirmationKey) {
+                console.error("Cannot cancel: G2 Thread ID or Confirmation Key missing.");
+                hideConfirmationModal();
+                return;
+            }
+            const resumeMessage = `resume_exec ${currentGraph2ThreadIdForConfirmation} ${JSON.stringify({
+                "confirmation_key": currentConfirmationKey,
+                "decision": false // User cancelled
+            })}`;
+            websocket.send(resumeMessage);
+            appendMessage(document.getElementById('workflowLogMessages'), `User cancelled operation for node (via modal).`, "System", "log-skipped");
+            hideConfirmationModal();
+        }
+
+
+        // Update the click handler for the main confirm button in your script.js
+        // Ensure it's assigned *after* the DOM is loaded
+        document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('modalConfirmButton').onclick = () => {
+                if (!currentGraph2ThreadIdForConfirmation || !currentConfirmationKey) {
+                    console.error("Cannot confirm: G2 Thread ID or Confirmation Key missing.");
+                    hideConfirmationModal();
+                    return;
+                }
+                const payloadStr = document.getElementById('modalPayload').value;
+                let parsedPayload;
+                try {
+                    parsedPayload = JSON.parse(payloadStr);
+                } catch (e) {
+                    alert("Invalid JSON in payload editor: " + e.message);
+                    return;
+                }
+
+                const resumeData = {
+                    "confirmation_key": currentConfirmationKey,
+                    "decision": true,
+                    "modified_payload": parsedPayload
+                };
+                const resumeMessage = `resume_exec ${currentGraph2ThreadIdForConfirmation} ${JSON.stringify(resumeData)}`;
+                websocket.send(resumeMessage);
+                appendMessage(document.getElementById('workflowLogMessages'), `User confirmed operation for node (via modal). Payload submitted.`, "System", "log-info");
+                hideConfirmationModal();
+            };
+            // Assign the new cancel function to the cancel button
+            const cancelButton = Array.from(document.querySelectorAll('.modal-actions .action-button.tertiary-button')).find(btn => btn.textContent.includes('Cancel'));
+            if (cancelButton) {
+                cancelButton.onclick = cancelConfirmationModal;
+            }
+        });
+        
+        // Function to append messages to chat or log (you might have this already)
+        function appendMessage(container, text, sender, typeClass = '') {
+            const messageElement = document.createElement('div');
+            if (container.id === 'chatMessages') {
+                messageElement.classList.add('message', sender === 'User' ? 'user-message' : 'agent-message');
+                const senderElement = document.createElement('div');
+                senderElement.classList.add('message-sender');
+                senderElement.textContent = sender;
+                const contentElement = document.createElement('div');
+                contentElement.classList.add('message-content');
+                contentElement.innerHTML = `<p>${text.replace(/\n/g, '<br>')}</p>`; // Basic formatting
+                messageElement.appendChild(senderElement);
+                messageElement.appendChild(contentElement);
+            } else { // For workflow log
+                 messageElement.classList.add('log-message-item'); // General class for log items
+                 if(typeClass) messageElement.classList.add(typeClass);
+                 messageElement.innerHTML = text; // Text can be HTML
+            }
+            container.appendChild(messageElement);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        // Function to set run workflow button state (you might have this)
+        function setRunWorkflowButtonState(enabled) {
+            const btn = document.getElementById('runWorkflowButton');
+            if(btn) btn.disabled = !enabled;
+        }
+        */
+    </script>
 </body>
 </html>
