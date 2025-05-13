@@ -10,8 +10,6 @@ logger = logging.getLogger(__name__)
 # --- Graph Representation Models (Used by Graph 1 to define plan for Graph 2) ---
 class InputMapping(BaseModel):
     """Defines how to map data from a source node's output or a shared pool to a target node's input."""
-    # MODIFIED Description: Clarified that source_data_path is key for shared pool access.
-    # source_operation_id is more for context or future advanced routing.
     source_operation_id: str = Field(
         ...,
         description="Effective_id of the source API operation node that (typically) produced the data, or a conceptual source like 'initial_input'. Primarily for context and graph readability."
@@ -38,8 +36,6 @@ class OutputMapping(BaseModel):
     """Defines how to extract data from a node's response and where to store it in the shared 'extracted_ids' pool."""
     source_data_path: str = Field(..., description="JSONPath-like string to extract data from the node's JSON response body (e.g., '$.id', '$.data.token', '$.items[*]').")
     target_data_key: str = Field(..., description="The key under which the extracted data will be stored in the shared 'extracted_ids' data pool for subsequent nodes (e.g., 'userAuthToken', 'createdItemId').")
-    # common_model_field: Optional[str] = Field(None, description="Optional: If this output corresponds to a known field in a common data model (e.g., 'user_id', 'product_id').")
-
 
 class Node(BaseModel):
     """Represents a node (an API call or a system operation) in the execution graph."""
@@ -59,7 +55,6 @@ class Node(BaseModel):
     
     requires_confirmation: bool = Field(False, description="If true, the workflow should interrupt for user confirmation before executing this node (e.g., for POST, PUT, DELETE operations that modify data).")
     confirmation_prompt: Optional[str] = Field(None, description="Custom prompt to show the user for confirmation if requires_confirmation is true. If None, a default prompt may be generated.")
-
 
     @property
     def effective_id(self) -> str:
@@ -102,24 +97,19 @@ class GraphOutput(BaseModel):
         - Edge 'from_node' and 'to_node' must refer to existing node effective_ids or 'START'/'END'.
         """
         if not self.nodes: 
-            # An empty graph (no nodes) is technically valid but might be unintentional.
-            # Depending on requirements, one might raise an error or warning here.
-            # For now, allow it but log if it seems problematic.
-            if self.edges: # Edges without nodes are definitely an issue
+            if self.edges: 
                 raise ValueError("Graph has edges but no nodes defined.")
             return self 
             
         node_effective_ids = {node.effective_id for node in self.nodes}
         if len(node_effective_ids) != len(self.nodes):
-            # Identify duplicates for a clearer error message
             seen_ids = set()
             duplicates = [node.effective_id for node in self.nodes if node.effective_id in seen_ids or seen_ids.add(node.effective_id)] # type: ignore[func-returns-value]
             raise ValueError(f"Duplicate node effective_ids found: {list(set(duplicates))}. Use 'display_name' to differentiate nodes if using the same operationId multiple times.")
 
         for edge in self.edges:
-            # LangGraph uses special "START" and "END" identifiers not necessarily in nodes list.
-            is_from_special_node = edge.from_node.upper() == "START" # LangGraph's START
-            is_to_special_node = edge.to_node.upper() == "END"     # LangGraph's END
+            is_from_special_node = edge.from_node.upper() == "START" 
+            is_to_special_node = edge.to_node.upper() == "END"     
             
             if not is_from_special_node and edge.from_node not in node_effective_ids:
                 raise ValueError(f"Edge source node '{edge.from_node}' not found in graph nodes (and not 'START').")
@@ -127,114 +117,76 @@ class GraphOutput(BaseModel):
                 raise ValueError(f"Edge target node '{edge.to_node}' not found in graph nodes (and not 'END').")
         return self
 
-# --- State Model for Graph 1 (Planning Graph - Your existing BotState) ---
 class BotState(BaseModel):
     """Represents the full state of the conversation and processing for Graph 1 (Planning Graph)."""
     session_id: str = Field(..., description="Unique identifier for the current user session.")
     user_input: Optional[str] = Field(None, description="The latest input received from the user.")
-
-    # OpenAPI Specification related fields
     openapi_spec_string: Optional[str] = Field(None, description="Temporary storage for raw OpenAPI spec text received from user input, awaiting parsing.")
     openapi_spec_text: Optional[str] = Field(None, description="The validated and successfully parsed OpenAPI specification text (JSON or YAML as string).")
     openapi_schema: Optional[Dict[str, Any]] = Field(None, description="The parsed OpenAPI schema as a Python dictionary.")
     schema_cache_key: Optional[str] = Field(None, description="Cache key derived from the content of the openapi_spec_text.")
     schema_summary: Optional[str] = Field(None, description="LLM-generated natural language summary of the OpenAPI schema.")
     input_is_spec: bool = Field(False, description="Flag indicating if the last user input was identified as an OpenAPI specification.")
-
-    # API and Payload related fields (derived from schema)
     identified_apis: List[Dict[str, Any]] = Field(default_factory=list, description="List of API operations identified from the schema (includes operationId, method, path, summary, parameters, requestBody details).")
     payload_descriptions: Dict[str, str] = Field(default_factory=dict, description="Maps operationId to LLM-generated example payload and response structure descriptions.")
-
-    # Execution Graph (Plan) related fields
     execution_graph: Optional[GraphOutput] = Field(None, description="The generated API execution graph/plan (output of Graph 1, input to Graph 2). This defines the sequence of API calls.")
     plan_generation_goal: Optional[str] = Field(None, description="The user's stated goal or objective for the current execution graph generation or refinement.")
     graph_refinement_iterations: int = Field(0, description="Counter for the number of refinement attempts made on the current execution_graph.")
     max_refinement_iterations: int = Field(3, description="Maximum number of allowed refinement iterations before attempting full regeneration or stopping.")
     graph_regeneration_reason: Optional[str] = Field(None, description="Feedback or reason provided for why the graph needs regeneration or refinement (e.g., from user input or verification failure).")
-
-    # Workflow Execution (Graph 2) related fields - reflects status and results from Graph 2
     workflow_execution_status: Literal[
-        "idle",              # No workflow active or planned
-        "pending_start",     # Graph 1 has prepared a plan, main.py should initiate Graph 2
-        "running",           # Graph 2 is actively executing
-        "paused_for_confirmation", # Graph 2 is paused, awaiting user input (e.g., for a sensitive operation)
-        "completed",         # Graph 2 finished all its steps successfully
-        "failed"             # Graph 2 encountered an error and could not complete
+        "idle", "pending_start", "running", "paused_for_confirmation", "completed", "failed"
     ] = Field("idle", description="Current status of the API workflow execution (primarily managed by Graph 2, reflected here).")
-    
     workflow_execution_results: Dict[str, Any] = Field(default_factory=dict, description="Summary or key results from Graph 2's executed nodes, for Graph 1's awareness and potential use in subsequent planning.")
     workflow_extracted_data: Dict[str, Any] = Field(default_factory=dict, description="Data that Graph 1 might want to initialize Graph 2 with, or a summary of data extracted by Graph 2's output mappings for broader use by Graph 1.")
-    
-    # Internal state for Graph 1's operation
     intent: Optional[str] = Field(None, description="User's high-level intent as determined by Graph 1's router (e.g., 'parse_openapi_spec', 'answer_openapi_query').")
     loop_counter: int = Field(0, description="Counter for detecting potential routing loops within Graph 1.")
     extracted_params: Optional[Dict[str, Any]] = Field(None, description="Parameters extracted by Graph 1's router or other nodes for specific actions (e.g., goal for graph generation).")
-
-    # Communication and Scratchpad
     final_response: str = Field("", description="The final, user-facing response generated by Graph 1 for the current turn.")
     response: Optional[str] = Field(None, description="Intermediate response message generated by Graph 1 nodes during processing. This is typically shown to the user before the final_response.")
-
     next_step: Optional[str] = Field(None, alias="__next__", exclude=True, description="Internal LangGraph field: specifies the next node to execute in Graph 1. Set by nodes to control flow.")
     scratchpad: Dict[str, Any] = Field(default_factory=dict, description="A dictionary for Graph 1 to store temporary data, intermediate results, logs, or any other information useful during a single processing cycle but not meant for long-term state.")
 
     class Config:
-        extra = 'allow' # Allows extra fields not explicitly defined, useful for dynamic scratchpad use
-        validate_assignment = True # Validate fields on assignment
-        populate_by_name = True # Allows using alias like __next__
+        extra = 'allow' 
+        validate_assignment = True 
+        populate_by_name = True 
 
     def update_scratchpad_reason(self, tool_name: str, details: str):
         """Helper method to log reasoning steps into the scratchpad."""
-        if not isinstance(self.scratchpad, dict): self.scratchpad = {} # Ensure scratchpad is a dict
+        if not isinstance(self.scratchpad, dict): self.scratchpad = {} 
         reason_log = self.scratchpad.get('reasoning_log', [])
-        if not isinstance(reason_log, list): reason_log = [] # Ensure log is a list
+        if not isinstance(reason_log, list): reason_log = [] 
         timestamp = datetime.now().isoformat()
         reason_log.append({"timestamp": timestamp, "tool": tool_name, "details": details})
-        # Keep only the last N reasons to prevent scratchpad from growing indefinitely
         self.scratchpad['reasoning_log'] = reason_log[-100:] 
         logger.debug(f"Scratchpad Updated by {tool_name}: {details[:200]}...")
 
-# --- State Definition for Graph 2 (Execution LangGraph) ---
 class ExecutionGraphState(BaseModel):
     """
     Defines the runtime state passed between nodes in the Execution LangGraph (Graph 2).
     This state is managed by the LangGraph `StateGraph` for the execution phase.
     """
-    # Stores the full API call results (status, body, headers, time) from each executed node.
-    # Keyed by the node's effective_id. Annotated with operator.add for LangGraph state merging.
-    api_results: Annotated[Dict[str, Any], operator.add] = Field(
+    api_results: Annotated[Dict[str, Any], operator.ior] = Field( # MODIFIED: Removed Optional
         default_factory=dict,
-        description="Stores outputs of API calls: {'node_effective_id': result_dict_from_APIExecutor}"
+        description="Stores outputs of API calls: {'node_effective_id': result_dict_from_APIExecutor}. Merged using dictionary update."
     )
-    
-    # Shared data pool. Data extracted via OutputMappings from node responses is stored here.
-    # InputMappings in subsequent nodes use this pool to resolve their inputs.
-    # Annotated with operator.ior (in-place OR) for merging dictionaries in LangGraph state.
-    extracted_ids: Annotated[Optional[Dict[str, Any]], operator.ior] = Field(
+    extracted_ids: Annotated[Dict[str, Any], operator.ior] = Field( # MODIFIED: Removed Optional
         default_factory=dict,
         description="Shared data pool: stores data extracted via OutputMappings from node responses (e.g., {'user_token': 'xyz123'}), used by InputMappings."
     )
-    
-    # Stores data confirmed or modified by the user during human-in-the-loop interruptions.
-    # For example, if a node `requires_confirmation: true`.
-    # Annotated with operator.ior for merging.
-    confirmed_data: Annotated[Optional[Dict[str, Any]], operator.ior] = Field(
+    confirmed_data: Annotated[Dict[str, Any], operator.ior] = Field( # MODIFIED: Removed Optional
         default_factory=dict,
         description="Stores data confirmed or modified by the user during interrupts for Graph 2 nodes (e.g., {'confirmed_opId_createOrder': True, 'confirmed_opId_createOrder_details': {...user_payload...}})."
     )
-    
-    # Initial input values provided when Graph 2 starts.
-    # Can be used for resolving placeholders in API paths or payloads if not found in extracted_ids.
-    initial_input: Optional[Dict[str, Any]] = Field(
+    initial_input: Optional[Dict[str, Any]] = Field( # This can remain Optional as it's a one-time input
         None,
         description="Initial input values provided to Graph 2 at the start of its execution, can be used for placeholder resolution."
     )
-    
-    # Stores error messages if any step (node) in Graph 2 fails during its execution.
-    error: Optional[str] = Field(
+    error: Optional[str] = Field( # Error is also fine as Optional
         None,
         description="Stores error messages if any step in Graph 2 fails, helping to halt or diagnose issues."
     )
 
     class Config:
-        arbitrary_types_allowed = True # Allows for complex types within the state if needed.
-
+        arbitrary_types_allowed = True

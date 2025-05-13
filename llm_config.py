@@ -14,14 +14,14 @@ except ImportError:
     logging.warning(
         "Failed to import ChatGoogleGenerativeAI from langchain_google_genai. "
         "Real LLM functionality will be unavailable unless 'langchain-google-genai' is installed. "
-        "You can still use mock LLMs by setting USE_MOCK_LLMS=true."
+        "The system will use mock LLMs if real ones cannot be initialized."
     )
 
 logger = logging.getLogger(__name__)
 
 # --- Environment Variable Names ---
 GOOGLE_API_KEY_ENV_VAR = "GOOGLE_API_KEY"
-USE_MOCK_LLMS_ENV_VAR = "USE_MOCK_LLMS" # New environment variable
+USE_MOCK_LLMS_ENV_VAR = "USE_MOCK_LLMS"
 
 # --- Model Names ---
 ROUTER_LLM_MODEL_NAME = os.getenv("ROUTER_LLM_MODEL_NAME", "gemini-1.5-flash-latest")
@@ -51,7 +51,7 @@ class MockLLM:
             "run this workflow": "setup_workflow_execution",
             "execute the plan": "setup_workflow_execution",
             "focus the plan on": "interactive_query_planner",
-            "regenerate the graph for goal": "interactive_query_planner", # Simpler match
+            "regenerate the graph for goal": "interactive_query_planner",
             "add a notification step": "interactive_query_planner",
             "what if i want to change": "interactive_query_planner",
             "here is the confirmed payload": "interactive_query_planner",
@@ -120,64 +120,63 @@ class MockLLM:
                 logger.info(f"{self.name} matched keyword '{keyword}' and will return: {str(response)[:100]}...")
                 return MockLLMContent(response)
 
-        # Default fallback response
         default_response = "I'm a mock LLM and I don't have a specific answer for that."
-        if "json" in prompt_str or "graphoutput" in prompt_str.lower(): # If JSON is expected
+        if "json" in prompt_str or "graphoutput" in prompt_str.lower():
             default_response = self._generate_mock_graph_output()
-        elif "classify" in prompt_str: # Default for router if no match
+        elif "classify" in prompt_str:
              default_response = "handle_unknown"
-
 
         logger.warning(f"{self.name} did not find a keyword match. Returning default response: {default_response[:100]}...")
         return MockLLMContent(default_response)
 
+def _get_mock_llms() -> Tuple[MockLLM, MockLLM]:
+    """Helper function to instantiate and return mock LLMs."""
+    logger.info("Instantiating Mock LLMs.")
+    mock_router_llm = MockLLM(name="MockRouterLLM")
+    mock_worker_llm = MockLLM(name="MockWorkerLLM")
+    return mock_router_llm, mock_worker_llm
+
 def initialize_llms() -> Tuple[Any, Any]:
     """
     Initializes and returns the router and worker LLMs.
-    Uses mock LLMs if USE_MOCK_LLMS environment variable is set to 'true'.
-    Otherwise, retrieves the GOOGLE_API_KEY and configures ChatGoogleGenerativeAI.
+    - If USE_MOCK_LLMS is 'true', uses mock LLMs.
+    - Otherwise, tries to use real Google LLMs if 'langchain-google-genai' is installed AND GOOGLE_API_KEY is set.
+    - Falls back to mock LLMs if real LLM initialization fails or prerequisites are missing.
 
     Returns:
         A tuple containing (router_llm, worker_llm).
-
-    Raises:
-        ValueError: If GOOGLE_API_KEY is not set (and not using mocks).
-        RuntimeError: If ChatGoogleGenerativeAI could not be imported (and not using mocks).
     """
-    use_mocks_str = os.getenv(USE_MOCK_LLMS_ENV_VAR, "false").lower()
-    use_mocks = use_mocks_str == "true"
+    use_mocks_explicitly = os.getenv(USE_MOCK_LLMS_ENV_VAR, "false").lower() == "true"
 
-    if use_mocks:
-        logger.info("Using Mock LLMs as USE_MOCK_LLMS is set to true.")
-        mock_router_llm = MockLLM(name="MockRouterLLM")
-        mock_worker_llm = MockLLM(name="MockWorkerLLM")
-        return mock_router_llm, mock_worker_llm
+    if use_mocks_explicitly:
+        logger.info("Explicitly using Mock LLMs as USE_MOCK_LLMS is set to true.")
+        return _get_mock_llms()
 
-    # --- Real LLM Initialization ---
+    # --- Attempt Real LLM Initialization ---
     if not LANGCHAIN_GOOGLE_GENAI_AVAILABLE:
-        logger.error(
-            "Real LLMs requested, but ChatGoogleGenerativeAI class not available. "
-            "Please ensure 'langchain-google-genai' is installed or set USE_MOCK_LLMS=true."
+        logger.warning(
+            "Real LLMs implicitly requested (USE_MOCK_LLMS is not 'true'), but 'langchain-google-genai' is not installed. "
+            "Falling back to Mock LLMs. Please install 'langchain-google-genai' for real LLM functionality."
         )
-        raise RuntimeError(
-            "ChatGoogleGenerativeAI class not available. Cannot initialize real LLMs."
-        )
+        return _get_mock_llms()
 
     google_api_key = os.getenv(GOOGLE_API_KEY_ENV_VAR)
     if not google_api_key:
-        logger.error(f"{GOOGLE_API_KEY_ENV_VAR} environment variable not found.")
-        raise ValueError(
-            f"Missing Google API Key. Please set the {GOOGLE_API_KEY_ENV_VAR} environment variable (or use mock LLMs)."
+        logger.warning(
+            f"{GOOGLE_API_KEY_ENV_VAR} environment variable not found. Real LLMs require an API key. "
+            "Falling back to Mock LLMs. Please set the GOOGLE_API_KEY environment variable for real LLM functionality."
         )
+        return _get_mock_llms()
 
     try:
+        logger.info("Attempting to initialize real Google Generative AI models...")
         router_llm = ChatGoogleGenerativeAI(
             model=ROUTER_LLM_MODEL_NAME,
             temperature=ROUTER_LLM_TEMPERATURE,
             google_api_key=google_api_key,
             convert_system_message_to_human=True,
         )
-        logger.info(f"Router LLM initialized successfully with model: {ROUTER_LLM_MODEL_NAME}")
+        logger.info(f"Real Router LLM initialized successfully with model: {ROUTER_LLM_MODEL_NAME}")
 
         worker_llm = ChatGoogleGenerativeAI(
             model=WORKER_LLM_MODEL_NAME,
@@ -185,72 +184,76 @@ def initialize_llms() -> Tuple[Any, Any]:
             google_api_key=google_api_key,
             convert_system_message_to_human=True,
         )
-        logger.info(f"Worker LLM initialized successfully with model: {WORKER_LLM_MODEL_NAME}")
+        logger.info(f"Real Worker LLM initialized successfully with model: {WORKER_LLM_MODEL_NAME}")
 
         return router_llm, worker_llm
 
     except Exception as e:
-        logger.critical(f"Failed to initialize Google Generative AI models: {e}", exc_info=True)
-        raise RuntimeError(f"Could not initialize LLMs: {e}")
+        logger.error(f"Failed to initialize real Google Generative AI models: {e}. Falling back to Mock LLMs.", exc_info=True)
+        return _get_mock_llms()
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 
-    # Test with Mock LLMs
+    # Scenario 1: Explicitly use mocks
+    logger.info("\n--- Scenario 1: Testing with USE_MOCK_LLMS=true ---")
     os.environ[USE_MOCK_LLMS_ENV_VAR] = "true"
-    logger.info("--- Testing with Mock LLMs ---")
+    # Unset API key to ensure it's not accidentally used
+    if GOOGLE_API_KEY_ENV_VAR in os.environ:
+        del os.environ[GOOGLE_API_KEY_ENV_VAR]
     try:
-        mock_router, mock_worker = initialize_llms()
-        logger.info("Mock LLMs initialized for testing.")
+        router, worker = initialize_llms()
+        logger.info(f"Initialized LLMs: Router type = {type(router).__name__}, Worker type = {type(worker).__name__}")
+        assert isinstance(router, MockLLM) and isinstance(worker, MockLLM), "Should be MockLLM instances"
+        logger.info("Scenario 1 PASSED: Explicitly used mock LLMs.")
+    except Exception as e:
+        logger.error(f"Error in Scenario 1: {e}", exc_info=True)
+    finally:
+        del os.environ[USE_MOCK_LLMS_ENV_VAR]
 
-        router_prompt_example = "System: You are a router. User: Classify this intent: 'run this workflow'"
-        mock_router_response = mock_router.invoke(router_prompt_example)
-        logger.info(f"Mock Router LLM test response content: {mock_router_response.content}")
-        assert mock_router_response.content == "setup_workflow_execution"
-
-
-        worker_prompt_example = "Design an API execution graph as a JSON object for getting user details."
-        mock_worker_response = mock_worker.invoke(worker_prompt_example)
-        logger.info(f"Mock Worker LLM test response (graph) content: {mock_worker_response.content[:200]}...")
-        try:
-            json.loads(mock_worker_response.content)
-            logger.info("Mock worker graph response is valid JSON.")
-        except json.JSONDecodeError:
-            logger.error("Mock worker graph response is NOT valid JSON.")
-
-
-        worker_summary_prompt = "Summarize the following API specification: openapi: 3.0..."
-        mock_summary_response = mock_worker.invoke(worker_summary_prompt)
-        logger.info(f"Mock Worker LLM summary response: {mock_summary_response.content}")
-        assert "mock API summary" in mock_summary_response.content
-
+    # Scenario 2: Implicitly request real LLMs, but no API key (should fall back to mocks)
+    logger.info("\n--- Scenario 2: Testing with no API key (should fall back to mocks) ---")
+    # Ensure USE_MOCK_LLMS is not true
+    if USE_MOCK_LLMS_ENV_VAR in os.environ:
+        del os.environ[USE_MOCK_LLMS_ENV_VAR]
+    # Ensure API key is not set
+    if GOOGLE_API_KEY_ENV_VAR in os.environ:
+        del os.environ[GOOGLE_API_KEY_ENV_VAR]
+    try:
+        router, worker = initialize_llms()
+        logger.info(f"Initialized LLMs: Router type = {type(router).__name__}, Worker type = {type(worker).__name__}")
+        if LANGCHAIN_GOOGLE_GENAI_AVAILABLE: # Only assert mock if the lib is there, otherwise it's expected to be mock
+            assert isinstance(router, MockLLM) and isinstance(worker, MockLLM), "Should fall back to MockLLM instances if no API key"
+            logger.info("Scenario 2 PASSED: Fell back to mock LLMs due to missing API key.")
+        else:
+            assert isinstance(router, MockLLM) and isinstance(worker, MockLLM), "Should use MockLLM if langchain-google-genai not available"
+            logger.info("Scenario 2 PASSED: Used mock LLMs as langchain-google-genai is not available.")
 
     except Exception as e:
-        logger.error(f"An error occurred during mock LLM testing: {e}", exc_info=True)
-    finally:
-        del os.environ[USE_MOCK_LLMS_ENV_VAR] # Clean up env var
+        logger.error(f"Error in Scenario 2: {e}", exc_info=True)
 
-    logger.info("\n--- Testing with Real LLMs (if GOOGLE_API_KEY is set) ---")
-    # Test with Real LLMs (requires GOOGLE_API_KEY to be set in environment)
+
+    # Scenario 3: Attempt real LLMs with API key (if key is provided externally and lib is installed)
+    logger.info("\n--- Scenario 3: Testing with API key (if GOOGLE_API_KEY is set externally) ---")
+    # Ensure USE_MOCK_LLMS is not true
+    if USE_MOCK_LLMS_ENV_VAR in os.environ:
+        del os.environ[USE_MOCK_LLMS_ENV_VAR]
+    # User must set GOOGLE_API_KEY in their environment for this to run with real LLMs
     if os.getenv(GOOGLE_API_KEY_ENV_VAR) and LANGCHAIN_GOOGLE_GENAI_AVAILABLE:
         try:
-            real_router, real_worker = initialize_llms()
-            logger.info("Real LLMs initialized for testing.")
-            
-            # Example actual invoke (can be costly/slow, so commented out by default in general use)
-            # real_router_response = real_router.invoke("Classify this intent: 'Show me the user details API.'")
-            # logger.info(f"Real Router LLM test response: {real_router_response.content}")
-
-            # real_worker_response = real_worker.invoke("Explain the concept of an API in one sentence.")
-            # logger.info(f"Real Worker LLM test response: {real_worker_response.content}")
-            logger.info("Real LLM initialization test completed. (Actual invokes can be un-commented for full test)")
-        except ValueError as ve:
-            logger.error(f"Configuration error during real LLM test: {ve}")
-        except RuntimeError as rte:
-            logger.error(f"Runtime error during real LLM test: {rte}")
+            router, worker = initialize_llms()
+            logger.info(f"Initialized LLMs: Router type = {type(router).__name__}, Worker type = {type(worker).__name__}")
+            assert not isinstance(router, MockLLM), "Should be a real LLM instance if API key is provided"
+            logger.info("Scenario 3 PASSED: Initialized real LLMs (GOOGLE_API_KEY was set).")
+            # Example invoke (optional, uncomment to test further)
+            # response = router.invoke("Hello")
+            # logger.info(f"Real router response: {response.content}")
         except Exception as e:
-            logger.error(f"An unexpected error occurred during the real LLM test: {e}", exc_info=True)
+            logger.error(f"Error in Scenario 3: {e}", exc_info=True)
+    elif not LANGCHAIN_GOOGLE_GENAI_AVAILABLE:
+        logger.warning("Scenario 3 SKIPPED: langchain-google-genai not installed. Cannot test real LLMs.")
     else:
-        logger.warning("GOOGLE_API_KEY not set or langchain-google-genai not available. Skipping real LLM test.")
+        logger.warning(f"Scenario 3 SKIPPED: {GOOGLE_API_KEY_ENV_VAR} not set in environment. Cannot test real LLMs.")
 
-    logger.info("Direct test of llm_config.py completed.")
+    logger.info("\nDirect test of llm_config.py completed.")
+    
