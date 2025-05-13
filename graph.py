@@ -22,24 +22,42 @@ logger = logging.getLogger(__name__)
 
 def finalize_response(state: BotState) -> BotState:
     tool_name = "responder"
-    logger.info(f"Responder ({tool_name}): Entered. state.response='{str(state.response)[:100]}...', state.final_response='{str(state.final_response)[:100]}...'")
+    # Log current state for debugging
+    # state.response here is the one *outputted* by the previous node.
+    # It should have been sent as intermediate and cleared from the BotState instance
+    # that this finalize_response node is currently processing.
+    logger.info(f"Responder ({tool_name}): Entered. state.response (from prev node, should be None if sent as intermediate)='{str(state.response)[:100]}'")
+    logger.info(f"Responder ({tool_name}): state.final_response (incoming, from prev node if set)='{str(state.final_response)[:100]}'")
     state.update_scratchpad_reason(tool_name, f"Finalizing response. Initial state.response: '{str(state.response)[:100]}...'")
 
-    if state.response: 
-        state.final_response = state.response
-        logger.info(f"Responder ({tool_name}): Set final_response from state.response: '{str(state.final_response)[:200]}...'")
-    elif not state.final_response: 
-        state.final_response = "Processing complete. How can I help you further?"
-        logger.warning(f"Responder ({tool_name}): state.response was empty/None. Using default final_response: '{state.final_response}'")
-    else:
-        logger.info(f"Responder ({tool_name}): state.response was falsey, but final_response was already set. No change to final_response: '{str(state.final_response)[:200]}...'")
+    # This node's primary job is to set state.final_response.
+    # It should generally provide a concluding message unless a prior node explicitly set a *different* final_response.
 
-    state.response = None         
+    # Check if a node *before* this explicitly set a final_response that is not a default/empty.
+    # This is defensive, as current core_logic.py nodes only set state.response.
+    if state.final_response and state.final_response.strip() and state.final_response != "Processing complete. How can I help you further?":
+        # A previous node explicitly set a meaningful final_response. Respect it.
+        logger.info(f"Responder: Using pre-existing state.final_response ('{state.final_response[:100]}...').")
+    # Elif state.response is still populated (this means the intermediate send in websocket_helpers might have been bypassed
+    # or this is a direct call to finalize_response with a message meant to be final).
+    elif state.response and state.response.strip():
+        state.final_response = state.response # Promote the current response to final.
+        logger.info(f"Responder: Promoting non-empty state.response ('{state.response[:100]}...') from previous node to final_response.")
+    else:
+        # Default final message if no specific final_response was set by a prior node,
+        # and the previous node's response was either cleared or not meant to be final.
+        state.final_response = "Processing complete. How can I help you further?"
+        logger.info(f"Responder: Setting default final_response.")
+    
+    # CRITICAL: finalize_response itself should not have a 'response' for intermediate sending.
+    # Its job is to set 'final_response'. Any 'response' it received should have been handled.
+    state.response = None 
+    
     state.next_step = None      
     state.intent = None         
     
     state.update_scratchpad_reason(tool_name, f"Final response set in state: {str(state.final_response)[:200]}...")
-    logger.info(f"Responder ({tool_name}): Exiting. state.final_response='{str(state.final_response)[:100]}...', state.response='{state.response}'")
+    logger.info(f"Responder ({tool_name}): Exiting. state.final_response='{str(state.final_response)[:100]}', state.response (outgoing from this node)='{state.response}'")
     return state
 
 
@@ -47,8 +65,8 @@ def build_graph(
     router_llm: Any,
     worker_llm: Any,
     api_executor_instance: APIExecutor, 
-    checkpointer: Optional[Any] # MODIFIED: Make checkpointer optional, can be None
-) -> Any: # Return type is effectively the compiled graph (Any for simplicity now)
+    checkpointer: Optional[Any] 
+) -> Any: 
     logger.info("Building LangGraph graph (Planning Graph - Graph 1)...")
     if checkpointer:
         logger.info("Compiling Planning Graph WITH checkpointer.")
@@ -135,7 +153,6 @@ def build_graph(
     builder.add_edge("responder", END)
 
     try:
-        # MODIFIED: Compile with or without checkpointer
         if checkpointer:
             app = builder.compile(checkpointer=checkpointer, debug=True)
             logger.info("LangGraph graph (Planning Graph - Graph 1) compiled successfully WITH checkpointer and debug mode.")
