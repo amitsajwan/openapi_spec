@@ -4,25 +4,26 @@ from typing import Any, Callable, Awaitable, Dict, Optional
 from collections import defaultdict
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.graph.state import StateSnapshot # For type hinting current_snapshot
 
-from models import BotState, ExecutionGraphState 
+from models import BotState, ExecutionGraphState, Node as PlanNode # Import PlanNode for type hint
+# We need access to the graph definition to get node details for the UI
+from execution_graph_definition import ExecutionGraphDefinition
+
 
 logger = logging.getLogger(__name__)
 
 class GraphExecutionManager:
-    """
-    Manages the runtime execution of a compiled LangGraph (Graph 2 - Execution Graph).
-    Handles streaming of graph execution, and manages resumption for human-in-the-loop steps
-    by checking for 'pending_confirmation_data' in the graph state updates from nodes.
-    """
     def __init__(
         self,
-        runnable_graph: Any,
+        runnable_graph: Any, # This is the compiled LangGraph
+        graph_definition: ExecutionGraphDefinition, # Pass the definition object
         websocket_callback: Callable[[str, Dict[str, Any], Optional[str]], Awaitable[None]],
         planning_checkpointer: Optional[BaseCheckpointSaver],
         main_planning_session_id: str
     ):
         self.runnable_graph: Any = runnable_graph
+        self.graph_definition = graph_definition # Store for fetching node details
         self.websocket_callback = websocket_callback
         self.planning_checkpointer = planning_checkpointer
         self.main_planning_session_id = main_planning_session_id
@@ -30,6 +31,7 @@ class GraphExecutionManager:
         logger.info(f"GraphExecutionManager initialized for Main Planning Session ID: {self.main_planning_session_id}")
 
     async def submit_resume_data(self, main_session_id: str, resume_data: Any) -> bool:
+        # ... (submit_resume_data remains the same)
         if main_session_id not in self.resume_queues:
              self.resume_queues[main_session_id] = asyncio.Queue()
              logger.info(f"Initialized resume queue for Main Session ID: {main_session_id} on first submit.")
@@ -45,6 +47,7 @@ class GraphExecutionManager:
             logger.warning(f"No active resume queue found for Main Session ID: {main_session_id}.")
             return False
 
+
     async def execute_workflow(
         self,
         initial_graph_values: Dict[str, Any],
@@ -52,138 +55,142 @@ class GraphExecutionManager:
     ) -> Optional[Dict[str, Any]]:
         graph2_thread_id = config.get("configurable", {}).get("thread_id")
         if not graph2_thread_id:
-            await self.websocket_callback(
-                "execution_error",
-                {"error": "ConfigurationError: thread_id is missing for ExecutionGraph."},
-                None
-            )
-            raise ValueError("thread_id is missing in config['configurable']['thread_id'] for ExecutionGraph (Graph 2).")
+            await self.websocket_callback("execution_error", {"error": "Config error: thread_id missing."}, None)
+            raise ValueError("thread_id missing for ExecutionGraph.")
 
-        final_state_dict: Optional[Dict[str, Any]] = None
-        logger.info(f"--- [Graph 2] Starting Workflow Execution for ThreadID: {graph2_thread_id} (Main Session: {self.main_planning_session_id}) ---")
-
+        logger.info(f"--- [Graph 2] Starting Workflow for ThreadID: {graph2_thread_id} ---")
         current_input_for_astream: Optional[Dict[str, Any]] = initial_graph_values
-        graph_has_ended_via_END_node = False
+        graph_has_ended = False
 
-        while not graph_has_ended_via_END_node:
-            paused_for_confirmation_this_cycle = False
+        while not graph_has_ended:
             try:
-                logger.debug(f"ThreadID '{graph2_thread_id}': Top of while loop. Input for astream: {str(current_input_for_astream)[:100]}...")
+                logger.debug(f"ThreadID '{graph2_thread_id}': Calling astream. Input: {str(current_input_for_astream)[:100]}...")
                 
+                # Collect all events from this astream iteration
+                events_in_iteration = []
                 async for event in self.runnable_graph.astream(current_input_for_astream, config=config):
-                    logger.debug(f"ThreadID '{graph2_thread_id}': Received event with keys: {list(event.keys())}")
-                    for node_name, node_output_state_update in event.items():
-                        if node_name == "__end__":
-                            logger.info(f"ThreadID '{graph2_thread_id}': Graph execution reached END state.")
-                            graph_has_ended_via_END_node = True
-                            break 
-
-                        logger.info(f"ThreadID '{graph2_thread_id}': Node '{node_name}' output. Keys: {list(node_output_state_update.keys()) if isinstance(node_output_state_update, dict) else type(node_output_state_update)}")
-
-                        if isinstance(node_output_state_update, dict):
-                            pending_conf_data = node_output_state_update.get("pending_confirmation_data")
-                            if pending_conf_data:
-                                logger.info(f"ThreadID '{graph2_thread_id}': Node '{node_name}' set pending_confirmation_data. Signaling pause.")
-                                interrupted_node_name = pending_conf_data.get("operationId", node_name)
-                                await self.websocket_callback(
-                                    "human_intervention_required",
-                                    {"node_name": interrupted_node_name, "details_for_ui": pending_conf_data},
-                                    graph2_thread_id
-                                )
-                                paused_for_confirmation_this_cycle = True
-                                break 
-                    
-                    if graph_has_ended_via_END_node or paused_for_confirmation_this_cycle:
+                    events_in_iteration.append(event)
+                    logger.debug(f"ThreadID '{graph2_thread_id}': Event received: {list(event.keys())}")
+                    if "__end__" in event:
+                        logger.info(f"ThreadID '{graph2_thread_id}': __end__ node reached.")
+                        graph_has_ended = True
                         break 
+                
+                if graph_has_ended:
+                    logger.info(f"ThreadID '{graph2_thread_id}': Graph ended via __end__ node.")
+                    break # Exit while loop
 
-                if graph_has_ended_via_END_node:
-                    logger.info(f"ThreadID '{graph2_thread_id}': Graph ended. Exiting main while loop.")
-                    break 
+                # If astream finished without hitting __end__, it means an interrupt occurred.
+                logger.info(f"ThreadID '{graph2_thread_id}': astream iteration completed. Graph paused due to interrupt_before.")
+                
+                # Get current state to find out what's next and prepare UI data
+                current_snapshot: StateSnapshot = self.runnable_graph.get_state(config)
+                if not current_snapshot:
+                    logger.error(f"ThreadID '{graph2_thread_id}': Failed to get state after interrupt.")
+                    await self.websocket_callback("execution_error", {"error": "Failed to get state after interrupt."}, graph2_thread_id)
+                    return {"error": "Failed to get state after interrupt."}
 
-                if paused_for_confirmation_this_cycle:
-                    logger.info(f"ThreadID '{graph2_thread_id}': Workflow paused. Waiting for resume data...")
-                    try:
-                        if self.main_planning_session_id not in self.resume_queues:
-                            self.resume_queues[self.main_planning_session_id] = asyncio.Queue()
+                # Determine the interrupted node. `next` usually holds the ID(s) of interrupted node(s).
+                interrupted_node_id: Optional[str] = None
+                if current_snapshot.next: # 'next' can be a string or a list of strings
+                    interrupted_node_id = current_snapshot.next[0] if isinstance(current_snapshot.next, list) and current_snapshot.next else \
+                                          current_snapshot.next if isinstance(current_snapshot.next, str) else None
+                
+                if not interrupted_node_id:
+                    logger.error(f"ThreadID '{graph2_thread_id}': Could not determine interrupted node from state.next: {current_snapshot.next}")
+                    await self.websocket_callback("execution_error", {"error": "Could not determine interrupted node."}, graph2_thread_id)
+                    return {"error": "Could not determine interrupted node."}
 
-                        resume_data = await asyncio.wait_for(self.resume_queues[self.main_planning_session_id].get(), timeout=600.0)
-                        logger.info(f"ThreadID '{graph2_thread_id}': Resuming with data: {str(resume_data)[:100]}")
+                logger.info(f"ThreadID '{graph2_thread_id}': Graph interrupted before node '{interrupted_node_id}'.")
 
-                        confirmation_key_from_ui = resume_data.get("confirmation_key")
-                        if not confirmation_key_from_ui:
-                            logger.error(f"ThreadID '{graph2_thread_id}': Resume data missing 'confirmation_key'.")
-                            raise ValueError("Resume data is missing the 'confirmation_key'.")
+                # Get the node definition from the plan to prepare UI details
+                node_def_for_ui: Optional[PlanNode] = self.graph_definition.get_node_definition(interrupted_node_id)
+                if not node_def_for_ui:
+                    logger.error(f"ThreadID '{graph2_thread_id}': Could not find definition for interrupted node '{interrupted_node_id}'.")
+                    await self.websocket_callback("execution_error", {"error": f"Definition for node {interrupted_node_id} not found."}, graph2_thread_id)
+                    return {"error": f"Definition for node {interrupted_node_id} not found."}
 
-                        update_for_resume_state = {
-                            "confirmed_data": { 
-                                confirmation_key_from_ui: resume_data.get("decision", True),
-                                f"{confirmation_key_from_ui}_details": resume_data
-                            },
-                            "pending_confirmation_data": None 
+                # Prepare data for the UI confirmation modal
+                # The node hasn't run yet, so we use its definition and current state to make the payload
+                temp_state_for_payload_prep = ExecutionGraphState.model_validate(current_snapshot.values)
+                _, _, prepared_payload, _ = self.graph_definition._prepare_api_request_components(node_def_for_ui, temp_state_for_payload_prep)
+
+                details_for_ui = {
+                    "type": "api_call_confirmation", # Consistent with frontend
+                    "operationId": node_def_for_ui.operationId,
+                    "method": node_def_for_ui.method,
+                    "path": node_def_for_ui.path, # Path template
+                    "payload_to_confirm": prepared_payload, # Payload based on current state
+                    "prompt": node_def_for_ui.confirmation_prompt or f"Confirm API call: {node_def_for_ui.method} {node_def_for_ui.path}?",
+                    "confirmation_key": f"confirmed_{node_def_for_ui.effective_id}"
+                }
+                
+                await self.websocket_callback("human_intervention_required", {"node_name": interrupted_node_id, "details_for_ui": details_for_ui}, graph2_thread_id)
+                
+                try:
+                    if self.main_planning_session_id not in self.resume_queues:
+                        self.resume_queues[self.main_planning_session_id] = asyncio.Queue()
+                    resume_data = await asyncio.wait_for(self.resume_queues[self.main_planning_session_id].get(), timeout=600.0)
+                    
+                    confirmation_key = resume_data.get("confirmation_key")
+                    decision = resume_data.get("decision", False) # Default to False if not specified
+
+                    if not confirmation_key:
+                        raise ValueError("Resume data missing 'confirmation_key'.")
+
+                    update_for_resume_state = {
+                        "confirmed_data": {
+                            confirmation_key: decision,
+                            f"{confirmation_key}_details": resume_data 
                         }
-                        
-                        # MODIFICATION: Removed await
-                        self.runnable_graph.update_state(config, update_for_resume_state)
-                        current_input_for_astream = None 
-                        logger.info(f"ThreadID '{graph2_thread_id}': State updated for resume. Continuing workflow in next iteration.")
-                    
-                    except asyncio.TimeoutError:
-                        interrupted_node_name_for_timeout = "Unknown (timeout waiting for resume)"
-                        error_msg = f"ThreadID '{graph2_thread_id}': Timeout waiting for resume data."
-                        logger.error(error_msg)
-                        await self.websocket_callback("workflow_timeout", {"message": error_msg, "node_name": interrupted_node_name_for_timeout}, graph2_thread_id)
-                        try: 
-                            # MODIFICATION: Removed await
-                            self.runnable_graph.update_state(config, {"error": "ConfirmationTimeout", "pending_confirmation_data": None})
-                        except Exception as e_up: logger.error(f"Failed to update state on timeout: {e_up}")
-                        final_state_on_timeout = self.runnable_graph.get_state(config)
-                        return final_state_on_timeout.values if final_state_on_timeout else {"error": error_msg}
-                    
-                    except Exception as e_resume_proc:
-                        error_msg = f"ThreadID '{graph2_thread_id}': Error processing resume data: {type(e_resume_proc).__name__} - {e_resume_proc}"
-                        logger.error(error_msg, exc_info=True)
-                        await self.websocket_callback("execution_error", {"error": error_msg}, graph2_thread_id)
-                        try: 
-                            # MODIFICATION: Removed await
-                            self.runnable_graph.update_state(config, {"error": error_msg, "pending_confirmation_data": None})
-                        except Exception as e_up: logger.error(f"Failed to update state on resume error: {e_up}")
-                        final_state_on_resume_err = self.runnable_graph.get_state(config)
-                        return final_state_on_resume_err.values if final_state_on_resume_err else {"error": error_msg}
-                else:
-                    logger.debug(f"ThreadID '{graph2_thread_id}': Iteration complete, no pause signaled in this chunk. Continuing to next step.")
-                    current_input_for_astream = None 
+                        # No need to manage pending_confirmation_data in state with this interrupt pattern
+                    }
+                    if not decision: # If user cancelled
+                        logger.info(f"ThreadID '{graph2_thread_id}': User cancelled operation for node '{interrupted_node_id}'. Stopping workflow.")
+                        # To truly stop, we might need to route to an error/end state or raise specific exception
+                        # For now, update state and let it error out or end if no path forward.
+                        self.runnable_graph.update_state(config, {"error": f"User cancelled operation: {interrupted_node_id}", **update_for_resume_state})
+                        graph_has_ended = True # Treat as ended
+                        continue # Go to final state retrieval
 
-            except Exception as e_stream_loop:
-                error_message = f"Critical error in ExecutionGraph (Graph 2) stream loop for ThreadID '{graph2_thread_id}': {type(e_stream_loop).__name__} - {str(e_stream_loop)}"
-                logger.critical(error_message, exc_info=True)
-                await self.websocket_callback("execution_error", {"error": error_message}, graph2_thread_id)
-                try: 
-                    # MODIFICATION: Removed await
-                    self.runnable_graph.update_state(config, {"error": error_message, "pending_confirmation_data": None})
-                except Exception as e_up: logger.error(f"Failed to update state on critical error: {e_up}")
-                critical_error_snapshot = self.runnable_graph.get_state(config)
-                return critical_error_snapshot.values if critical_error_snapshot else {"error": error_message}
-            
+                    self.runnable_graph.update_state(config, update_for_resume_state)
+                    current_input_for_astream = None # Resume from checkpoint
+                    logger.info(f"ThreadID '{graph2_thread_id}': State updated for resume. Continuing.")
+
+                except asyncio.TimeoutError:
+                    error_msg = f"ThreadID '{graph2_thread_id}': Timeout waiting for resume for '{interrupted_node_id}'."
+                    logger.error(error_msg)
+                    await self.websocket_callback("workflow_timeout", {"message": error_msg, "node_name": interrupted_node_id}, graph2_thread_id)
+                    self.runnable_graph.update_state(config, {"error": "ConfirmationTimeout"})
+                    return self.runnable_graph.get_state(config).values
+                
+                except Exception as e_resume:
+                    error_msg = f"ThreadID '{graph2_thread_id}': Error processing resume: {e_resume}"
+                    logger.error(error_msg, exc_info=True)
+                    await self.websocket_callback("execution_error", {"error": error_msg}, graph2_thread_id)
+                    self.runnable_graph.update_state(config, {"error": error_msg})
+                    return self.runnable_graph.get_state(config).values
+
+            except Exception as e_loop:
+                error_msg = f"Critical error in workflow for ThreadID '{graph2_thread_id}': {e_loop}"
+                logger.critical(error_msg, exc_info=True)
+                await self.websocket_callback("execution_error", {"error": error_msg}, graph2_thread_id)
+                try: self.runnable_graph.update_state(config, {"error": error_msg})
+                except: pass # Best effort
+                return self.runnable_graph.get_state(config).values if self.runnable_graph else {"error": error_msg}
+
+        # After while loop (graph_has_ended is True)
         try:
-            logger.info(f"Graph 2 ThreadID '{graph2_thread_id}': Workflow processing loop ended. Getting final state.")
-            final_state_snapshot = self.runnable_graph.get_state(config) 
-            if final_state_snapshot and hasattr(final_state_snapshot, 'values'):
-                final_state_dict = final_state_snapshot.values
-                if final_state_dict.get("error"):
-                     await self.websocket_callback("execution_failed", {"final_state": final_state_dict}, graph2_thread_id)
-                     logger.error(f"--- [Graph 2] Workflow FAILED for ThreadID: {graph2_thread_id}. Error: {final_state_dict['error']} ---")
-                else:
-                    await self.websocket_callback("execution_completed", {"final_state": final_state_dict}, graph2_thread_id)
-                    logger.info(f"--- [Graph 2] Workflow COMPLETED SUCCESSFULLY for ThreadID: {graph2_thread_id} ---")
+            logger.info(f"ThreadID '{graph2_thread_id}': Workflow ended. Getting final state.")
+            final_snapshot = self.runnable_graph.get_state(config)
+            final_state_dict = final_snapshot.values if final_snapshot else {}
+            if final_state_dict.get("error"):
+                await self.websocket_callback("execution_failed", {"final_state": final_state_dict}, graph2_thread_id)
             else:
-                await self.websocket_callback("execution_warning", {"message": "Execution finished, but no final state snapshot retrieved."}, graph2_thread_id)
-                logger.warning(f"--- [Graph 2] Workflow FINISHED (No Final State Snapshot) for ThreadID: {graph2_thread_id} ---")
-        
-        except Exception as e_get_final_state:
-            error_message = f"Error retrieving final state for Graph 2 ThreadID '{graph2_thread_id}': {type(e_get_final_state).__name__} - {str(e_get_final_state)}"
-            logger.error(error_message, exc_info=True)
-            await self.websocket_callback("execution_error", {"error": error_message, "detail": "Failed to get final state."}, graph2_thread_id)
-            final_state_dict = {"error": error_message}
-            
-        return final_state_dict
-        
+                await self.websocket_callback("execution_completed", {"final_state": final_state_dict}, graph2_thread_id)
+            return final_state_dict
+        except Exception as e_final:
+            error_msg = f"Error getting final state for ThreadID '{graph2_thread_id}': {e_final}"
+            logger.error(error_msg, exc_info=True)
+            await self.websocket_callback("execution_error", {"error": error_msg}, graph2_thread_id)
+            return {"error": error_msg}
