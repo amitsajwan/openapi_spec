@@ -3,36 +3,24 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OpenAPI Agent Interface</title>
+    <title>OpenAPI Workflow Agent</title>
     <link rel="stylesheet" href="/static/style.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" rel="stylesheet">
 </head>
 <body>
     <div class="app-container">
         <header class="app-header">
-            <h1>OpenAPI Workflow Agent</h1>
+            <div class="logo-title">
+                <i class="fas fa-cogs header-icon"></i>
+                <h1>OpenAPI Workflow Agent</h1>
+            </div>
+            <div class="header-actions">
+                </div>
         </header>
 
         <main class="main-content">
-            <div class="left-panel">
-                <div class="graph-view-panel">
-                    <h2>Execution Graph</h2>
-                    <div class="tab-controls">
-                        <button id="jsonTabButton" class="tab-button active" onclick="showGraphTab('json')">JSON</button>
-                        <button id="dagTabButton" class="tab-button" onclick="showGraphTab('dag')">DAG</button>
-                    </div>
-                    <div id="graphJsonViewContent" class="tab-pane active">
-                        <pre id="graphJsonViewPre">No graph loaded yet. Paste an OpenAPI spec and generate a plan.</pre>
-                    </div>
-                    <div id="graphDagViewContent" class="tab-pane">
-                        <div class="mermaid-container" id="mermaidDagDiagram">
-                            Graph will appear here once loaded and DAG tab is active.
-                        </div>
-                    </div>
-                </div>
-                </div>
-
-            <div class="right-panel chat-panel">
+            <div class="chat-panel-container">
                 <div id="chatMessages" class="chat-messages-container">
                     <div class="message agent-message">
                         <div class="message-sender">Agent</div>
@@ -44,11 +32,31 @@
                 <div class="chat-input-area">
                     <textarea id="userInput" placeholder="Enter OpenAPI spec, ask a question, or provide input..." rows="3"></textarea>
                     <div class="chat-buttons">
-                        <button id="sendButton" class="action-button primary-button" onclick="sendMessage()">
-                            Send
+                        <button id="sendButton" class="action-button primary-button" onclick="sendMessage()" title="Send Message">
+                            <i class="fas fa-paper-plane"></i> Send
                             <div class="spinner" id="thinkingIndicator" style="display: none;"></div>
                         </button>
-                        <button id="runWorkflowButton" class="action-button secondary-button" onclick="runCurrentWorkflow()">Run Workflow</button>
+                         <button id="runWorkflowButton" class="action-button secondary-button" onclick="runCurrentWorkflow()" title="Run Current Workflow">
+                            <i class="fas fa-play-circle"></i> Run Workflow
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="graph-details-panel-container">
+                <div class="graph-view-panel">
+                    <h2>Execution Graph</h2>
+                    <div class="tab-controls">
+                        <button id="dagTabButton" class="tab-button" onclick="showGraphTab('dag')">DAG View</button>
+                        <button id="jsonTabButton" class="tab-button" onclick="showGraphTab('json')">JSON View</button>
+                    </div>
+                    <div id="graphDagViewContent" class="tab-pane">
+                        <div class="mermaid-container" id="mermaidDagDiagram">
+                            Graph will appear here once loaded.
+                        </div>
+                    </div>
+                    <div id="graphJsonViewContent" class="tab-pane">
+                        <pre id="graphJsonViewPre">JSON representation of the graph will appear here.</pre>
                     </div>
                 </div>
             </div>
@@ -57,21 +65,24 @@
 
     <div id="confirmationModal" class="modal-overlay" style="display: none;">
         <div class="modal-content">
-            <h3 id="modalTitle">Confirm Action</h3>
-            <div class="modal-details">
+            <div class="modal-header">
+                <h3 id="modalTitle">Confirm Action</h3>
+                <button class="modal-close-button" onclick="hideConfirmationModal()" title="Close"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body">
                 <p><strong>Operation ID:</strong> <span id="modalOperationId">N/A</span></p>
                 <p><strong>Effective Node ID:</strong> <span id="modalEffectiveNodeId">N/A</span></p>
                 <p><strong>Method:</strong> <span id="modalMethod">N/A</span></p>
                 <p><strong>Path:</strong> <code id="modalPath">N/A</code></p>
-                <p><strong>Graph2 Thread ID:</strong> <code id="modalGraph2ThreadId" style="font-size: 0.8em; color: #555;">N/A</code></p>
+                <p><strong>Graph2 Thread ID:</strong> <code id="modalGraph2ThreadId">N/A</code></p>
                 <div class="payload-editor">
                     <label for="modalPayload"><strong>Request Payload (JSON):</strong></label>
                     <textarea id="modalPayload" rows="10" placeholder="Enter or modify JSON payload..."></textarea>
                 </div>
             </div>
             <div class="modal-actions">
-                <button id="modalConfirmButton" class.action-button primary-button">Confirm & Proceed</button>
                 <button id="modalCancelButton" class="action-button tertiary-button">Cancel</button> 
+                <button id="modalConfirmButton" class="action-button primary-button">Confirm & Proceed</button>
             </div>
         </div>
     </div>
@@ -79,7 +90,20 @@
     <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
     <script>
         if (typeof mermaid !== 'undefined') {
-            mermaid.initialize({ startOnLoad: false, theme: 'neutral' }); // Can also use 'dark', 'forest', 'default'
+            mermaid.initialize({ 
+                startOnLoad: false, 
+                theme: 'neutral', // Options: 'default', 'neutral', 'dark', 'forest'
+                // For more advanced styling with Mermaid:
+                // mermaidAPI.initialize({
+                //     theme: 'base',
+                //     themeVariables: {
+                //         primaryColor: '#007bff',
+                //         primaryTextColor: '#fff',
+                //         lineColor: '#555',
+                //         // ... other variables
+                //     }
+                // });
+            });
         } else {
             console.error("Mermaid.js library not loaded.");
         }
