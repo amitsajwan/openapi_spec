@@ -81,10 +81,10 @@ class GraphExecutionManager:
 
                 if graph_has_ended_via_END_node:
                     logger.info(f"Graph 2 ThreadID '{graph2_thread_id}': Graph explicitly ended via __end__ node.")
-                    break
+                    break # Exit the while loop, proceed to get final state
 
+                # If graph hasn't ended, check the state for pending confirmation
                 logger.debug(f"Graph 2 ThreadID '{graph2_thread_id}': astream iteration finished. Checking state for pending confirmation.")
-                # MODIFICATION: Removed await
                 current_snapshot = self.runnable_graph.get_state(config)
                 current_state_values = current_snapshot.values if current_snapshot and hasattr(current_snapshot, 'values') else {}
                 
@@ -122,18 +122,17 @@ class GraphExecutionManager:
                         }
                         
                         await self.runnable_graph.update_state(config, update_for_resume_state)
-                        current_input_for_astream = None
+                        current_input_for_astream = None # LangGraph will use checkpointed state
                         logger.info(f"Graph 2 ThreadID '{graph2_thread_id}': State updated for resume. Continuing workflow.")
+                        # The while loop will continue, and astream will be called again.
                     
                     except asyncio.TimeoutError:
                         error_msg = f"Graph 2 ThreadID '{graph2_thread_id}': Timeout waiting for resume data for node '{interrupted_node_name}'."
                         logger.error(error_msg)
                         await self.websocket_callback("workflow_timeout", {"message": error_msg, "node_name": interrupted_node_name}, graph2_thread_id)
                         try: 
-                            # MODIFICATION: Removed await
                             self.runnable_graph.update_state(config, {"error": "ConfirmationTimeout", "pending_confirmation_data": None})
                         except Exception as e_up: logger.error(f"Failed to update state on timeout: {e_up}")
-                        # MODIFICATION: Removed await
                         error_snapshot_on_timeout = self.runnable_graph.get_state(config)
                         return error_snapshot_on_timeout.values if error_snapshot_on_timeout else {"error": error_msg}
                     
@@ -142,32 +141,32 @@ class GraphExecutionManager:
                         logger.error(error_msg, exc_info=True)
                         await self.websocket_callback("execution_error", {"error": error_msg}, graph2_thread_id)
                         try: 
-                            # MODIFICATION: Removed await
                             self.runnable_graph.update_state(config, {"error": error_msg, "pending_confirmation_data": None})
                         except Exception as e_up: logger.error(f"Failed to update state on resume error: {e_up}")
-                        # MODIFICATION: Removed await
                         error_snapshot_on_resume_error = self.runnable_graph.get_state(config)
                         return error_snapshot_on_resume_error.values if error_snapshot_on_resume_error else {"error": error_msg}
                 
+                # REMOVED else block that prematurely set graph_has_ended_via_END_node = True
+                # If no pending confirmation and not __end__, the loop continues naturally.
+                # current_input_for_astream will be None (if a node just ran) or initial_graph_values (first run).
+                # LangGraph's astream(None, ...) will correctly pick up the next node.
                 else:
-                    logger.warning(f"Graph 2 ThreadID '{graph2_thread_id}': astream iteration finished, not at __end__, and no pending confirmation. Assuming graph completion or stall.")
-                    graph_has_ended_via_END_node = True
+                    logger.debug(f"Graph 2 ThreadID '{graph2_thread_id}': No pending confirmation. Loop continues for next node if graph not ended.")
+                    current_input_for_astream = None # Ensure next astream call uses checkpoint
 
             except Exception as e_stream_loop:
                 error_message = f"Critical error in ExecutionGraph (Graph 2) stream loop for ThreadID '{graph2_thread_id}': {type(e_stream_loop).__name__} - {str(e_stream_loop)}"
                 logger.critical(error_message, exc_info=True)
                 await self.websocket_callback("execution_error", {"error": error_message}, graph2_thread_id)
                 try: 
-                    # MODIFICATION: Removed await
                     self.runnable_graph.update_state(config, {"error": error_message, "pending_confirmation_data": None})
                 except Exception as e_up: logger.error(f"Failed to update state on critical error: {e_up}")
-                # MODIFICATION: Removed await
                 critical_error_snapshot = self.runnable_graph.get_state(config)
                 return critical_error_snapshot.values if critical_error_snapshot else {"error": error_message}
             
+        # After the while loop (graph_has_ended_via_END_node is True)
         try:
             logger.info(f"Graph 2 ThreadID '{graph2_thread_id}': Workflow processing loop ended. Getting final state.")
-            # MODIFICATION: Removed await
             final_state_snapshot = self.runnable_graph.get_state(config)
             if final_state_snapshot and hasattr(final_state_snapshot, 'values'):
                 final_state_dict = final_state_snapshot.values
