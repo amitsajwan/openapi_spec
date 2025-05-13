@@ -5,7 +5,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const chatMessagesDiv = document.getElementById('chatMessages');
     const userInput = document.getElementById('userInput');
     const sendButton = document.getElementById('sendButton');
-    const thinkingIndicator = document.getElementById('thinkingIndicator');
+    // Spinner is now part of sendButton's dynamic HTML
     const runWorkflowButton = document.getElementById('runWorkflowButton');
 
     const graphJsonViewPre = document.getElementById('graphJsonViewPre');
@@ -29,6 +29,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     let ws;
     let currentGraphData = null;
+    const initialSendButtonHTML = sendButton.innerHTML; 
+
     let currentConfirmationContext = {
         graph2ThreadId: null,
         confirmationKey: null,
@@ -36,12 +38,21 @@ document.addEventListener('DOMContentLoaded', () => {
         effectiveNodeId: null 
     };
 
-    function showThinking(show) {
-        thinkingIndicator.style.display = show ? 'inline-block' : 'none';
-        sendButton.disabled = show;
-        userInput.disabled = show;
-        runWorkflowButton.disabled = show; 
+    function updateSendButtonState(isThinking) {
+        if (isThinking) {
+            sendButton.classList.add('thinking');
+            sendButton.innerHTML = `<div class="spinner" style="display: inline-block;"></div> Thinking...`; 
+            sendButton.disabled = true;
+            userInput.disabled = true;
+        } else {
+            sendButton.classList.remove('thinking');
+            sendButton.innerHTML = initialSendButtonHTML; 
+            sendButton.disabled = false;
+            userInput.disabled = false;
+        }
+        runWorkflowButton.disabled = isThinking || !currentGraphData;
     }
+
 
     function escapeHtml(unsafe) {
         if (typeof unsafe !== 'string') {
@@ -73,13 +84,14 @@ document.addEventListener('DOMContentLoaded', () => {
         } else if (sourceGraph === "system" || sender === "System") {
             senderClass = 'system-message';
             senderName = 'System';
-        } else if (sender === 'Planner') { 
+        } else if (sender === 'Planner' || sourceGraph === 'graph1_planning') { // Catch all planner messages
             senderClass = 'planner-message';
+            senderName = 'Planner'; // Standardize sender name for planner
         }
         
         messageElement.classList.add('message', senderClass);
-        if (type === 'error' || (typeof content === 'object' && content && content.error)) {
-            messageElement.classList.add('error-message');
+        if (chatMessagesDiv.children.length > 1) { 
+             setTimeout(() => messageElement.classList.add('new-message-animation'), 50);
         }
 
         const senderElement = document.createElement('div');
@@ -89,19 +101,21 @@ document.addEventListener('DOMContentLoaded', () => {
         const contentElement = document.createElement('div');
         contentElement.classList.add('message-content');
 
+        // Original content formatting logic (before error handling)
         if (typeof content === 'string') {
             let formattedContent = content.replace(/```([\s\S]*?)```/g, (match, code) => {
                 return `<pre><code>${escapeHtml(code.trim())}</code></pre>`;
             });
             formattedContent = formattedContent.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
             formattedContent = formattedContent.replace(/\*(.*?)\*/g, '<em>$1</em>');
+            formattedContent = formattedContent.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
             contentElement.innerHTML = formattedContent.split('\n').map(line => `<p>${line}</p>`).join('');
         } else if (typeof content === 'object' && content !== null) {
             if (sourceGraph === "graph2_execution") {
                  let detailsHtml = "";
                  if (content.node_name) detailsHtml += `<strong>Node:</strong> ${escapeHtml(content.node_name)}<br>`;
                  if (content.input_preview) detailsHtml += `Input Preview: <pre>${escapeHtml(content.input_preview)}</pre>`;
-                 if (content.status_code) detailsHtml += `Status: ${escapeHtml(content.status_code)} `;
+                 if (content.status_code) detailsHtml += `Status: <span class="status-code status-${String(content.status_code).charAt(0)}xx">${escapeHtml(content.status_code)}</span> `;
                  if (content.execution_time) detailsHtml += `(Took: ${escapeHtml(content.execution_time)}s)<br>`;
                  if (content.response_preview) detailsHtml += `Response Preview: <pre>${escapeHtml(content.response_preview)}</pre>`;
                  if (content.raw_output_from_node && type === "tool_end") { 
@@ -116,16 +130,38 @@ document.addEventListener('DOMContentLoaded', () => {
                     detailsHtml += `Final State (details): <pre>${escapeHtml(content.final_state)}</pre>`;
                  }
                  contentElement.innerHTML = detailsHtml || `<pre>${escapeHtml(content)}</pre>`; 
-            } else if (content.message) { 
+            } else if (content.message) { // For planner or other object messages with a 'message' field
                 contentElement.innerHTML = `<p>${escapeHtml(content.message)}</p>`;
                  if (content.details) { 
                     contentElement.innerHTML += `<pre>${escapeHtml(content.details)}</pre>`;
                  }
-            } else { 
+            } else { // Fallback for other objects
                 contentElement.innerHTML = `<pre>${escapeHtml(content)}</pre>`;
             }
         } else {
              contentElement.innerHTML = `<p>${escapeHtml(String(content))}</p>`;
+        }
+        
+        // Apply error styling based on type and source
+        if (type === 'error' || (typeof content === 'object' && content && content.error)) {
+            if (sourceGraph === 'graph1_planning') { // Planner-specific error handling
+                let errorPrefix = `<strong style="color: var(--error-color); font-weight: bold;">Planner Alert:</strong> `;
+                let currentContent = contentElement.innerHTML; // Get already formatted content
+
+                if (typeof content === 'object' && content.error) {
+                    // If error is in a sub-field, ensure it's displayed prominently
+                    contentElement.innerHTML = errorPrefix + `<pre>${escapeHtml(content.error)}</pre>`;
+                     if (content.message && content.message !== content.error) { // Add original message if different
+                        contentElement.innerHTML += `<p><em>Original message: ${escapeHtml(content.message)}</em></p>`;
+                    }
+                } else { // Error message is the main content (already formatted)
+                     contentElement.innerHTML = errorPrefix + currentContent;
+                }
+                // No 'error-message' class for background, relies on planner-message style
+            } else {
+                // For other sources (system, workflow), apply the full error styling (red background)
+                messageElement.classList.add('error-message');
+            }
         }
         
         messageElement.appendChild(senderElement);
@@ -143,15 +179,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
         ws.onopen = () => {
             addMessageToChat('System', 'Successfully connected to the agent.', 'system', 'system');
-            showThinking(false);
+            updateSendButtonState(false);
             runWorkflowButton.disabled = true; 
+            updateGraphViewEmptyState(true); 
         };
 
         ws.onmessage = (event) => {
             try {
                 const data = JSON.parse(event.data);
                 console.log("WS RX:", data); 
-                showThinking(false); 
+                updateSendButtonState(false); 
 
                 let sender = 'Agent'; 
                 let messageContent = data.content;
@@ -159,19 +196,27 @@ document.addEventListener('DOMContentLoaded', () => {
                 let sourceGraph = data.source || "unknown_source";
 
                 if (sourceGraph === 'graph1_planning') {
-                    sender = 'Planner';
+                    sender = 'Planner'; // This will be used by addMessageToChat
                     if (data.type === "graph_update") {
                         currentGraphData = data.content;
                         graphJsonViewPre.textContent = JSON.stringify(currentGraphData, null, 2);
                         addMessageToChat('System', 'Execution graph has been updated.', 'system', 'system');
+                        updateGraphViewEmptyState(false); 
                         if (graphDagViewContent.classList.contains('active')) {
                             renderMermaidGraphUI(currentGraphData);
                         }
                         runWorkflowButton.disabled = !currentGraphData; 
                         return; 
                     }
-                    messageContent = data.content.message || data.content; 
+                    // For graph1, content can be {message: "..."} or a direct string if error
+                    messageContent = (typeof data.content === 'object' && data.content !== null && data.content.message) ? data.content.message : data.content;
+                     if (typeof data.content === 'object' && data.content !== null && data.content.error && !messageContent){
+                        messageContent = data.content.error; // If error is the primary content
+                    }
+
                 } else if (sourceGraph === 'graph2_execution') {
+                    // Sender name will be derived from type in addMessageToChat
+                    // messageContent is already data.content
                     if (data.type === "execution_completed" || data.type === "execution_failed" || data.type === "workflow_timeout") {
                         runWorkflowButton.disabled = !currentGraphData; 
                     }
@@ -194,20 +239,20 @@ document.addEventListener('DOMContentLoaded', () => {
             } catch (error) {
                 console.error("Error processing WebSocket message:", error, "Raw data:", event.data);
                 addMessageToChat('System', 'Error processing message from server. Check console.', 'error', 'system');
-                showThinking(false);
+                updateSendButtonState(false);
             }
         };
 
         ws.onerror = (error) => {
             console.error('WebSocket Error:', error);
             addMessageToChat('System', 'WebSocket connection error. Check console.', 'error', 'system');
-            showThinking(false);
+            updateSendButtonState(false);
             runWorkflowButton.disabled = true;
         };
 
         ws.onclose = (event) => {
             addMessageToChat('System', `WebSocket disconnected. Code: ${event.code}. Attempting to reconnect in 5 seconds...`, 'system', 'system');
-            showThinking(false);
+            updateSendButtonState(false);
             runWorkflowButton.disabled = true;
             setTimeout(connectWebSocket, 5000);
         };
@@ -224,7 +269,7 @@ document.addEventListener('DOMContentLoaded', () => {
         ws.send(messageText);
         userInput.value = '';
         userInput.style.height = 'auto'; 
-        showThinking(true);
+        updateSendButtonState(true); 
     };
 
     window.runCurrentWorkflow = () => {
@@ -240,9 +285,25 @@ document.addEventListener('DOMContentLoaded', () => {
         addMessageToChat('You', command, 'user', 'user_input');
         ws.send(command);
         addMessageToChat('System', "Requesting to run the current workflow...", 'status', 'system');
-        showThinking(true);
+        updateSendButtonState(true); 
         runWorkflowButton.disabled = true; 
     };
+
+    function updateGraphViewEmptyState(isEmpty) {
+        const dagTabPane = graphDagViewContent; 
+        const jsonTabPane = graphJsonViewContent;
+
+        if (isEmpty) {
+            dagTabPane.classList.add('is-empty');
+            jsonTabPane.classList.add('is-empty');
+            graphJsonViewPre.textContent = "JSON representation of the graph will appear here once a plan is generated.";
+            renderMermaidGraphUI(null); 
+        } else {
+            dagTabPane.classList.remove('is-empty');
+            jsonTabPane.classList.remove('is-empty');
+        }
+    }
+
 
     window.showGraphTab = (tabName) => {
         graphJsonViewContent.style.display = 'none';
@@ -260,23 +321,46 @@ document.addEventListener('DOMContentLoaded', () => {
             graphDagViewContent.style.display = 'flex'; 
             graphDagViewContent.classList.add('active');
             dagTabButton.classList.add('active');
-            renderMermaidGraphUI(currentGraphData);
+            renderMermaidGraphUI(currentGraphData); 
         }
+        updateGraphViewEmptyState(!currentGraphData);
     };
 
     function generateMermaidDefinition(graph) {
-        if (!graph || !graph.nodes || !graph.edges) {
-            return "graph TD\n    empty[\"No graph data or invalid format.\"];";
-        }
-        let def = "graph TD;\n";
-        // More distinct styling for nodes
-        def += "    classDef startEnd fill:#607d8b,stroke:#455a64,stroke-width:2px,color:white,font-weight:bold,rx:8,ry:8,padding:10px 15px;\n"; // Darker Grey
-        def += "    classDef apiNode fill:var(--primary-color),stroke:var(--primary-hover-color),stroke-width:2px,color:white,rx:8,ry:8,padding:10px 15px;\n";
-        def += "    classDef confirmedNode fill:var(--success-color),stroke:#1e7e34,stroke-width:2px,color:white,rx:8,ry:8,padding:10px 15px;\n"; 
-        def += "    classDef skippedNode fill:var(--warning-color),stroke:#b8860b,stroke-width:2px,color:#333,rx:8,ry:8,padding:10px 15px;\n"; 
-        def += "    classDef errorNode fill:var(--error-color),stroke:#a71d2a,stroke-width:2px,color:white,rx:8,ry:8,padding:10px 15px;\n"; 
-        def += "    classDef interruptNode fill:var(--accent-color),stroke:#0f6c7a,stroke-width:2px,color:white,rx:8,ry:8,padding:10px 15px;\n"; // For nodes requiring confirmation
+        const emptyFill = '#fcfcfc'; 
+        const emptyStroke = '#e0e0e0'; 
+        const emptyColor = '#7f8c8d'; 
 
+        const defaultNodeFill = '#ECEFF1'; 
+        const defaultNodeStroke = '#90A4AE'; 
+        const defaultNodeTextColor = '#37474F'; 
+        
+        const startEndFill = '#546E7A';
+        const startEndStroke = '#37474F';
+        const apiNodeFill = '#007AFF'; 
+        const apiNodeStroke = '#0056b3'; 
+        const confirmedNodeFill = '#28a745'; 
+        const confirmedNodeStroke = '#1E8E3E';
+        const skippedNodeFill = '#ffc107'; 
+        const skippedNodeStroke = '#F57F17';
+        const skippedNodeTextColor = '#212121';
+        const errorNodeFill = '#dc3545'; 
+        const errorNodeStroke = '#B71C1C';
+        const interruptNodeFill = '#17a2b8'; 
+        const interruptNodeStroke = '#0D8A9F';
+
+        if (!graph || !graph.nodes || !graph.edges) {
+            return `graph TD\n    empty[<i class='fas fa-drafting-compass icon-placeholder'></i><br/>No Workflow Graph Available<br/><small>Please provide an OpenAPI specification and define a goal to generate a visual workflow.</small>];\n    classDef empty fill:${emptyFill},stroke:${emptyStroke},color:${emptyColor},padding:30px,font-style:italic,text-align:center,rx:12px,ry:12px,font-size:14px,border-width:1px,border-style:dashed;`;
+        }
+        
+        let def = "graph TD;\n";
+        def += `    classDef default fill:${defaultNodeFill},stroke:${defaultNodeStroke},stroke-width:1.5px,color:${defaultNodeTextColor},rx:6px,ry:6px,padding:10px 15px,font-size:13px,font-family:'Inter';\n`; 
+        def += `    classDef startEnd fill:${startEndFill},stroke:${startEndStroke},color:white,font-weight:bold;\n`;
+        def += `    classDef apiNode fill:${apiNodeFill},stroke:${apiNodeStroke},color:white;\n`;
+        def += `    classDef confirmedNode fill:${confirmedNodeFill},stroke:${confirmedNodeStroke},color:white;\n`; 
+        def += `    classDef skippedNode fill:${skippedNodeFill},stroke:${skippedNodeStroke},color:${skippedNodeTextColor};\n`;
+        def += `    classDef errorNode fill:${errorNodeFill},stroke:${errorNodeStroke},color:white;\n`; 
+        def += `    classDef interruptNode fill:${interruptNodeFill},stroke:${interruptNodeStroke},color:white;\n`; 
 
         const sanitizeId = (id) => String(id).replace(/[^a-zA-Z0-9_]/g, '_');
 
@@ -288,59 +372,73 @@ document.addEventListener('DOMContentLoaded', () => {
             } else {
                 labelText = `<b>${escapeHtml(node.operationId)}</b><br/><small>(${escapeHtml(node.effective_id)})</small>`;
             }
-            def += `    ${id}("${labelText}");\n`;
+            
+            def += `    ${id}("${labelText.replace(/"/g, '#quot;')}");\n`; 
+             
+            let nodeClass = 'apiNode'; 
             if (node.operationId === "START_NODE" || node.operationId === "END_NODE") {
-                def += `    class ${id} startEnd;\n`;
-            } else if (node.requires_confirmation) {
-                 def += `    class ${id} interruptNode;\n`;
+                nodeClass = 'startEnd';
+            } else if (node.requires_confirmation) { 
+                 nodeClass = 'interruptNode';
             }
-            else {
-                def += `    class ${id} apiNode;\n`; 
-            }
+            def += `    class ${id} ${nodeClass};\n`; 
         });
 
         graph.edges.forEach(edge => {
             const from = sanitizeId(edge.from_node);
             const to = sanitizeId(edge.to_node);
-            const label = edge.description ? `|"${escapeHtml(edge.description.substring(0, 50))}"|` : "";
+            const label = edge.description ? `|"${escapeHtml(edge.description.substring(0, 50)).replace(/"/g, '#quot;')}"|` : "";
             def += `    ${from} -->${label} ${to};\n`;
         });
         return def;
     }
 
     async function renderMermaidGraphUI(graphData) {
-        if (!graphData) {
-            mermaidDagContainer.innerHTML = "<p style='text-align:center; color: var(--text-muted-color); padding: 20px;'>Graph not yet available. Generate a plan to see the visualization.</p>";
-            return;
-        }
         if (typeof mermaid === 'undefined') {
-            mermaidDagContainer.innerHTML = "<p style='text-align:center; color: var(--error-color);'>Mermaid.js library not loaded. Cannot render graph.</p>";
+            mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder error'><i class='fas fa-exclamation-triangle'></i><p>Mermaid.js library not loaded.</p><p>Cannot render graph visualization.</p></div>";
             return;
         }
-        mermaidDagContainer.innerHTML = "<p style='text-align:center; color: var(--text-muted-color); padding: 20px;'>Rendering graph...</p>"; // Loading message
+        
+        const definition = generateMermaidDefinition(graphData);
+
+        if (!graphData) {
+            try {
+                mermaidDagContainer.classList.add('rendering-placeholder');
+                const { svg } = await mermaid.render('mermaidGeneratedSvgPlaceholder', definition);
+                mermaidDagContainer.innerHTML = svg;
+                mermaidDagContainer.classList.remove('rendering-placeholder');
+                const placeholderSvg = mermaidDagContainer.querySelector('svg');
+                if(placeholderSvg) {
+                    placeholderSvg.style.maxWidth = '350px'; 
+                    placeholderSvg.style.maxHeight = '250px';
+                    placeholderSvg.style.margin = 'auto'; 
+                }
+            } catch (error) {
+                 console.error("Mermaid rendering error for placeholder:", error, "\nDefinition:", definition);
+                 mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder error'><i class='fas fa-exclamation-triangle'></i><p>Error rendering placeholder.</p><p>Check console for details.</p></div>";
+            }
+            return;
+        }
+
+        mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder loading'><i class='fas fa-spinner fa-spin'></i><p>Rendering graph...</p></div>"; 
         try {
-            const definition = generateMermaidDefinition(graphData);
-            // Ensure the container is visible and has dimensions before rendering for complex graphs
-            if (graphDagViewContent.offsetParent === null) { // Check if hidden
+            if (graphDagViewContent.offsetParent === null) { 
                 console.warn("Mermaid container is hidden, rendering might be suboptimal. Ensure tab is active.");
             }
             const { svg } = await mermaid.render('mermaidGeneratedSvg', definition);
             mermaidDagContainer.innerHTML = svg;
-             // Add pan and zoom capabilities if desired (example using a simple library or custom code)
-            // This is a placeholder for more advanced interaction.
             const svgElement = mermaidDagContainer.querySelector('svg');
             if (svgElement) {
                 svgElement.style.cursor = 'grab';
-                // Basic pan/zoom can be complex to implement robustly without a library.
             }
 
         } catch (error) {
-            console.error("Mermaid rendering error:", error, "\nDefinition:", generateMermaidDefinition(graphData));
-            mermaidDagContainer.textContent = "Error rendering DAG. Check console for details.";
+            console.error("Mermaid rendering error:", error, "\nDefinition:", definition);
+            mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder error'><i class='fas fa-exclamation-triangle'></i><p>Error rendering DAG.</p><p>Check console for details.</p></div>";
         }
     }
     
-    window.hideConfirmationModal = () => { // Make it globally accessible for the close button in HTML
+    window.hideConfirmationModal = () => { 
         confirmationModal.style.display = 'none';
         currentConfirmationContext.graph2ThreadId = null;
         currentConfirmationContext.confirmationKey = null;
@@ -381,27 +479,19 @@ document.addEventListener('DOMContentLoaded', () => {
         confirmationModal.style.display = 'flex';
     }
 
-
     modalConfirmButton.onclick = () => {
         if (!currentConfirmationContext.graph2ThreadId || !currentConfirmationContext.confirmationKey) {
-            addMessageToChat('System', 'Error: Missing context for confirmation (Graph2 Thread ID or Confirmation Key). Cannot send resume command.', 'error', 'system');
+            addMessageToChat('System', 'Error: Missing context for confirmation. Cannot send resume command.', 'error', 'system');
             hideConfirmationModal();
             return;
         }
-
         let parsedPayload;
         try {
-            if (modalPayload.value.trim() === "") {
-                parsedPayload = {}; 
-            } else {
-                parsedPayload = JSON.parse(modalPayload.value);
-            }
+            parsedPayload = modalPayload.value.trim() === "" ? {} : JSON.parse(modalPayload.value);
         } catch (e) {
             alert('Invalid JSON in payload textarea: ' + e.message);
-            addMessageToChat('System', 'Payload in modal is not valid JSON. Please correct it.', 'error', 'system');
             return;
         }
-
         const resumeData = {
             confirmation_key: currentConfirmationContext.confirmationKey,
             decision: true,
@@ -409,29 +499,17 @@ document.addEventListener('DOMContentLoaded', () => {
             operationId: currentConfirmationContext.operationId, 
             effectiveNodeId: currentConfirmationContext.effectiveNodeId
         };
-        
         const wsMessage = `resume_exec ${currentConfirmationContext.graph2ThreadId} ${JSON.stringify(resumeData)}`;
-        
-        addMessageToChat(
-            `You (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, 
-            `Confirming: ${currentConfirmationContext.operationId || 'action'} with payload.`, 
-            'user',
-            'user_input' 
-        );
+        addMessageToChat(`You (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Confirming: ${currentConfirmationContext.operationId || 'action'}`, 'user', 'user_input');
         ws.send(wsMessage);
-        addMessageToChat(
-            `System (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, 
-            `Confirmation sent for ${currentConfirmationContext.effectiveNodeId}. Waiting for workflow to resume...`, 
-            'status', 
-            'system'
-        );
+        addMessageToChat(`System (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Confirmation sent for ${currentConfirmationContext.effectiveNodeId}. Resuming...`, 'status', 'system');
         hideConfirmationModal();
-        showThinking(true); 
+        updateSendButtonState(true); 
     };
 
     modalCancelButton.onclick = () => {
         if (!currentConfirmationContext.graph2ThreadId || !currentConfirmationContext.confirmationKey) {
-            addMessageToChat('System', 'Error: Missing context for cancellation. Cannot send resume command.', 'error', 'system');
+            addMessageToChat('System', 'Error: Missing context for cancellation.', 'error', 'system');
             hideConfirmationModal();
             return;
         }
@@ -442,20 +520,9 @@ document.addEventListener('DOMContentLoaded', () => {
             effectiveNodeId: currentConfirmationContext.effectiveNodeId
         };
         const wsMessage = `resume_exec ${currentConfirmationContext.graph2ThreadId} ${JSON.stringify(resumeData)}`;
-        
-        addMessageToChat(
-            `You (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, 
-            `Cancelling confirmation for: ${currentConfirmationContext.operationId || 'action'}.`, 
-            'user',
-            'user_input'
-        );
+        addMessageToChat(`You (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Cancelling confirmation for: ${currentConfirmationContext.operationId || 'action'}.`, 'user', 'user_input');
         ws.send(wsMessage);
-         addMessageToChat(
-            `System (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, 
-            `Cancellation sent for ${currentConfirmationContext.effectiveNodeId}.`, 
-            'status', 
-            'system'
-        );
+        addMessageToChat(`System (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Cancellation sent for ${currentConfirmationContext.effectiveNodeId}.`, 'status', 'system');
         hideConfirmationModal();
     };
 
@@ -469,7 +536,7 @@ document.addEventListener('DOMContentLoaded', () => {
             sendMessage();
         }
     });
-
-    showGraphTab('dag'); // MODIFIED: Default to DAG view
+    
+    showGraphTab('dag'); 
     connectWebSocket(); 
 });

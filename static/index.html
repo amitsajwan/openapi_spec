@@ -6,14 +6,13 @@
     <title>OpenAPI Workflow Agent</title>
     <link rel="stylesheet" href="/static/style.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
 </head>
 <body>
     <div class="app-container">
         <header class="app-header">
             <div class="logo-title">
-                <i class="fas fa-cogs header-icon"></i>
-                <h1>OpenAPI Workflow Agent</h1>
+                <i class="fa-solid fa-atom header-icon"></i> <h1>OpenAPI Workflow Agent</h1>
             </div>
             <div class="header-actions">
                 </div>
@@ -25,19 +24,19 @@
                     <div class="message agent-message">
                         <div class="message-sender">Agent</div>
                         <div class="message-content">
-                            <p>Welcome! Please paste your OpenAPI specification (JSON or YAML) below, or ask a question if a spec is already loaded.</p>
+                            <p>Welcome! I can help you plan and execute API workflows. Please provide an OpenAPI specification to begin.</p>
                         </div>
                     </div>
                 </div>
                 <div class="chat-input-area">
-                    <textarea id="userInput" placeholder="Enter OpenAPI spec, ask a question, or provide input..." rows="3"></textarea>
+                    <textarea id="userInput" placeholder="Paste OpenAPI spec, ask a question, or define a goal..." rows="3"></textarea>
                     <div class="chat-buttons">
                         <button id="sendButton" class="action-button primary-button" onclick="sendMessage()" title="Send Message">
-                            <i class="fas fa-paper-plane"></i> Send
-                            <div class="spinner" id="thinkingIndicator" style="display: none;"></div>
-                        </button>
+                            <i class="fa-solid fa-paper-plane"></i>
+                            <span>Send</span>
+                            </button>
                          <button id="runWorkflowButton" class="action-button secondary-button" onclick="runCurrentWorkflow()" title="Run Current Workflow">
-                            <i class="fas fa-play-circle"></i> Run Workflow
+                            <i class="fa-solid fa-gears"></i> <span>Run Workflow</span>
                         </button>
                     </div>
                 </div>
@@ -45,15 +44,16 @@
 
             <div class="graph-details-panel-container">
                 <div class="graph-view-panel">
-                    <h2>Execution Graph</h2>
-                    <div class="tab-controls">
-                        <button id="dagTabButton" class="tab-button" onclick="showGraphTab('dag')">DAG View</button>
-                        <button id="jsonTabButton" class="tab-button" onclick="showGraphTab('json')">JSON View</button>
-                    </div>
-                    <div id="graphDagViewContent" class="tab-pane">
-                        <div class="mermaid-container" id="mermaidDagDiagram">
-                            Graph will appear here once loaded.
+                    <div class="panel-header">
+                        <h2>Execution Graph</h2>
+                        <div class="tab-controls">
+                            <button id="dagTabButton" class="tab-button active" onclick="showGraphTab('dag')">DAG View</button>
+                            <button id="jsonTabButton" class="tab-button" onclick="showGraphTab('json')">JSON View</button>
                         </div>
+                    </div>
+                    <div id="graphDagViewContent" class="tab-pane active">
+                        <div class="mermaid-container" id="mermaidDagDiagram">
+                            </div>
                     </div>
                     <div id="graphJsonViewContent" class="tab-pane">
                         <pre id="graphJsonViewPre">JSON representation of the graph will appear here.</pre>
@@ -67,7 +67,7 @@
         <div class="modal-content">
             <div class="modal-header">
                 <h3 id="modalTitle">Confirm Action</h3>
-                <button class="modal-close-button" onclick="hideConfirmationModal()" title="Close"><i class="fas fa-times"></i></button>
+                <button class="modal-close-button" onclick="hideConfirmationModal()" title="Close"><i class="fa-solid fa-xmark"></i></button>
             </div>
             <div class="modal-body">
                 <p><strong>Operation ID:</strong> <span id="modalOperationId">N/A</span></p>
@@ -92,17 +92,17 @@
         if (typeof mermaid !== 'undefined') {
             mermaid.initialize({ 
                 startOnLoad: false, 
-                theme: 'neutral', // Options: 'default', 'neutral', 'dark', 'forest'
-                // For more advanced styling with Mermaid:
-                // mermaidAPI.initialize({
-                //     theme: 'base',
-                //     themeVariables: {
-                //         primaryColor: '#007bff',
-                //         primaryTextColor: '#fff',
-                //         lineColor: '#555',
-                //         // ... other variables
-                //     }
-                // });
+                theme: 'base', // Using 'base' for more CSS control
+                themeVariables: { // Example of customizing base theme
+                    primaryColor: '#f0f2f5',    // Background of nodes (light)
+                    primaryTextColor: '#333',    // Text on nodes
+                    primaryBorderColor: '#007bff',// Border of nodes
+                    lineColor: '#555e68',        // Edge lines
+                    secondaryColor: '#f0f2f5',   // Cluster background (if used)
+                    tertiaryColor: '#fff'        // Actor borders (if used)
+                },
+                fontFamily: '"Inter", sans-serif',
+                securityLevel: 'loose' // Allow HTML in labels if needed for icons, but sanitize carefully
             });
         } else {
             console.error("Mermaid.js library not loaded.");
