@@ -64,16 +64,13 @@ class ExecutionGraphDefinition:
         if not isinstance(template_string, str):
             return str(template_string)
         resolved_string = template_string
-        extracted_ids_dict = state.extracted_ids
-        initial_input_dict = state.initial_input if isinstance(state.initial_input, dict) else {}
-        # Resolve from extracted_ids first
-        for key, value in extracted_ids_dict.items():
-            if value is not None:
+        # Combine initial_input and extracted_ids for placeholder resolution.
+        # extracted_ids can override initial_input if keys conflict.
+        placeholders_data = {**(state.initial_input or {}), **(state.extracted_ids or {})}
+
+        for key, value in placeholders_data.items():
+            if value is not None: # Ensure value is not None before string conversion
                 resolved_string = resolved_string.replace(f"{{{key}}}", str(value))
-        # Then resolve from initial_input for any remaining placeholders
-        for key, value in initial_input_dict.items():
-            if value is not None:
-                 resolved_string = resolved_string.replace(f"{{{key}}}", str(value))
         return resolved_string
 
     def _apply_input_mappings(
@@ -87,22 +84,18 @@ class ExecutionGraphDefinition:
     ) -> None:
         if not node_definition.input_mappings:
             return
-        current_extracted_ids = state.extracted_ids # Data comes from the shared pool
-        initial_input_data = state.initial_input if isinstance(state.initial_input, dict) else {}
+        
+        # Data for input mappings can come from initial_input or extracted_ids.
+        # extracted_ids should take precedence if keys overlap.
+        available_data_for_mapping = {**(state.initial_input or {}), **(state.extracted_ids or {})}
 
         for mapping in node_definition.input_mappings:
             source_value = None
-            # Try to get value from extracted_ids first
-            if mapping.source_data_path: # Ensure path is not empty
-                source_value = _get_value_from_path(current_extracted_ids, mapping.source_data_path)
-
-            # If not found in extracted_ids, try from initial_input (if path is simple key)
-            if source_value is None and mapping.source_data_path and not any(c in mapping.source_data_path for c in ['.', '[', ']']): # Simple key
-                 source_value = _get_value_from_path(initial_input_data, mapping.source_data_path)
-
+            if mapping.source_data_path: 
+                source_value = _get_value_from_path(available_data_for_mapping, mapping.source_data_path)
 
             if source_value is None:
-                logger.warning(f"Node '{node_definition.effective_id}': InputMapping - Could not find source data for path '{mapping.source_data_path}' in extracted_ids or initial_input. Skipping.")
+                logger.warning(f"Node '{node_definition.effective_id}': InputMapping - Could not find source data for path '{mapping.source_data_path}' in available data. Skipping.")
                 continue
 
             target_param_name = mapping.target_parameter_name
@@ -117,10 +110,8 @@ class ExecutionGraphDefinition:
             elif target_param_in.startswith("body."):
                 field_path_in_body = target_param_in.split("body.", 1)[1]
                 _set_value_by_path(resolved_body_payload_for_field_mapping, field_path_in_body, source_value)
-            elif target_param_in == "body": # To replace the entire body
-                 # This case is handled after placeholder resolution in _prepare_api_request_components
-                 # by checking input_mappings again. For now, we note it.
-                 logger.debug(f"Node '{node_definition.effective_id}': InputMapping for full body replacement noted for '{target_param_name}'. Will be applied later.")
+            elif target_param_in == "body":
+                 logger.debug(f"Node '{node_definition.effective_id}': InputMapping for full body replacement noted for '{target_param_name}'. Applied in _prepare_api_request_components.")
 
 
     def _prepare_api_request_components(
@@ -128,68 +119,58 @@ class ExecutionGraphDefinition:
     ) -> Tuple[str, Dict[str, Any], Any, Dict[str, Any]]:
         path_template = node_definition.path or ""
         payload_template = node_definition.payload
-        # Deep copy the payload template if it's a dictionary to avoid modifying the original
+        
         if isinstance(payload_template, dict):
-            payload_template = {k: v for k, v in payload_template.items()} # Simple deep copy for one level
+            current_payload_template = {k: v for k, v in payload_template.items()} 
+        else:
+            current_payload_template = payload_template # Could be string, None, etc.
 
-        # 1. Resolve placeholders in path and body templates
         resolved_path_from_template = self._resolve_placeholders(path_template, state)
         
         body_after_placeholder_resolution: Any
-        if isinstance(payload_template, dict):
+        if isinstance(current_payload_template, dict):
             body_after_placeholder_resolution = {
                 key: (self._resolve_placeholders(value, state) if isinstance(value, str) else value)
-                for key, value in payload_template.items()
+                for key, value in current_payload_template.items()
             }
-        elif payload_template is not None: # If payload is a string or other primitive
-            body_after_placeholder_resolution = self._resolve_placeholders(str(payload_template), state)
-        else: # No payload template
+        elif current_payload_template is not None: 
+            body_after_placeholder_resolution = self._resolve_placeholders(str(current_payload_template), state)
+        else: 
             body_after_placeholder_resolution = {}
 
-
-        # Initialize containers for final request components
-        final_path_params: Dict[str, Any] = {} # For path parameters that might need re-resolution
+        final_path_params: Dict[str, Any] = {} 
         final_query_params: Dict[str, Any] = {}
         final_headers: Dict[str, Any] = {}
-        # Use the placeholder-resolved body as the base for field mappings
         body_for_field_mappings = body_after_placeholder_resolution if isinstance(body_after_placeholder_resolution, dict) else {}
 
-
-        # 2. Apply input mappings (this populates final_query_params, final_headers, and modifies body_for_field_mappings)
         self._apply_input_mappings(
             node_definition, state, final_path_params, final_query_params,
             body_for_field_mappings, final_headers
         )
 
-        # Determine the final body payload
-        final_body_payload = body_for_field_mappings # Start with the (potentially modified by mapping) body
+        final_body_payload = body_for_field_mappings 
 
-        # Check if any input mapping targets the entire body
-        # This type of mapping should override any previous body content.
         if node_definition.input_mappings:
             for mapping in node_definition.input_mappings:
                 if mapping.target_parameter_in == "body":
-                    current_data_sources = {**state.initial_input, **state.extracted_ids} if isinstance(state.initial_input, dict) else state.extracted_ids
+                    current_data_sources = {**(state.initial_input or {}), **(state.extracted_ids or {})}
                     source_value = _get_value_from_path(current_data_sources, mapping.source_data_path)
                     if source_value is not None:
-                        final_body_payload = source_value # Replace entire body
+                        final_body_payload = source_value 
                         logger.info(f"Node '{node_definition.effective_id}': Entire request body replaced by input mapping from '{mapping.source_data_path}'.")
-                        break # Assume only one mapping should replace the entire body
+                        break 
 
-        # 3. Re-resolve path if path_params were populated by input_mappings
         final_api_path = resolved_path_from_template
-        if final_path_params: # Path parameters were added/modified by input mappings
-            # Create a temporary state with these path params for re-resolution
-            # This ensures that placeholders in the path template (e.g., /items/{itemId})
-            # can be filled by values derived from input mappings.
+        if final_path_params: 
             temp_ids_for_path_resolution = {
-                **(state.initial_input if isinstance(state.initial_input, dict) else {}),
-                **state.extracted_ids,
-                **final_path_params # Mapped path params take precedence
+                **(state.initial_input or {}),
+                **(state.extracted_ids or {}),
+                **final_path_params 
             }
+            # Create a minimal temporary state for path re-resolution
             temp_state_for_path_re_resolution = ExecutionGraphState(
                 extracted_ids=temp_ids_for_path_resolution,
-                api_results={}, confirmed_data={}, initial_input={} # Other fields not needed for path re-resolution
+                api_results={}, confirmed_data={}, initial_input=None 
             )
             final_api_path = self._resolve_placeholders(path_template, temp_state_for_path_re_resolution)
             logger.debug(f"Node '{node_definition.effective_id}': API path re-resolved to '{final_api_path}' after applying path params from input mappings.")
@@ -205,31 +186,20 @@ class ExecutionGraphDefinition:
         confirmation_key = f"confirmed_{operationId}"
         
         updated_body = current_body_payload
-        if isinstance(current_body_payload, dict): # Ensure deep copy for dicts
+        if isinstance(current_body_payload, dict): 
             updated_body = {k:v for k,v in current_body_payload.items()}
         
         updated_params = current_query_params.copy()
         updated_headers = current_headers.copy()
         
-        current_confirmed_data = state.confirmed_data
+        current_confirmed_data = state.confirmed_data or {} # Ensure it's a dict
         
-        # Check if this operationId was part of a confirmation decision
         if current_confirmed_data.get(confirmation_key): 
             confirmed_details = current_confirmed_data.get(f"{confirmation_key}_details", {})
             
-            # If user provided a modified payload during confirmation, use it
             if "modified_payload" in confirmed_details: 
                 updated_body = confirmed_details["modified_payload"]
                 logger.info(f"Node '{operationId}': Applied modified payload from user confirmation.")
-            
-            # Potentially extend this to apply modified query_params or headers if your UI supports it
-            # For example:
-            # if "modified_query_params" in confirmed_details:
-            #     updated_params.update(confirmed_details["modified_query_params"])
-            #     logger.info(f"Node '{operationId}': Applied modified query params from user confirmation.")
-            # if "modified_headers" in confirmed_details:
-            #     updated_headers.update(confirmed_details["modified_headers"])
-            #     logger.info(f"Node '{operationId}': Applied modified headers from user confirmation.")
                 
         return updated_body, updated_params, updated_headers
 
@@ -252,22 +222,19 @@ class ExecutionGraphDefinition:
 
         if is_successful and node_definition.output_mappings:
             response_body = api_call_result_dict.get("response_body")
-            if isinstance(response_body, (dict, list)): # Allow list for top-level array responses
+            if isinstance(response_body, (dict, list)): 
                 for mapping in node_definition.output_mappings:
                     extracted_value = _get_value_from_path(response_body, mapping.source_data_path)
                     if extracted_value is not None:
                         extracted_data_for_state[mapping.target_data_key] = extracted_value
                     else:
                         logger.warning(f"Node '{effective_id}': OutputMapping - Could not extract value for path '{mapping.source_data_path}' from response.")
-            elif response_body is not None: # Response body exists but isn't dict/list
+            elif response_body is not None: 
                  logger.warning(f"Node '{effective_id}': Response body type {type(response_body)} is not dict or list. Cannot apply output mappings directly. Response preview: {str(response_body)[:100]}")
-                 # If there's only one output mapping and it targets a simple key,
-                 # and the response_body is a primitive, we could assign it directly.
                  if len(node_definition.output_mappings) == 1 and not any(c in node_definition.output_mappings[0].source_data_path for c in ['.', '[', ']']):
                      simple_key = node_definition.output_mappings[0].target_data_key
                      extracted_data_for_state[simple_key] = response_body
                      logger.info(f"Node '{effective_id}': Applied non-dict/list response directly to target_data_key '{simple_key}' due to simple output mapping.")
-
 
         return api_call_result_dict, (extracted_data_for_state if extracted_data_for_state else None)
 
@@ -282,21 +249,17 @@ class ExecutionGraphDefinition:
 
             try:
                 api_path, query_params, body_payload, headers = self._prepare_api_request_components(node_definition, state)
-                
                 logger.debug(f"Node '{effective_id}': Prepared components - Path: {api_path}, Query: {query_params}, Body Type: {type(body_payload)}, Headers: {headers}")
-
 
                 if node_definition.requires_confirmation:
                     confirmation_key = f"confirmed_{effective_id}"
-                    # Check if confirmation was explicitly given and was True
-                    if not state.confirmed_data.get(confirmation_key, False): # Default to False if key not present
+                    if not (state.confirmed_data or {}).get(confirmation_key, False): 
                         skip_message = f"Node '{effective_id}' requires confirmation, but it was not found or was negative in confirmed_data. Skipping execution."
                         logger.warning(skip_message)
                         output_state_update["error"] = skip_message 
                         output_state_update["api_results"] = {effective_id: {"status_code": "SKIPPED_NO_CONFIRMATION", "error": skip_message, "path_template": node_definition.path, "method": node_definition.method}}
                         return output_state_update
 
-                # Apply any data modifications from the confirmation step (e.g., user edited payload)
                 final_body, final_params, final_headers = self._apply_confirmed_data_to_request(
                     node_definition, state, body_payload, query_params, headers
                 )
@@ -306,14 +269,12 @@ class ExecutionGraphDefinition:
                     node_definition, api_path, final_params, final_body, final_headers
                 )
                 
-                # Store the full API call result under the node's effective_id
-                current_api_results = state.api_results.copy() if state.api_results else {}
+                current_api_results = (state.api_results or {}).copy()
                 current_api_results[effective_id] = api_call_result
                 output_state_update["api_results"] = current_api_results
                 
                 if extracted_data:
-                    # Merge extracted data with existing extracted_ids
-                    current_extracted_ids = state.extracted_ids.copy() if state.extracted_ids else {}
+                    current_extracted_ids = (state.extracted_ids or {}).copy()
                     current_extracted_ids.update(extracted_data)
                     output_state_update["extracted_ids"] = current_extracted_ids
                 
@@ -324,7 +285,7 @@ class ExecutionGraphDefinition:
                 error_message = f"Error in node {effective_id}: {type(e).__name__} - {e}"
                 logger.error(error_message, exc_info=True)
                 output_state_update["error"] = error_message
-                current_api_results_on_error = state.api_results.copy() if state.api_results else {}
+                current_api_results_on_error = (state.api_results or {}).copy()
                 current_api_results_on_error[effective_id] = {"error": error_message, "status_code": "NODE_EXCEPTION", "path_template": node_definition.path, "method": node_definition.method}
                 output_state_update["api_results"] = current_api_results_on_error
                 return output_state_update
@@ -334,61 +295,72 @@ class ExecutionGraphDefinition:
         logger.info(f"ExecutionGraphDefinition: Building graph. Plan: {self.graph_plan.description or 'N/A'}")
         builder = StateGraph(ExecutionGraphState)
         
-        if not self.graph_plan.nodes:
-            logger.error("Execution plan must contain at least one node. Compilation will likely fail or be empty.")
-            # Depending on LangGraph version, compiling an empty graph might raise an error or return a non-runnable graph.
-            # It's better to raise an error here if it's truly invalid.
-            # For now, let it proceed and LangGraph will handle it.
-            # Consider: raise ValueError("Execution plan must contain at least one node.")
-
         actual_api_nodes_defs = []
         nodes_requiring_interrupt_before: list[str] = [] 
 
+        if not self.graph_plan.nodes:
+            logger.warning("Execution plan has no nodes. Building an empty graph (START -> END).")
+            builder.add_node("__start_dummy__", lambda x: x) # Dummy node if no actual nodes
+            builder.add_node("__end_dummy__", lambda x: x)   # Dummy node
+            builder.set_entry_point("__start_dummy__")
+            builder.add_edge("__start_dummy__", "__end_dummy__")
+            builder.set_finish_point("__end_dummy__")
+            memory_saver = MemorySaver()
+            return builder.compile(checkpointer=memory_saver)
+
+
         for node_def in self.graph_plan.nodes:
             node_id_str = str(node_def.effective_id).strip()
-            # Skip conceptual START_NODE and END_NODE from being added as executable LangGraph nodes
             if node_id_str.upper() in ["START_NODE", "END_NODE"]:
                 logger.debug(f"Skipping conceptual node '{node_id_str}' from direct addition to LangGraph builder.")
                 continue
             
-            # Validate essential fields for API nodes
             if not node_def.method or not node_def.path:
-                # This should ideally be caught during Graph 1's verification.
-                # If it reaches here, it's a problem with the plan.
                 logger.error(f"API Node '{node_id_str}' (OpID: {node_def.operationId}) is missing 'method' or 'path'. This node will likely fail if called.")
-                # Depending on strictness, you might raise ValueError here.
-                # For now, add it and let it fail at runtime if called without these.
 
             builder.add_node(node_id_str, self._make_node_runnable(node_def))
-            actual_api_nodes_defs.append(node_def) # Keep track of nodes actually added to builder
+            actual_api_nodes_defs.append(node_def) 
             
             if node_def.requires_confirmation:
                 nodes_requiring_interrupt_before.append(node_id_str)
                 logger.info(f"Node '{node_id_str}' marked for 'interrupt_before' due to requires_confirmation=True.")
 
-
         executable_node_ids_in_builder = {str(n.effective_id).strip() for n in actual_api_nodes_defs}
-        has_start_edge_from_plan = False
         
-        if not self.graph_plan.edges and actual_api_nodes_defs:
-            logger.warning("Execution plan has no edges, but has API nodes. This might lead to an unconnected graph if not handled.")
-        elif not self.graph_plan.edges and not actual_api_nodes_defs:
-            logger.warning("Execution plan has no edges and no executable API nodes. Graph will be empty.")
+        # Handle empty executable graph after filtering START_NODE/END_NODE
+        if not actual_api_nodes_defs:
+            logger.warning("Execution plan contains only conceptual START_NODE/END_NODE or no executable nodes. Building a simple START -> END graph.")
+            # Check if there's an explicit START_NODE -> END_NODE in the plan's edges
+            has_direct_start_to_end_edge = any(
+                str(edge.from_node).strip().upper() == "START_NODE" and 
+                str(edge.to_node).strip().upper() == "END_NODE" 
+                for edge in self.graph_plan.edges
+            )
+            if has_direct_start_to_end_edge or not self.graph_plan.edges : # If direct edge or no edges at all with no API nodes
+                builder.set_entry_point(START)
+                builder.add_edge(START, END)
+                logger.info("Set graph to START -> END as no executable API nodes found or direct plan edge.")
+            else: # Edges exist but don't form a simple START->END and no API nodes
+                logger.error("Graph has edges but no executable API nodes, and not a simple START->END. This configuration is problematic.")
+                # Fallback to a minimal graph to avoid compilation error, though it might not be what user intended
+                builder.set_entry_point(START)
+                builder.add_edge(START, END)
+
+            memory_saver = MemorySaver()
+            return builder.compile(checkpointer=memory_saver)
 
 
+        has_start_edge_from_plan = False
         for edge in self.graph_plan.edges:
             plan_from_node_original_case = str(edge.from_node).strip()
             plan_to_node_original_case = str(edge.to_node).strip()
 
-            # Determine source for LangGraph: START constant or actual node ID
             is_plan_source_start_node = plan_from_node_original_case.upper() == "START_NODE"
             source_for_builder = START if is_plan_source_start_node else plan_from_node_original_case
             
-            # Determine target for LangGraph: END constant or actual node ID
             is_plan_target_end_node = plan_to_node_original_case.upper() == "END_NODE"
             target_for_builder = END if is_plan_target_end_node else plan_to_node_original_case
 
-            # Validate that non-START/END nodes in edges exist in the builder
             if source_for_builder != START and plan_from_node_original_case not in executable_node_ids_in_builder:
                 logger.error(f"Edge source node '{plan_from_node_original_case}' from plan is not an executable node in the builder. Skipping edge. Available: {executable_node_ids_in_builder}")
                 continue
@@ -405,85 +377,87 @@ class ExecutionGraphDefinition:
                  logger.error(f"Failed to add edge {source_for_builder} -> {target_for_builder}: {e_add_edge}", exc_info=True)
 
         # Set entry point
+        entry_point_node_id: Optional[str] = None
         if has_start_edge_from_plan:
             builder.set_entry_point(START) 
             logger.info("Entry point set to START (due to explicit edge from START_NODE in plan).")
-        elif actual_api_nodes_defs: # No explicit START_NODE edge, but there are API nodes
-            # Default to the first API node encountered in the plan as the entry point
-            # This assumes nodes are somewhat ordered in the plan if no START_NODE edge.
-            entry_point_candidate = str(actual_api_nodes_defs[0].effective_id).strip()
-            builder.set_entry_point(entry_point_candidate) 
-            logger.info(f"No explicit START_NODE edge. Entry point heuristically set to first API node: '{entry_point_candidate}'.")
-        else: # No explicit START_NODE edge and no API nodes (empty or only conceptual nodes)
-             logger.warning("Graph has no executable API nodes and no explicit entry point from START_NODE. LangGraph might default or error.")
-             # LangGraph might require an entry point even for an empty graph if compiled.
-             # If you intend to support empty runnable graphs, you might need a dummy entry that goes to END.
-             # For now, this state is considered problematic.
+        elif actual_api_nodes_defs: 
+            entry_point_node_id = str(actual_api_nodes_defs[0].effective_id).strip()
+            builder.set_entry_point(entry_point_node_id) 
+            logger.info(f"No explicit START_NODE edge. Entry point heuristically set to first API node: '{entry_point_node_id}'.")
+        else: # Should have been caught by the "empty executable graph" check above.
+             logger.critical("Graph building reached an unexpected state: no executable nodes and no START_NODE edge, but not handled by empty graph logic.")
+             # Fallback to prevent crash during compile, though graph is likely non-functional
+             builder.set_entry_point(START)
+             builder.add_edge(START, END)
+
 
         # Set finish points for nodes that are leaves or only point to END_NODE
-        if actual_api_nodes_defs:
-            all_source_ids_in_edges = {str(e.from_node).strip() for e in self.graph_plan.edges if str(e.from_node).strip().upper() != "START_NODE"}
-            
+        # This logic needs to be careful not to conflict with the entry point if it's a single-node graph.
+        if len(actual_api_nodes_defs) == 1 and entry_point_node_id == actual_api_nodes_defs[0].effective_id:
+            # Single API node graph, and it's the entry point.
+            # Ensure it has a path to END if no other outgoing edges are defined in the plan.
+            single_node_id = entry_point_node_id
+            has_outgoing_edge_from_plan = any(
+                str(e.from_node).strip() == single_node_id for e in self.graph_plan.edges
+            )
+            if not has_outgoing_edge_from_plan:
+                logger.info(f"Single API node graph with '{single_node_id}' as entry. Adding explicit edge to END as no outgoing edges found in plan.")
+                builder.add_edge(single_node_id, END)
+            # In this single-node case, we don't need to call set_finish_point explicitly for this node
+            # if it already leads to END. LangGraph handles it.
+        else: # Graphs with multiple API nodes or where entry is START
             for node_def in actual_api_nodes_defs:
                 node_id = str(node_def.effective_id).strip()
                 
-                # A node is a finish point if it's not a source for any edge leading to another API node
                 is_source_for_api_edge = any(
                     str(e.from_node).strip() == node_id and 
-                    str(e.to_node).strip().upper() != "END_NODE" and # Edge does not go to conceptual END
-                    str(e.to_node).strip() in executable_node_ids_in_builder # Edge goes to another actual API node
+                    str(e.to_node).strip().upper() != "END_NODE" and 
+                    str(e.to_node).strip() in executable_node_ids_in_builder 
                     for e in self.graph_plan.edges
                 )
                 
-                # An explicit edge from this node to the conceptual "END_NODE" means LangGraph handles its termination.
-                has_explicit_edge_to_end_node = any(
+                has_explicit_edge_to_end_node_constant = any(
                     str(e.from_node).strip() == node_id and 
-                    str(e.to_node).strip().upper() == "END_NODE" 
+                    str(edge.to_node).strip().upper() == "END_NODE" 
                     for e in self.graph_plan.edges
                 )
 
-                if not is_source_for_api_edge and not has_explicit_edge_to_end_node:
-                    # This node is a leaf among API nodes and doesn't have an explicit edge to "END_NODE" in the plan.
-                    # So, it should be a finish point in the LangGraph.
-                    try:
-                        builder.set_finish_point(node_id)
-                        logger.info(f"Node '{node_id}' is a leaf or points only to END implicitly. Setting as LangGraph finish point.")
-                    except Exception as e_set_finish:
-                        logger.error(f"Failed to set node '{node_id}' as finish point: {e_set_finish}", exc_info=True)
+                # If a node is not the source of any edge to another API node,
+                # AND it doesn't have an explicit edge to the conceptual END_NODE (which would be mapped to LangGraph.END),
+                # then it's a leaf among API nodes and should be a finish point.
+                if not is_source_for_api_edge and not has_explicit_edge_to_end_node_constant:
+                    # Avoid setting the main START constant as a finish point.
+                    if node_id != START: # Ensure we are not trying to set LangGraph's START as a finish point
+                        try:
+                            builder.set_finish_point(node_id)
+                            logger.info(f"Node '{node_id}' is a leaf or points only to END implicitly. Setting as LangGraph finish point.")
+                        except Exception as e_set_finish:
+                             logger.error(f"Failed to set node '{node_id}' as finish point: {e_set_finish}", exc_info=True)
         
         logger.info(f"Compiling execution graph. Nodes for interrupt_before: {nodes_requiring_interrupt_before}")
-        memory_saver = MemorySaver() # Instantiate the checkpointer
+        memory_saver = MemorySaver()
         
         try:
             compiled_graph = builder.compile(
                 checkpointer=memory_saver, 
                 interrupt_before=nodes_requiring_interrupt_before if nodes_requiring_interrupt_before else None
-                # Consider adding interrupt_after if needed for some nodes
             )
             logger.info("Execution graph compiled successfully.")
             return compiled_graph
         except Exception as e_compile:
             logger.critical(f"Execution graph compilation failed: {e_compile}", exc_info=True)
-            # Depending on desired behavior, you might re-raise or return a non-runnable indicator
-            raise # Re-raise for now, as a non-compiled graph is a critical failure
+            raise 
 
 
     def get_runnable_graph(self) -> Any:
         return self.runnable_graph
 
     def get_node_definition(self, node_effective_id: Union[str, Tuple[str, ...], List[str]]) -> Optional[Node]:
-        """
-        Retrieves a node definition by its effective_id.
-        Handles cases where node_effective_id might be passed as a string or a list/tuple containing the string.
-        """
         target_id_str: Optional[str] = None
-
         if isinstance(node_effective_id, str):
             target_id_str = node_effective_id.strip()
         elif isinstance(node_effective_id, (list, tuple)) and node_effective_id:
-            # If it's a list/tuple, assume the first element is the ID.
-            # This addresses the user's observation that node_effective_id was coming as node_effective_id[0].
-            # It's still recommended to fix the caller to pass a simple string.
             potential_id = node_effective_id[0]
             if isinstance(potential_id, str):
                 target_id_str = potential_id.strip()
