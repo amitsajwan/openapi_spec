@@ -3,191 +3,91 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OpenAPI Agent</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol"; margin: 0; padding: 0; background-color: #f0f2f5; display: flex; justify-content: center; align-items: center; min-height: 100vh; font-size: 16px; }
-        #app-container { width: 95%; max-width: 1200px; background-color: #fff; border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,0.1); display: flex; flex-direction: column; height: 90vh; min-height: 600px; }
-        #header { padding: 18px 25px; background-color: #007bff; color: white; border-top-left-radius: 10px; border-top-right-radius: 10px; text-align: center; }
-        #header h2 { margin: 0; font-size: 1.6em; font-weight: 600; }
-        #main-content { display: flex; flex-grow: 1; overflow: hidden; }
-        #chat-area { flex: 3; display: flex; flex-direction: column; padding: 20px; border-right: 1px solid #dee2e6; }
-        #messages { list-style-type: none; padding: 0; margin: 0 0 20px 0; flex-grow: 1; overflow-y: auto; border: 1px solid #e0e0e0; padding: 15px; border-radius: 6px; background-color: #f9f9f9; scroll-behavior: smooth; }
-        .message { margin-bottom: 12px; padding: 10px 15px; border-radius: 18px; line-height: 1.5; max-width: 80%; word-wrap: break-word; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
-        .message small { font-size: 0.7em; color: #777; display: block; margin-top: 4px; text-align: inherit; } /* Inherit text-align */
-        .user-message { background-color: #007bff; color: white; text-align: left; margin-left: auto; border-bottom-right-radius: 5px; align-self: flex-end; }
-        .user-message small { text-align: right; }
-        .assistant-message { background-color: #e9ecef; color: #212529; text-align: left; margin-right: auto; border-bottom-left-radius: 5px; align-self: flex-start; }
-        .assistant-message small { text-align: left; }
-        .system-message { background-color: #fffde7; text-align: center; font-style: italic; color: #545454; border-radius: 6px; font-size: 0.9em; padding: 8px 12px; }
-        .error-message { background-color: #ffe3e3; color: #c82333; border: 1px solid #f5c6cb; }
-        #input-container { display: flex; border-top: 1px solid #dee2e6; padding-top: 20px; }
-        #message-input { flex-grow: 1; padding: 12px 15px; border: 1px solid #ced4da; border-radius: 22px 0 0 22px; resize: none; font-size: 1em; line-height: 1.5; }
-        #message-input:focus { border-color: #80bdff; outline: 0; box-shadow: 0 0 0 0.2rem rgba(0,123,255,.25); }
-        #send-button { padding: 12px 25px; background-color: #007bff; color: white; border: none; cursor: pointer; border-radius: 0 22px 22px 0; font-size: 1em; font-weight: 500; }
-        #send-button:hover { background-color: #0056b3; }
-        #graph-display-area { flex: 2; padding: 20px; overflow-y: auto; background-color: #f8f9fa; border-left: 1px solid #dee2e6;}
-        #graph-display-area h3 { margin-top: 0; color: #343a40; font-size: 1.3em; margin-bottom: 15px; }
-        #graph-json-output { white-space: pre-wrap; word-wrap: break-word; background-color: #282c34; color: #abb2bf; padding: 15px; border-radius: 6px; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace; font-size: 0.875em; line-height: 1.6; max-height: calc(85vh - 100px); overflow-y: auto; }
-        .status-indicator { font-size: 0.85em; color: #6c757d; padding: 8px 0; text-align: center; border-top: 1px solid #dee2e6; margin-top: auto; }
-        pre { margin-top: 8px; } 
-    </style>
+    <title>OpenAPI Agent Interface</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 </head>
 <body>
-    <div id="app-container">
-        <div id="header"><h2>OpenAPI Intelligent Agent</h2></div>
-        <div id="main-content">
-            <div id="chat-area">
-                <ul id="messages"></ul>
-                <div class="status-indicator" id="status-indicator">Connecting...</div>
-                <div id="input-container">
-                    <textarea id="message-input" placeholder="Paste OpenAPI spec (YAML/JSON) or type your query..." rows="3"></textarea>
-                    <button id="send-button">Send</button>
+    <div class="app-container">
+        <header class="app-header">
+            <h1>OpenAPI Workflow Agent</h1>
+        </header>
+
+        <main class="main-content">
+            <div class="left-panel">
+                <div class="graph-view-panel">
+                    <h2>Execution Graph</h2>
+                    <div class="tab-controls">
+                        <button id="jsonTabButton" class="tab-button active" onclick="showGraphTab('json')">JSON</button>
+                        <button id="dagTabButton" class="tab-button" onclick="showGraphTab('dag')">DAG</button>
+                    </div>
+                    <div id="graphJsonViewContent" class="tab-pane active">
+                        <pre id="graphJsonViewPre">No graph loaded yet. Paste an OpenAPI spec and generate a plan.</pre>
+                    </div>
+                    <div id="graphDagViewContent" class="tab-pane">
+                        <div class="mermaid-container" id="mermaidDagDiagram">
+                            Graph will appear here once loaded and DAG tab is active.
+                        </div>
+                    </div>
+                </div>
+                <div class="workflow-log-panel">
+                    <h3>Workflow Execution Log</h3>
+                    <div id="workflowLogMessages" class="log-messages-container">
+                        </div>
                 </div>
             </div>
-            <div id="graph-display-area">
-                <h3>Execution Plan View</h3>
-                <div id="graph-json-output">(Plan JSON will appear here)</div>
+
+            <div class="right-panel chat-panel">
+                <div id="chatMessages" class="chat-messages-container">
+                    <div class="message agent-message">
+                        <div class="message-sender">Agent</div>
+                        <div class="message-content">
+                            <p>Welcome! Please paste your OpenAPI specification (JSON or YAML) below, or ask a question if a spec is already loaded.</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="chat-input-area">
+                    <textarea id="userInput" placeholder="Enter OpenAPI spec, ask a question, or provide input..." rows="3"></textarea>
+                    <div class="chat-buttons">
+                        <button id="sendButton" class="action-button primary-button" onclick="sendMessage()">
+                            Send
+                            <div class="spinner" id="thinkingIndicator" style="display: none;"></div>
+                        </button>
+                        <button id="runWorkflowButton" class="action-button secondary-button" onclick="runCurrentWorkflow()">Run Workflow</button>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <div id="confirmationModal" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <h3 id="modalTitle">Confirm Action</h3>
+            <div class="modal-details">
+                <p><strong>Operation ID:</strong> <span id="modalOperationId">N/A</span></p>
+                <p><strong>Method:</strong> <span id="modalMethod">N/A</span></p>
+                <p><strong>Path:</strong> <code id="modalPath">N/A</code></p>
+                <div class="payload-editor">
+                    <label for="modalPayload"><strong>Request Payload (JSON):</strong></label>
+                    <textarea id="modalPayload" rows="10" placeholder="Enter or modify JSON payload..."></textarea>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button id="modalConfirmButton" class="action-button primary-button">Confirm & Proceed</button>
+                <button id="modalCancelButton" class="action-button tertiary-button" onclick="hideConfirmationModal()">Cancel</button>
             </div>
         </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
     <script>
-        const messagesList = document.getElementById('messages');
-        const messageInput = document.getElementById('message-input');
-        const sendButton = document.getElementById('send-button');
-        const graphJsonOutput = document.getElementById('graph-json-output');
-        const statusIndicator = document.getElementById('status-indicator');
-        let socket;
-        let currentSessionId = null;
-
-        function formatTimestamp() {
-            return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit'});
+        // Initialize Mermaid.js
+        if (typeof mermaid !== 'undefined') {
+            mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
+        } else {
+            console.error("Mermaid.js library not loaded.");
         }
-
-        function addMessage(text, type = 'assistant', source = 'system', data = null) {
-            const messageItem = document.createElement('li');
-            messageItem.classList.add('message');
-            
-            let sourcePrefix = "";
-            if (source === 'graph1_planning') sourcePrefix = "[Planner] ";
-            else if (source === 'graph2_execution') sourcePrefix = "[Executor] ";
-            else if (source === 'system') sourcePrefix = "[System] ";
-
-            let messageContent = text;
-            if (typeof text === 'object' && text !== null) {
-                 messageContent = text.message || JSON.stringify(text, null, 2);
-            }
-
-            const textSpan = document.createElement('span');
-            textSpan.textContent = sourcePrefix + messageContent;
-            messageItem.appendChild(textSpan);
-
-            const timeSpan = document.createElement('small');
-            timeSpan.textContent = formatTimestamp();
-            messageItem.appendChild(timeSpan);
-
-            if (type === 'user') {
-                messageItem.classList.add('user-message');
-            } else if (type === 'error') {
-                messageItem.classList.add('error-message');
-            } else if (type === 'system' || type === 'info' || type === 'warning') {
-                 messageItem.classList.add('system-message');
-                 if (type === 'warning') messageItem.style.backgroundColor = '#fff3cd';
-            } else { 
-                messageItem.classList.add('assistant-message');
-            }
-            
-            if (data && type === 'graph_update' && source === 'graph1_planning') { 
-                graphJsonOutput.textContent = JSON.stringify(data, null, 2);
-                const graphUpdateSpan = document.createElement('span');
-                graphUpdateSpan.textContent = " (Plan updated in view)";
-                graphUpdateSpan.style.fontStyle = 'italic';
-                graphUpdateSpan.style.marginLeft = '5px';
-                messageItem.appendChild(graphUpdateSpan);
-            } else if (data && type === 'human_intervention_required' && source === 'graph2_execution') { // Check source
-                const details = data.details_for_ui || {};
-                const interventionDiv = document.createElement('div');
-                interventionDiv.style.cssText = "margin-top: 10px; padding: 10px; background-color: #fffde7; border: 1px solid #fff59d; border-radius: 4px;";
-                interventionDiv.innerHTML = `<strong>Intervention Needed for OpID: ${details.operationId || 'N/A'}</strong><br>
-                                           Method: ${details.method || 'N/A'} ${details.path || 'N/A'}<br>
-                                           Prompt: ${details.prompt || 'N/A'}<br>
-                                           Payload to Confirm: <pre style="white-space: pre-wrap; word-wrap: break-word;">${JSON.stringify(details.payload_to_confirm, null, 2)}</pre>
-                                           To resume, type: <code>resume_exec {"confirmation_key": "${details.confirmation_key}", "decision": true}</code><br>
-                                           (You can also include <code>"modified_payload": {...}</code> in the JSON if changes are needed).`;
-                messageItem.appendChild(interventionDiv);
-            } else if (type === 'execution_completed' && source === 'graph2_execution' && data && data.final_state) { // Check source
-                 const finalStatePre = document.createElement('pre');
-                 finalStatePre.style.cssText = "margin-top:10px; white-space: pre-wrap; word-wrap: break-word; background-color: #e0f7fa; padding: 10px; border-radius: 4px;";
-                 finalStatePre.textContent = `Execution Final State:\n${JSON.stringify(data.final_state, null, 2)}`;
-                 messageItem.appendChild(finalStatePre);
-            }
-
-
-            messagesList.appendChild(messageItem);
-            messagesList.scrollTop = messagesList.scrollHeight;
-        }
-
-        function connectWebSocket() {
-            statusIndicator.textContent = "Connecting...";
-            const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-            const wsUrl = `${wsProtocol}//${window.location.host}/ws/openapi_agent`;
-            socket = new WebSocket(wsUrl);
-
-            socket.onopen = function(event) {
-                statusIndicator.textContent = "Connected";
-                console.log("WebSocket connection established.");
-                addMessage("Connected to the OpenAPI Agent backend.", "system", "system");
-            };
-
-            socket.onmessage = function(event) {
-                console.log("Message from server: ", event.data);
-                try {
-                    const parsedData = JSON.parse(event.data);
-                    currentSessionId = parsedData.session_id || currentSessionId; 
-                    const msgContent = parsedData.content;
-                    const msgType = parsedData.type;
-                    const msgSource = parsedData.source || 'system'; // Default to system if source is missing
-                    addMessage(msgContent, msgType, msgSource, msgContent); // Pass full content as data for special handling
-                } catch (e) {
-                    addMessage("Received unparsable data: " + event.data, 'error', 'system');
-                    console.error("Error parsing message from server: ", e);
-                }
-            };
-
-            socket.onclose = function(event) {
-                statusIndicator.textContent = "Disconnected. Retrying...";
-                console.log("WebSocket connection closed.", event);
-                addMessage("Disconnected. Attempting to reconnect in 5 seconds...", "system", "system");
-                setTimeout(connectWebSocket, 5000);
-            };
-
-            socket.onerror = function(error) {
-                statusIndicator.textContent = "Connection Error.";
-                console.error("WebSocket error: ", error);
-                addMessage("WebSocket connection error. Check console.", "error", "system");
-            };
-        }
-
-        sendButton.onclick = function() {
-            const message = messageInput.value;
-            if (message.trim() === '') return;
-            if (socket && socket.readyState === WebSocket.OPEN) {
-                socket.send(message);
-                addMessage(message, 'user', 'user'); // Source is 'user'
-                messageInput.value = '';
-            } else {
-                addMessage("Not connected. Please wait or refresh.", "error", "system");
-            }
-        };
-        
-        messageInput.addEventListener('keypress', function(e) {
-            if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault(); 
-                sendButton.click();
-            }
-        });
-
-        connectWebSocket();
     </script>
+    <script src="/static/script.js"></script>
 </body>
 </html>
