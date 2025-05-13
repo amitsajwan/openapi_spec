@@ -1,6 +1,6 @@
 # graph.py
 import logging
-from typing import Any, Dict, Literal
+from typing import Any, Dict, Literal, Optional
 
 from langgraph.graph import StateGraph, START, END
 # from langgraph.checkpoint.base import BaseCheckpointSaver # No longer needed if not using checkpointer
