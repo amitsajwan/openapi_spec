@@ -64,12 +64,10 @@ class ExecutionGraphDefinition:
         if not isinstance(template_string, str):
             return str(template_string)
         resolved_string = template_string
-        # Combine initial_input and extracted_ids for placeholder resolution.
-        # extracted_ids can override initial_input if keys conflict.
         placeholders_data = {**(state.initial_input or {}), **(state.extracted_ids or {})}
 
         for key, value in placeholders_data.items():
-            if value is not None: # Ensure value is not None before string conversion
+            if value is not None: 
                 resolved_string = resolved_string.replace(f"{{{key}}}", str(value))
         return resolved_string
 
@@ -85,8 +83,6 @@ class ExecutionGraphDefinition:
         if not node_definition.input_mappings:
             return
         
-        # Data for input mappings can come from initial_input or extracted_ids.
-        # extracted_ids should take precedence if keys overlap.
         available_data_for_mapping = {**(state.initial_input or {}), **(state.extracted_ids or {})}
 
         for mapping in node_definition.input_mappings:
@@ -123,7 +119,7 @@ class ExecutionGraphDefinition:
         if isinstance(payload_template, dict):
             current_payload_template = {k: v for k, v in payload_template.items()} 
         else:
-            current_payload_template = payload_template # Could be string, None, etc.
+            current_payload_template = payload_template
 
         resolved_path_from_template = self._resolve_placeholders(path_template, state)
         
@@ -167,7 +163,6 @@ class ExecutionGraphDefinition:
                 **(state.extracted_ids or {}),
                 **final_path_params 
             }
-            # Create a minimal temporary state for path re-resolution
             temp_state_for_path_re_resolution = ExecutionGraphState(
                 extracted_ids=temp_ids_for_path_resolution,
                 api_results={}, confirmed_data={}, initial_input=None 
@@ -192,7 +187,7 @@ class ExecutionGraphDefinition:
         updated_params = current_query_params.copy()
         updated_headers = current_headers.copy()
         
-        current_confirmed_data = state.confirmed_data or {} # Ensure it's a dict
+        current_confirmed_data = state.confirmed_data or {} 
         
         if current_confirmed_data.get(confirmation_key): 
             confirmed_details = current_confirmed_data.get(f"{confirmation_key}_details", {})
@@ -292,149 +287,151 @@ class ExecutionGraphDefinition:
         return node_executor
 
     def _build_and_compile_graph(self) -> Any:
-        logger.info(f"ExecutionGraphDefinition: Building graph. Plan: {self.graph_plan.description or 'N/A'}")
+        logger.info(f"ExecutionGraphDefinition: Building graph. Plan description: {self.graph_plan.description or 'N/A'}")
         builder = StateGraph(ExecutionGraphState)
         
-        actual_api_nodes_defs = []
-        nodes_requiring_interrupt_before: list[str] = [] 
-
         if not self.graph_plan.nodes:
-            logger.warning("Execution plan has no nodes. Building an empty graph (START -> END).")
-            builder.add_node("__start_dummy__", lambda x: x) # Dummy node if no actual nodes
-            builder.add_node("__end_dummy__", lambda x: x)   # Dummy node
-            builder.set_entry_point("__start_dummy__")
-            builder.add_edge("__start_dummy__", "__end_dummy__")
-            builder.set_finish_point("__end_dummy__")
-            memory_saver = MemorySaver()
-            return builder.compile(checkpointer=memory_saver)
+            # If the plan itself has no nodes, it's an invalid plan for execution.
+            raise ValueError("Execution plan (GraphOutput) must contain at least one node to build Graph 2.")
 
+        actual_api_nodes_defs = []
+        nodes_requiring_interrupt_before: list[str] = []
 
         for node_def in self.graph_plan.nodes:
-            node_id_str = str(node_def.effective_id).strip()
-            if node_id_str.upper() in ["START_NODE", "END_NODE"]:
-                logger.debug(f"Skipping conceptual node '{node_id_str}' from direct addition to LangGraph builder.")
+            # Ensure effective_id is a string and stripped. Handle if it's None.
+            node_effective_id_str = str(node_def.effective_id).strip() if node_def.effective_id else ""
+            if not node_effective_id_str: # Should not happen if plan is well-formed
+                logger.error(f"Node with operationId '{node_def.operationId}' has an empty or None effective_id. Skipping.")
+                continue
+
+            if node_effective_id_str.upper() in ["START_NODE", "END_NODE"]:
+                logger.debug(f"Skipping conceptual node '{node_effective_id_str}' from direct addition to LangGraph builder.")
                 continue
             
             if not node_def.method or not node_def.path:
-                logger.error(f"API Node '{node_id_str}' (OpID: {node_def.operationId}) is missing 'method' or 'path'. This node will likely fail if called.")
-
-            builder.add_node(node_id_str, self._make_node_runnable(node_def))
-            actual_api_nodes_defs.append(node_def) 
+                # This is a critical error for an API node.
+                raise ValueError(f"API Node '{node_effective_id_str}' in plan must have 'method' and 'path' defined.")
+            
+            builder.add_node(node_effective_id_str, self._make_node_runnable(node_def))
+            actual_api_nodes_defs.append(node_def)
             
             if node_def.requires_confirmation:
-                nodes_requiring_interrupt_before.append(node_id_str)
-                logger.info(f"Node '{node_id_str}' marked for 'interrupt_before' due to requires_confirmation=True.")
+                nodes_requiring_interrupt_before.append(node_effective_id_str)
+                logger.info(f"Node '{node_effective_id_str}' marked for 'interrupt_before'.")
+
+        # If, after filtering, there are no actual API nodes to execute
+        if not actual_api_nodes_defs:
+            logger.warning("No executable API nodes found in the plan. Building a minimal START -> END graph.")
+            builder.set_entry_point(START)
+            builder.add_edge(START, END)
+            memory_saver = MemorySaver()
+            return builder.compile(
+                checkpointer=memory_saver,
+                interrupt_before=nodes_requiring_interrupt_before if nodes_requiring_interrupt_before else None
+            )
 
         executable_node_ids_in_builder = {str(n.effective_id).strip() for n in actual_api_nodes_defs}
-        
-        # Handle empty executable graph after filtering START_NODE/END_NODE
-        if not actual_api_nodes_defs:
-            logger.warning("Execution plan contains only conceptual START_NODE/END_NODE or no executable nodes. Building a simple START -> END graph.")
-            # Check if there's an explicit START_NODE -> END_NODE in the plan's edges
-            has_direct_start_to_end_edge = any(
-                str(edge.from_node).strip().upper() == "START_NODE" and 
-                str(edge.to_node).strip().upper() == "END_NODE" 
-                for edge in self.graph_plan.edges
-            )
-            if has_direct_start_to_end_edge or not self.graph_plan.edges : # If direct edge or no edges at all with no API nodes
-                builder.set_entry_point(START)
-                builder.add_edge(START, END)
-                logger.info("Set graph to START -> END as no executable API nodes found or direct plan edge.")
-            else: # Edges exist but don't form a simple START->END and no API nodes
-                logger.error("Graph has edges but no executable API nodes, and not a simple START->END. This configuration is problematic.")
-                # Fallback to a minimal graph to avoid compilation error, though it might not be what user intended
-                builder.set_entry_point(START)
-                builder.add_edge(START, END)
-
-            memory_saver = MemorySaver()
-            return builder.compile(checkpointer=memory_saver)
-
-
         has_start_edge_from_plan = False
-        for edge in self.graph_plan.edges:
-            plan_from_node_original_case = str(edge.from_node).strip()
-            plan_to_node_original_case = str(edge.to_node).strip()
+        
+        if not self.graph_plan.edges:
+            logger.warning("Execution plan has no edges defined. This might lead to an unconnected graph if not handled by entry/finish point logic.")
 
-            is_plan_source_start_node = plan_from_node_original_case.upper() == "START_NODE"
-            source_for_builder = START if is_plan_source_start_node else plan_from_node_original_case
+        for edge_idx, edge in enumerate(self.graph_plan.edges):
+            plan_from_node_original_case = str(edge.from_node).strip() if edge.from_node else ""
+            plan_to_node_original_case = str(edge.to_node).strip() if edge.to_node else ""
             
-            is_plan_target_end_node = plan_to_node_original_case.upper() == "END_NODE"
+            if not plan_from_node_original_case:
+                raise ValueError(f"Edge {edge_idx + 1} has an empty 'from_node'.")
+            if not plan_to_node_original_case:
+                raise ValueError(f"Edge {edge_idx + 1} has an empty 'to_node'.")
+
+            plan_from_node_upper = plan_from_node_original_case.upper()
+            plan_to_node_upper = plan_to_node_original_case.upper()
+            
+            is_plan_source_start_node = plan_from_node_upper == "START_NODE"
+            is_plan_target_end_node = plan_to_node_upper == "END_NODE"
+
+            source_for_builder = START if is_plan_source_start_node else plan_from_node_original_case
             target_for_builder = END if is_plan_target_end_node else plan_to_node_original_case
 
             if source_for_builder != START and plan_from_node_original_case not in executable_node_ids_in_builder:
-                logger.error(f"Edge source node '{plan_from_node_original_case}' from plan is not an executable node in the builder. Skipping edge. Available: {executable_node_ids_in_builder}")
-                continue
+                raise ValueError(f"Edge source '{plan_from_node_original_case}' not in builder nodes: {executable_node_ids_in_builder}")
             if target_for_builder != END and plan_to_node_original_case not in executable_node_ids_in_builder:
-                logger.error(f"Edge target node '{plan_to_node_original_case}' from plan is not an executable node in the builder. Skipping edge. Available: {executable_node_ids_in_builder}")
-                continue
+                raise ValueError(f"Edge target '{plan_to_node_original_case}' not in builder nodes: {executable_node_ids_in_builder}")
             
             try:
                 builder.add_edge(source_for_builder, target_for_builder)
                 logger.debug(f"Added edge: {source_for_builder} --> {target_for_builder}")
-                if source_for_builder == START:
-                    has_start_edge_from_plan = True
             except Exception as e_add_edge:
-                 logger.error(f"Failed to add edge {source_for_builder} -> {target_for_builder}: {e_add_edge}", exc_info=True)
+                source_log = 'LANGGRAPH_START' if source_for_builder == START else source_for_builder
+                target_log = 'LANGGRAPH_END' if target_for_builder == END else target_for_builder
+                raise ValueError(f"LangGraph failed to add edge ('{source_log}' -> '{target_log}'). Error: {e_add_edge}")
 
-        # Set entry point
-        entry_point_node_id: Optional[str] = None
-        if has_start_edge_from_plan:
-            builder.set_entry_point(START) 
-            logger.info("Entry point set to START (due to explicit edge from START_NODE in plan).")
-        elif actual_api_nodes_defs: 
-            entry_point_node_id = str(actual_api_nodes_defs[0].effective_id).strip()
-            builder.set_entry_point(entry_point_node_id) 
-            logger.info(f"No explicit START_NODE edge. Entry point heuristically set to first API node: '{entry_point_node_id}'.")
-        else: # Should have been caught by the "empty executable graph" check above.
-             logger.critical("Graph building reached an unexpected state: no executable nodes and no START_NODE edge, but not handled by empty graph logic.")
-             # Fallback to prevent crash during compile, though graph is likely non-functional
-             builder.set_entry_point(START)
-             builder.add_edge(START, END)
-
-
-        # Set finish points for nodes that are leaves or only point to END_NODE
-        # This logic needs to be careful not to conflict with the entry point if it's a single-node graph.
-        if len(actual_api_nodes_defs) == 1 and entry_point_node_id == actual_api_nodes_defs[0].effective_id:
-            # Single API node graph, and it's the entry point.
-            # Ensure it has a path to END if no other outgoing edges are defined in the plan.
-            single_node_id = entry_point_node_id
-            has_outgoing_edge_from_plan = any(
-                str(e.from_node).strip() == single_node_id for e in self.graph_plan.edges
-            )
-            if not has_outgoing_edge_from_plan:
-                logger.info(f"Single API node graph with '{single_node_id}' as entry. Adding explicit edge to END as no outgoing edges found in plan.")
-                builder.add_edge(single_node_id, END)
-            # In this single-node case, we don't need to call set_finish_point explicitly for this node
-            # if it already leads to END. LangGraph handles it.
-        else: # Graphs with multiple API nodes or where entry is START
-            for node_def in actual_api_nodes_defs:
-                node_id = str(node_def.effective_id).strip()
-                
-                is_source_for_api_edge = any(
-                    str(e.from_node).strip() == node_id and 
-                    str(e.to_node).strip().upper() != "END_NODE" and 
-                    str(e.to_node).strip() in executable_node_ids_in_builder 
-                    for e in self.graph_plan.edges
-                )
-                
-                has_explicit_edge_to_end_node_constant = any(
-                    str(e.from_node).strip() == node_id and 
-                    str(edge.to_node).strip().upper() == "END_NODE" 
-                    for e in self.graph_plan.edges
-                )
-
-                # If a node is not the source of any edge to another API node,
-                # AND it doesn't have an explicit edge to the conceptual END_NODE (which would be mapped to LangGraph.END),
-                # then it's a leaf among API nodes and should be a finish point.
-                if not is_source_for_api_edge and not has_explicit_edge_to_end_node_constant:
-                    # Avoid setting the main START constant as a finish point.
-                    if node_id != START: # Ensure we are not trying to set LangGraph's START as a finish point
-                        try:
-                            builder.set_finish_point(node_id)
-                            logger.info(f"Node '{node_id}' is a leaf or points only to END implicitly. Setting as LangGraph finish point.")
-                        except Exception as e_set_finish:
-                             logger.error(f"Failed to set node '{node_id}' as finish point: {e_set_finish}", exc_info=True)
+            if source_for_builder == START:
+                has_start_edge_from_plan = True
         
+        # Set entry point
+        if has_start_edge_from_plan:
+            builder.set_entry_point(START)
+            logger.info("Entry point set to START (due to explicit edge from START_NODE in plan).")
+        elif actual_api_nodes_defs: # Must have at least one actual node to be an entry point
+            entry_point_candidate = str(actual_api_nodes_defs[0].effective_id).strip()
+            # This check should pass if actual_api_nodes_defs is populated correctly
+            if entry_point_candidate not in executable_node_ids_in_builder:
+                 raise ValueError(f"Default entry point candidate '{entry_point_candidate}' is not among executable nodes: {executable_node_ids_in_builder}")
+            builder.set_entry_point(entry_point_candidate)
+            logger.info(f"No explicit START_NODE edge. Entry point set to first API node: '{entry_point_candidate}'.")
+        else:
+            # This case should be covered by the "no actual_api_nodes_defs" check earlier.
+            # If it's reached, it's an unexpected state.
+            logger.critical("Graph building: Reached unexpected state for entry point setting. No API nodes and no START edge, but not caught by empty graph logic.")
+            raise RuntimeError("Failed to determine a valid entry point for the graph.")
+
+
+        # Set finish points for nodes that are leaves or only point to the conceptual END_NODE
+        if actual_api_nodes_defs:
+            for node_def in actual_api_nodes_defs:
+                node_id_str = str(node_def.effective_id).strip()
+                
+                # Check if this node is a source for any edge leading to another *executable* API node
+                is_source_to_another_api_node = any(
+                    str(e.from_node).strip() == node_id_str and
+                    str(e.to_node).strip() in executable_node_ids_in_builder and # Target must be an API node
+                    str(e.to_node).strip().upper() != "END_NODE" # And not the conceptual END_NODE
+                    for e in self.graph_plan.edges
+                )
+                
+                # Check if this node has an explicit edge to the conceptual "END_NODE" in the plan
+                has_explicit_edge_to_plan_end_node = any(
+                    str(e.from_node).strip() == node_id_str and
+                    str(e.to_node).strip().upper() == "END_NODE"
+                    for e in self.graph_plan.edges
+                )
+
+                # A node is a finish point if:
+                # 1. It does not lead to any other executable API node.
+                # 2. AND it does not have an explicit edge to the conceptual "END_NODE" in the plan
+                #    (because if it did, LangGraph handles that edge to its `END` constant).
+                if not is_source_to_another_api_node and not has_explicit_edge_to_plan_end_node:
+                    # However, if this node is also the *only* node and the entry point,
+                    # LangGraph might error if it's also set as a finish point directly without an edge to END.
+                    # This is more subtly handled by ensuring single-node entry points have an edge to END if no other outgoing.
+                    if len(actual_api_nodes_defs) == 1 and node_id_str == builder.entry_point and not has_explicit_edge_to_plan_end_node:
+                        logger.info(f"Single node graph with entry point '{node_id_str}'. Ensuring it has a path to END.")
+                        # If it doesn't already point to END via plan, add it.
+                        # This check is a bit redundant if the above logic for single node graphs is perfect, but safe.
+                        try:
+                            builder.add_edge(node_id_str, END)
+                            logger.info(f"Added explicit edge from single entry node '{node_id_str}' to END.")
+                        except Exception as e: # Catch if edge already exists or other issues
+                            logger.warning(f"Could not add edge from single entry node '{node_id_str}' to END: {e}. It might already exist or be handled.")
+                    elif node_id_str != builder.entry_point or len(actual_api_nodes_defs) > 1 : # Not a single node entry point, or multiple nodes exist
+                        try:
+                            builder.set_finish_point(node_id_str)
+                            logger.info(f"Node '{node_id_str}' set as finish point.")
+                        except Exception as e_set_finish:
+                            logger.error(f"Failed to set node '{node_id_str}' as finish point: {e_set_finish}", exc_info=True)
+
         logger.info(f"Compiling execution graph. Nodes for interrupt_before: {nodes_requiring_interrupt_before}")
         memory_saver = MemorySaver()
         
@@ -447,8 +444,7 @@ class ExecutionGraphDefinition:
             return compiled_graph
         except Exception as e_compile:
             logger.critical(f"Execution graph compilation failed: {e_compile}", exc_info=True)
-            raise 
-
+            raise
 
     def get_runnable_graph(self) -> Any:
         return self.runnable_graph
@@ -473,12 +469,13 @@ class ExecutionGraphDefinition:
             logger.error(f"get_node_definition received an invalid type for node_effective_id: {type(node_effective_id)}")
             return None
 
-        if target_id_str is None:
+        if target_id_str is None: # Should be caught by above checks if input was not string or valid list/tuple
             return None
 
         for node in self.graph_plan.nodes:
-            if str(node.effective_id).strip() == target_id_str:
+            # Ensure comparison is robust if node.effective_id could be None
+            current_node_eff_id = str(node.effective_id).strip() if node.effective_id else ""
+            if current_node_eff_id == target_id_str:
                 return node
         logger.warning(f"Node definition not found for effective_id: '{target_id_str}'")
         return None
-
