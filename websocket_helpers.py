@@ -24,78 +24,56 @@ async def send_websocket_message_helper(
     source_graph: str = "graph1_planning",
     graph2_thread_id: Optional[str] = None
 ):
-    """
-    Helper function to send JSON messages over a WebSocket connection.
-    Ensures content is JSON serializable.
-    """
     if websocket.client_state != WebSocketState.CONNECTED:
         logger.warning(f"[{session_id}] Attempted to send WS message but socket is not connected (State: {websocket.client_state}). Type: {msg_type}")
         return
 
     try:
-        # Ensure content is JSON serializable before sending
         try:
-            # Attempt to serialize to catch errors early, then send the original object
-            # if it's already a dict/list/primitive that send_json can handle.
-            # If it's a Pydantic model, model_dump() should have been called before passing here.
-            json.dumps(content)
+            json.dumps(content) # Test serializability
             payload_to_send = content
         except TypeError as te:
             logger.warning(f"Content for WS type {msg_type} not directly JSON serializable, attempting str(): {te}. Content snippet: {str(content)[:200]}")
-            payload_to_send = {"raw_content": str(content)} # Fallback
+            payload_to_send = {"raw_content": str(content)} 
 
         await websocket.send_json({
             "type": msg_type,
             "source": source_graph,
             "content": payload_to_send,
-            "session_id": session_id, # Always include the main G1 session ID
-            "graph2_thread_id": graph2_thread_id or session_id # Use specific G2 ID if available
+            "session_id": session_id, 
+            "graph2_thread_id": graph2_thread_id or session_id 
         })
     except Exception as e:
-        # Catch broader exceptions during send_json itself (e.g., connection dropped mid-send)
         logger.error(f"[{session_id}] WebSocket send error (Type: {msg_type}, G2_Thread: {graph2_thread_id}): {e}", exc_info=False)
 
 
 # --- Main WebSocket Connection Handler ---
 async def handle_websocket_connection(
     websocket: WebSocket,
-    session_id: str, # Graph 1 (planning) session ID
+    session_id: str, 
     langgraph_planning_app: Any,
     api_executor_instance: APIExecutor,
     active_graph2_executors: Dict[str, GraphExecutionManager],
     active_graph2_definitions: Dict[str, ExecutionGraphDefinition]
 ):
-    """
-    Manages an active WebSocket connection, processing incoming messages,
-    orchestrating Graph 1 (planning) and Graph 2 (execution).
-    """
     await send_websocket_message_helper(
-        websocket, "info", {"message": "Connection established with helper."},
+        websocket, "info", {"message": "Connection established."}, # Simplified initial message
         session_id, "system"
     )
 
-    # Session-specific store for BotState fields that persist across Graph 1 invocations
     _session_bot_state_store: Dict[str, Any] = {"workflow_execution_status": "idle"}
-    current_graph2_thread_id_for_session: Optional[str] = None # Tracks the G2 ID for the current G1 turn
+    current_graph2_thread_id_for_session: Optional[str] = None 
 
-    # --- Graph 2 Callback (Nested to capture session-specific WebSocket & ID) ---
     async def graph2_ws_callback_for_this_session(
         event_type: str,
         data: Dict[str, Any],
-        graph2_thread_id_param: Optional[str] # This is the G2 thread ID from the manager
+        graph2_thread_id_param: Optional[str] 
     ):
-        """
-        Callback for GraphExecutionManager to send updates back to the client
-        via this specific WebSocket session.
-        """
-        # Ensure messages from G2 are tagged with their specific G2 thread ID
         await send_websocket_message_helper(
             websocket, event_type, data, session_id, "graph2_execution", graph2_thread_id_param
         )
 
-        # Update the main session's general workflow status based on G2 events
-        # Exclude per-tool events from this high-level status update
-        if event_type not in ["tool_start", "tool_end"]:
+        if event_type not in ["tool_start", "tool_end"]: # Avoid high-level status change for every tool event
             logger.info(f"[{session_id}] G2 Callback (G2_Thread: {graph2_thread_id_param}). Event: {event_type}. Store status before: {_session_bot_state_store.get('workflow_execution_status')}")
             new_status = _session_bot_state_store.get("workflow_execution_status", "idle")
 
@@ -104,7 +82,6 @@ async def handle_websocket_connection(
             elif event_type in ["execution_completed", "execution_failed", "workflow_timeout"]:
                 new_status = "completed" if event_type == "execution_completed" else "failed"
                 _session_bot_state_store["workflow_execution_results"] = data.get("final_state", {})
-                # Clean up the specific G2 executor and definition when it's truly finished/failed
                 if graph2_thread_id_param:
                     if graph2_thread_id_param in active_graph2_executors:
                         logger.info(f"[{session_id}] Workflow for G2 Thread ID {graph2_thread_id_param} ended. Removing its executor and definition.")
@@ -112,11 +89,9 @@ async def handle_websocket_connection(
                         active_graph2_definitions.pop(graph2_thread_id_param, None)
                     else:
                         logger.warning(f"[{session_id}] G2 Thread ID {graph2_thread_id_param} ended but not found in active executors for cleanup.")
-
-
+            
             _session_bot_state_store["workflow_execution_status"] = new_status
             logger.info(f"[{session_id}] G2 Callback. Store status after: {new_status}")
-    # --- End of Graph 2 Callback ---
 
     try:
         while True:
@@ -126,37 +101,30 @@ async def handle_websocket_connection(
                 continue
             logger.info(f"[{session_id}] RX: '{user_input_text[:100]}...'")
 
-            # --- Initialize BotState for the current turn ---
             current_bot_state = _initialize_bot_state_for_turn(session_id, user_input_text, _session_bot_state_store)
 
-            # --- Handle "resume_exec" Command ---
             if user_input_text.lower().startswith("resume_exec"):
                 await _process_resume_command(
                     websocket, session_id, user_input_text,
                     _session_bot_state_store, active_graph2_executors
                 )
-                continue # Skip further processing for this turn
+                continue 
 
-            # --- Run Graph 1 (Planning) ---
             current_bot_state = await _run_planning_graph(
                 websocket, session_id, current_bot_state, langgraph_planning_app
             )
 
-            # --- Persist BotState after Graph 1 ---
             _persist_bot_state_after_planning(_session_bot_state_store, current_bot_state)
             logger.debug(f"[{session_id}] Persisted BotState. Store status: {_session_bot_state_store.get('workflow_execution_status')}")
 
-
-            # --- Initiate Graph 2 (Execution) if pending ---
             if _session_bot_state_store.get("workflow_execution_status") == "pending_start":
                 current_graph2_thread_id_for_session = await _initiate_execution_graph(
                     websocket, session_id, _session_bot_state_store,
                     api_executor_instance, active_graph2_executors,
-                    active_graph2_definitions, graph2_ws_callback_for_this_session # Pass the nested callback
+                    active_graph2_definitions, graph2_ws_callback_for_this_session 
                 )
-                if not current_graph2_thread_id_for_session: # If initiation failed
+                if not current_graph2_thread_id_for_session: 
                      _session_bot_state_store["workflow_execution_status"] = "failed"
-
 
     except WebSocketDisconnect:
         logger.info(f"[{session_id}] WebSocket disconnected by client.")
@@ -168,22 +136,16 @@ async def handle_websocket_connection(
         )
     finally:
         logger.info(f"[{session_id}] Cleaning up WebSocket connection resources.")
-        # Clean up any G2 executor specifically associated with the *last* G2 run started by this G1 session
         if current_graph2_thread_id_for_session:
             logger.info(f"[{session_id}] Cleaning up executor and definition for last G2 thread: {current_graph2_thread_id_for_session}")
             active_graph2_executors.pop(current_graph2_thread_id_for_session, None)
             active_graph2_definitions.pop(current_graph2_thread_id_for_session, None)
         else:
-            # Fallback: if no specific G2 ID was tracked for the very last interaction,
-            # this might indicate a G1-only session or an issue before G2 started.
-            # No specific G2 cleanup needed here unless a broader session-based cleanup is intended,
-            # which is risky if G2 threads could outlive the G1 session that spawned them.
             logger.info(f"[{session_id}] No specific G2 thread ID tracked for final cleanup.")
-
 
         if websocket.client_state == WebSocketState.CONNECTED:
             try:
-                await websocket.close(code=1000) # Normal closure
+                await websocket.close(code=1000) 
             except RuntimeError as e:
                 logger.warning(f"[{session_id}] Error closing WebSocket (already closing?): {e}")
             except Exception as e:
@@ -196,8 +158,6 @@ async def handle_websocket_connection(
 def _initialize_bot_state_for_turn(
     session_id: str, user_input: str, session_store: Dict[str, Any]
 ) -> BotState:
-    """Creates and initializes a BotState instance for the current processing turn."""
-    # Ensure execution_graph is loaded as Pydantic model if present in store
     exec_graph_data = session_store.get("execution_graph")
     execution_graph_model = None
     if isinstance(exec_graph_data, dict):
@@ -205,10 +165,9 @@ def _initialize_bot_state_for_turn(
             execution_graph_model = PlanSchema.model_validate(exec_graph_data)
         except Exception as e:
             logger.error(f"[{session_id}] Failed to validate execution_graph from session_store: {e}")
-            execution_graph_model = None # Proceed without it if validation fails
+            execution_graph_model = None 
     elif isinstance(exec_graph_data, PlanSchema):
         execution_graph_model = exec_graph_data
-
 
     state = BotState(
         session_id=session_id,
@@ -221,13 +180,11 @@ def _initialize_bot_state_for_turn(
         payload_descriptions=session_store.get("payload_descriptions", {}),
         execution_graph=execution_graph_model,
         plan_generation_goal=session_store.get("plan_generation_goal"),
-        input_is_spec=session_store.get("input_is_spec", False), # Will be determined by router
+        input_is_spec=session_store.get("input_is_spec", False), 
         workflow_execution_status=session_store.get("workflow_execution_status", "idle"),
         workflow_execution_results=session_store.get("workflow_execution_results", {}),
         workflow_extracted_data=session_store.get("workflow_extracted_data", {})
-        # response, final_response, next_step, intent are transient for the turn
     )
-    # Ensure scratchpad is a dict for the new turn
     state.scratchpad = {}
     return state
 
@@ -236,7 +193,6 @@ async def _process_resume_command(
     session_store: Dict[str, Any],
     active_graph2_executors: Dict[str, GraphExecutionManager]
 ):
-    """Handles the 'resume_exec' command from the user."""
     try:
         parts = user_input_text.split(" ", 2)
         if len(parts) < 3:
@@ -259,7 +215,6 @@ async def _process_resume_command(
 
         exec_manager = active_graph2_executors.get(graph2_thread_id_to_resume)
 
-        # Check general status first, then specific manager
         if session_store.get("workflow_execution_status") == "paused_for_confirmation":
             if exec_manager:
                 submitted = await exec_manager.submit_resume_data(graph2_thread_id_to_resume, resume_payload_for_graph2)
@@ -268,7 +223,7 @@ async def _process_resume_command(
                         websocket, "info", {"message": "Resume data submitted to execution manager."},
                         session_id, "graph2_execution", graph2_thread_id_to_resume
                     )
-                    session_store["workflow_execution_status"] = "running" # Update general status
+                    session_store["workflow_execution_status"] = "running" 
                 else:
                     await send_websocket_message_helper(
                         websocket, "error", {"error": "Failed to submit resume data to the manager."},
@@ -300,55 +255,47 @@ async def _process_resume_command(
 async def _run_planning_graph(
     websocket: WebSocket, session_id: str, bot_state: BotState, langgraph_planning_app: Any
 ) -> BotState:
-    """Executes Graph 1 (Planning) and updates the BotState."""
     await send_websocket_message_helper(
         websocket, "status", {"message": "Planning workflow..."},
         session_id, "graph1_planning"
     )
-    planning_config = {"configurable": {"thread_id": session_id}} # Graph 1 uses main session_id
-    current_bot_state_after_planning = bot_state # Initialize with incoming state
+    planning_config = {"configurable": {"thread_id": session_id}} 
+    current_bot_state_after_planning = bot_state 
+    last_intermediate_message_sent: Optional[str] = None # MODIFIED: Track last intermediate message
 
     try:
         graph1_input_dict = current_bot_state_after_planning.model_dump(exclude_none=True)
-        async for event in langgraph_planning_app.astream_events(graph1_input_dict, config=planning_config, version="v2"): # Use v2 events
+        async for event in langgraph_planning_app.astream_events(graph1_input_dict, config=planning_config, version="v2"): 
             event_name = event["event"]
             event_data = event.get("data", {})
-            node_name = event.get("name", "") # For on_tool_end etc.
+            # node_name = event.get("name", "") # Not directly used for G1 message sending logic
 
-            # logger.debug(f"[{session_id}] G1 Event: {event_name}, Node: {node_name}, DataKeys: {list(event_data.keys())}")
-
-            if event_name == "on_tool_end" or event_name == "on_chat_model_end" or event_name == "on_chain_end": # More specific event types
-                # The output of a node is usually in event["data"]["output"]
-                # For StateGraph, this output is merged into the state.
-                # The full state snapshot is usually available at on_graph_end or by calling get_state.
-                # For intermediate updates, we can try to parse if 'output' is a BotState or dict.
+            if event_name == "on_tool_end" or event_name == "on_chat_model_end" or event_name == "on_chain_end": 
                 node_output_any = event_data.get("output")
 
                 if isinstance(node_output_any, BotState):
                     current_bot_state_after_planning = node_output_any
                 elif isinstance(node_output_any, dict):
                     try:
-                        # Merge output dict into existing state. Be careful with Pydantic.
-                        # Create a copy and update, or use model_copy(update=...)
-                        updated_fields = {k: v for k, v in node_output_any.items() if hasattr(BotState, k)} # Only update valid BotState fields
+                        updated_fields = {k: v for k, v in node_output_any.items() if hasattr(BotState, k)} 
                         current_bot_state_after_planning = current_bot_state_after_planning.model_copy(update=updated_fields)
                     except Exception as e_val:
                         logger.error(f"[{session_id}] Error updating BotState from G1 node output dict: {e_val}, dict: {node_output_any}")
 
-                # Send intermediate response if the node generated one
                 if current_bot_state_after_planning.response:
+                    msg_to_send = current_bot_state_after_planning.response
                     await send_websocket_message_helper(
-                        websocket, "intermediate", {"message": current_bot_state_after_planning.response},
+                        websocket, "intermediate", {"message": msg_to_send},
                         session_id, "graph1_planning"
                     )
-                    current_bot_state_after_planning.response = None # Clear after sending
+                    last_intermediate_message_sent = msg_to_send # MODIFIED: Track it
+                    current_bot_state_after_planning.response = None 
 
-                # Send graph update if available in scratchpad
                 if current_bot_state_after_planning.scratchpad and 'graph_to_send' in current_bot_state_after_planning.scratchpad:
                     graph_json_str = current_bot_state_after_planning.scratchpad.pop('graph_to_send', None)
                     if graph_json_str:
                         try:
-                            graph_content = json.loads(graph_json_str) # Expecting a JSON string
+                            graph_content = json.loads(graph_json_str) 
                             await send_websocket_message_helper(
                                 websocket, "graph_update", graph_content,
                                 session_id, "graph1_planning"
@@ -358,44 +305,53 @@ async def _run_planning_graph(
                         except Exception as e_graph:
                             logger.error(f"[{session_id}] G1: Failed to send graph_update: {e_graph}")
 
-
             elif event_name == "on_graph_end":
-                final_graph_output = event_data.get("output") # This should be the final BotState dict
+                final_graph_output = event_data.get("output") 
                 if isinstance(final_graph_output, dict):
                     try:
                         current_bot_state_after_planning = BotState.model_validate(final_graph_output)
                     except Exception as e_val:
                          logger.error(f"[{session_id}] Error validating final BotState from G1 output: {e_val}, dict: {final_graph_output}")
-                elif isinstance(final_graph_output, BotState): # Should ideally be dict from LangGraph
+                elif isinstance(final_graph_output, BotState): 
                     current_bot_state_after_planning = final_graph_output
                 else:
                     logger.error(f"[{session_id}] G1: on_graph_end output was not a dict or BotState: {type(final_graph_output)}")
-                break # Finished with Graph 1 execution
+                break 
 
-        # Send final response from Graph 1
-        final_response_g1 = current_bot_state_after_planning.final_response or current_bot_state_after_planning.response
-        if final_response_g1:
-            await send_websocket_message_helper(
-                websocket, "final", {"message": final_response_g1},
-                session_id, "graph1_planning"
-            )
-        current_bot_state_after_planning.final_response = "" # Clear after sending
+        # MODIFIED: Send final response from Graph 1, checking against last intermediate
+        final_msg_content = current_bot_state_after_planning.final_response
+        # Fallback to .response only if .final_response is empty AND .response somehow survived (unlikely with current logic)
+        if not final_msg_content and current_bot_state_after_planning.response:
+            final_msg_content = current_bot_state_after_planning.response
+            logger.warning(f"[{session_id}] G1: final_response was empty, using lingering .response for final message: '{str(final_msg_content)[:50]}...'. This is unusual.")
+
+        if final_msg_content:
+            if final_msg_content == last_intermediate_message_sent:
+                logger.info(f"[{session_id}] G1: Final message ('{str(final_msg_content)[:50]}...') is identical to last intermediate. Suppressing duplicate final message.")
+                # If suppressed, and you still want a "final" event type for UI state,
+                # you might send a generic "processing complete" or a special "final_ack" type.
+                # For now, just suppressing.
+            else:
+                await send_websocket_message_helper(
+                    websocket, "final", {"message": final_msg_content},
+                    session_id, "graph1_planning"
+                )
+        
+        current_bot_state_after_planning.final_response = "" 
         current_bot_state_after_planning.response = None
-
 
     except Exception as e_plan:
         logger.critical(f"[{session_id}] Planning Graph (Graph 1) execution error: {e_plan}", exc_info=True)
         await send_websocket_message_helper(
-            websocket, "error", {"error": f"Error during planning phase: {str(e_plan)[:200]}"}, # Truncate long errors
+            websocket, "error", {"error": f"Error during planning phase: {str(e_plan)[:200]}"}, 
             session_id, "system_error"
         )
-        current_bot_state_after_planning.workflow_execution_status = "failed" # Mark as failed if planning itself errors
+        current_bot_state_after_planning.workflow_execution_status = "failed" 
 
     return current_bot_state_after_planning
 
 
 def _persist_bot_state_after_planning(session_store: Dict[str, Any], bot_state: BotState):
-    """Persists relevant fields from BotState to the session_store."""
     session_store["openapi_spec_text"] = bot_state.openapi_spec_text
     session_store["openapi_schema"] = bot_state.openapi_schema
     session_store["schema_cache_key"] = bot_state.schema_cache_key
@@ -407,22 +363,20 @@ def _persist_bot_state_after_planning(session_store: Dict[str, Any], bot_state: 
     else:
         session_store["execution_graph"] = None
     session_store["plan_generation_goal"] = bot_state.plan_generation_goal
-    session_store["input_is_spec"] = bot_state.input_is_spec # Though router might reset this
+    session_store["input_is_spec"] = bot_state.input_is_spec 
     session_store["workflow_execution_status"] = bot_state.workflow_execution_status
     session_store["workflow_execution_results"] = bot_state.workflow_execution_results
     session_store["workflow_extracted_data"] = bot_state.workflow_extracted_data
-    # Scratchpad is not typically persisted between turns unless specific keys are needed.
 
 async def _initiate_execution_graph(
     websocket: WebSocket,
-    session_id: str, # G1 session ID
+    session_id: str, 
     session_store: Dict[str, Any],
     api_executor_instance: APIExecutor,
     active_graph2_executors: Dict[str, GraphExecutionManager],
     active_graph2_definitions: Dict[str, ExecutionGraphDefinition],
     graph2_ws_callback: Callable[[str, Dict[str, Any], Optional[str]], Awaitable[None]]
-) -> Optional[str]: # Returns the G2 thread ID if successful
-    """Initiates Graph 2 (Execution) if conditions are met."""
+) -> Optional[str]: 
     logger.info(f"[{session_id}] Checking if Graph 2 initiation is pending...")
     exec_plan_dict = session_store.get("execution_graph")
     exec_plan_model = PlanSchema.model_validate(exec_plan_dict) if exec_plan_dict else None
@@ -434,7 +388,7 @@ async def _initiate_execution_graph(
             session_id, "system_warning"
         )
         return None
-    if not api_executor_instance: # Should have been caught at startup
+    if not api_executor_instance: 
         logger.error(f"[{session_id}] Graph 2 initiation failed: APIExecutor not available.")
         await send_websocket_message_helper(
             websocket, "error", {"error": "Cannot start execution: API executor service is not available."},
@@ -442,12 +396,10 @@ async def _initiate_execution_graph(
         )
         return None
 
-    # Generate a unique thread ID for this specific Graph 2 execution run
     graph2_thread_id = f"{session_id}_exec_{uuid.uuid4().hex[:8]}"
     logger.info(f"[{session_id}] Generated new G2 Thread ID for execution: {graph2_thread_id}")
 
     try:
-        # ExecutionGraphDefinition no longer takes websocket_callback or graph2_thread_id
         exec_graph_def = ExecutionGraphDefinition(
             graph_execution_plan=exec_plan_model,
             api_executor=api_executor_instance
@@ -458,27 +410,24 @@ async def _initiate_execution_graph(
         exec_manager = GraphExecutionManager(
             runnable_graph=runnable_exec_graph,
             graph_definition=exec_graph_def,
-            websocket_callback=graph2_ws_callback, # Manager uses this for high-level events and per-tool events
-            planning_checkpointer=None, # Checkpointer for Graph 2's own state if needed
-            main_planning_session_id=session_id # For context/logging in manager
+            websocket_callback=graph2_ws_callback, 
+            planning_checkpointer=None, 
+            main_planning_session_id=session_id 
         )
         active_graph2_executors[graph2_thread_id] = exec_manager
 
         initial_exec_state_values = ExecutionGraphState(
             initial_input=session_store.get("workflow_extracted_data", {}),
-            # Other fields (api_results, extracted_ids, confirmed_data) start empty
         ).model_dump(exclude_none=True)
 
-        # Config for Graph 2 execution, using its unique thread_id
         exec_graph_config = {"configurable": {"thread_id": graph2_thread_id}}
 
         await send_websocket_message_helper(
             websocket, "info", {"message": f"Execution phase (Graph 2) starting with G2 Thread ID: {graph2_thread_id}."},
-            session_id, "graph2_execution", graph2_thread_id # Tag with G2 ID
+            session_id, "graph2_execution", graph2_thread_id 
         )
-        session_store["workflow_execution_status"] = "running" # Update general status
+        session_store["workflow_execution_status"] = "running" 
 
-        # Start Graph 2 execution in a background task
         asyncio.create_task(exec_manager.execute_workflow(initial_exec_state_values, exec_graph_config))
         return graph2_thread_id
 
@@ -488,7 +437,6 @@ async def _initiate_execution_graph(
             websocket, "error", {"error": f"Server error during execution setup: {str(e_exec_setup)[:150]}"},
             session_id, "system_error", graph2_thread_id
         )
-        # Clean up if setup failed for this specific G2 thread
         active_graph2_executors.pop(graph2_thread_id, None)
         active_graph2_definitions.pop(graph2_thread_id, None)
         return None
