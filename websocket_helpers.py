@@ -369,4 +369,126 @@ async def _run_planning_graph(
                 elif isinstance(final_graph_output, BotState): # Should ideally be dict from LangGraph
                     current_bot_state_after_planning = final_graph_output
                 else:
-                    logger.error(f"[{session_id}] G1: on_graph_end output was not a dict or BotState: {t
+                    logger.error(f"[{session_id}] G1: on_graph_end output was not a dict or BotState: {type(final_graph_output)}")
+                break # Finished with Graph 1 execution
+
+        # Send final response from Graph 1
+        final_response_g1 = current_bot_state_after_planning.final_response or current_bot_state_after_planning.response
+        if final_response_g1:
+            await send_websocket_message_helper(
+                websocket, "final", {"message": final_response_g1},
+                session_id, "graph1_planning"
+            )
+        current_bot_state_after_planning.final_response = "" # Clear after sending
+        current_bot_state_after_planning.response = None
+
+
+    except Exception as e_plan:
+        logger.critical(f"[{session_id}] Planning Graph (Graph 1) execution error: {e_plan}", exc_info=True)
+        await send_websocket_message_helper(
+            websocket, "error", {"error": f"Error during planning phase: {str(e_plan)[:200]}"}, # Truncate long errors
+            session_id, "system_error"
+        )
+        current_bot_state_after_planning.workflow_execution_status = "failed" # Mark as failed if planning itself errors
+
+    return current_bot_state_after_planning
+
+
+def _persist_bot_state_after_planning(session_store: Dict[str, Any], bot_state: BotState):
+    """Persists relevant fields from BotState to the session_store."""
+    session_store["openapi_spec_text"] = bot_state.openapi_spec_text
+    session_store["openapi_schema"] = bot_state.openapi_schema
+    session_store["schema_cache_key"] = bot_state.schema_cache_key
+    session_store["schema_summary"] = bot_state.schema_summary
+    session_store["identified_apis"] = bot_state.identified_apis
+    session_store["payload_descriptions"] = bot_state.payload_descriptions
+    if bot_state.execution_graph:
+        session_store["execution_graph"] = bot_state.execution_graph.model_dump(exclude_none=True)
+    else:
+        session_store["execution_graph"] = None
+    session_store["plan_generation_goal"] = bot_state.plan_generation_goal
+    session_store["input_is_spec"] = bot_state.input_is_spec # Though router might reset this
+    session_store["workflow_execution_status"] = bot_state.workflow_execution_status
+    session_store["workflow_execution_results"] = bot_state.workflow_execution_results
+    session_store["workflow_extracted_data"] = bot_state.workflow_extracted_data
+    # Scratchpad is not typically persisted between turns unless specific keys are needed.
+
+async def _initiate_execution_graph(
+    websocket: WebSocket,
+    session_id: str, # G1 session ID
+    session_store: Dict[str, Any],
+    api_executor_instance: APIExecutor,
+    active_graph2_executors: Dict[str, GraphExecutionManager],
+    active_graph2_definitions: Dict[str, ExecutionGraphDefinition],
+    graph2_ws_callback: Callable[[str, Dict[str, Any], Optional[str]], Awaitable[None]]
+) -> Optional[str]: # Returns the G2 thread ID if successful
+    """Initiates Graph 2 (Execution) if conditions are met."""
+    logger.info(f"[{session_id}] Checking if Graph 2 initiation is pending...")
+    exec_plan_dict = session_store.get("execution_graph")
+    exec_plan_model = PlanSchema.model_validate(exec_plan_dict) if exec_plan_dict else None
+
+    if not exec_plan_model:
+        logger.warning(f"[{session_id}] Graph 2 initiation skipped: No execution plan found in session store.")
+        await send_websocket_message_helper(
+            websocket, "warning", {"message": "Cannot start execution: No valid plan available."},
+            session_id, "system_warning"
+        )
+        return None
+    if not api_executor_instance: # Should have been caught at startup
+        logger.error(f"[{session_id}] Graph 2 initiation failed: APIExecutor not available.")
+        await send_websocket_message_helper(
+            websocket, "error", {"error": "Cannot start execution: API executor service is not available."},
+            session_id, "system_error"
+        )
+        return None
+
+    # Generate a unique thread ID for this specific Graph 2 execution run
+    graph2_thread_id = f"{session_id}_exec_{uuid.uuid4().hex[:8]}"
+    logger.info(f"[{session_id}] Generated new G2 Thread ID for execution: {graph2_thread_id}")
+
+    try:
+        # ExecutionGraphDefinition no longer takes websocket_callback or graph2_thread_id
+        exec_graph_def = ExecutionGraphDefinition(
+            graph_execution_plan=exec_plan_model,
+            api_executor=api_executor_instance
+        )
+        active_graph2_definitions[graph2_thread_id] = exec_graph_def
+        runnable_exec_graph = exec_graph_def.get_runnable_graph()
+
+        exec_manager = GraphExecutionManager(
+            runnable_graph=runnable_exec_graph,
+            graph_definition=exec_graph_def,
+            websocket_callback=graph2_ws_callback, # Manager uses this for high-level events and per-tool events
+            planning_checkpointer=None, # Checkpointer for Graph 2's own state if needed
+            main_planning_session_id=session_id # For context/logging in manager
+        )
+        active_graph2_executors[graph2_thread_id] = exec_manager
+
+        initial_exec_state_values = ExecutionGraphState(
+            initial_input=session_store.get("workflow_extracted_data", {}),
+            # Other fields (api_results, extracted_ids, confirmed_data) start empty
+        ).model_dump(exclude_none=True)
+
+        # Config for Graph 2 execution, using its unique thread_id
+        exec_graph_config = {"configurable": {"thread_id": graph2_thread_id}}
+
+        await send_websocket_message_helper(
+            websocket, "info", {"message": f"Execution phase (Graph 2) starting with G2 Thread ID: {graph2_thread_id}."},
+            session_id, "graph2_execution", graph2_thread_id # Tag with G2 ID
+        )
+        session_store["workflow_execution_status"] = "running" # Update general status
+
+        # Start Graph 2 execution in a background task
+        asyncio.create_task(exec_manager.execute_workflow(initial_exec_state_values, exec_graph_config))
+        return graph2_thread_id
+
+    except Exception as e_exec_setup:
+        logger.error(f"[{session_id}] Failed to set up and start Graph 2 (G2 Thread ID: {graph2_thread_id}): {e_exec_setup}", exc_info=True)
+        await send_websocket_message_helper(
+            websocket, "error", {"error": f"Server error during execution setup: {str(e_exec_setup)[:150]}"},
+            session_id, "system_error", graph2_thread_id
+        )
+        # Clean up if setup failed for this specific G2 thread
+        active_graph2_executors.pop(graph2_thread_id, None)
+        active_graph2_definitions.pop(graph2_thread_id, None)
+        return None
