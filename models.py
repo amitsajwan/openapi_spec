@@ -1,7 +1,7 @@
 # models.py
 import logging
 from typing import Any, Dict, List, Optional, Literal, Annotated
-import operator # Added for Annotated
+import operator 
 from pydantic import BaseModel, Field, ValidationError, model_validator, field_validator
 from datetime import datetime
 
@@ -167,23 +167,28 @@ class ExecutionGraphState(BaseModel):
     Defines the runtime state passed between nodes in the Execution LangGraph (Graph 2).
     This state is managed by the LangGraph `StateGraph` for the execution phase.
     """
-    api_results: Annotated[Dict[str, Any], operator.ior] = Field( # MODIFIED: Removed Optional
+    api_results: Annotated[Dict[str, Any], operator.ior] = Field( 
         default_factory=dict,
         description="Stores outputs of API calls: {'node_effective_id': result_dict_from_APIExecutor}. Merged using dictionary update."
     )
-    extracted_ids: Annotated[Dict[str, Any], operator.ior] = Field( # MODIFIED: Removed Optional
+    extracted_ids: Annotated[Dict[str, Any], operator.ior] = Field( 
         default_factory=dict,
         description="Shared data pool: stores data extracted via OutputMappings from node responses (e.g., {'user_token': 'xyz123'}), used by InputMappings."
     )
-    confirmed_data: Annotated[Dict[str, Any], operator.ior] = Field( # MODIFIED: Removed Optional
+    confirmed_data: Annotated[Dict[str, Any], operator.ior] = Field( 
         default_factory=dict,
         description="Stores data confirmed or modified by the user during interrupts for Graph 2 nodes (e.g., {'confirmed_opId_createOrder': True, 'confirmed_opId_createOrder_details': {...user_payload...}})."
     )
-    initial_input: Optional[Dict[str, Any]] = Field( # This can remain Optional as it's a one-time input
+    initial_input: Optional[Dict[str, Any]] = Field( 
         None,
         description="Initial input values provided to Graph 2 at the start of its execution, can be used for placeholder resolution."
     )
-    error: Optional[str] = Field( # Error is also fine as Optional
+    # NEW FIELD to hold data for UI confirmation
+    pending_confirmation_data: Optional[Dict[str, Any]] = Field(
+        None,
+        description="If set, indicates that the graph is paused awaiting user confirmation. Contains data for the UI prompt."
+    )
+    error: Optional[str] = Field( 
         None,
         description="Stores error messages if any step in Graph 2 fails, helping to halt or diagnose issues."
     )
