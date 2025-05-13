@@ -53,19 +53,24 @@ body {
 }
 
 .left-panel {
-    width: 45%;
+    width: 45%; /* Can be adjusted or made flexible with flex-grow */
     min-width: 450px;
+    /* Removed flex-grow to prevent it from taking too much space if chat panel is narrow */
 }
 
 .right-panel.chat-panel {
     flex-grow: 1; /* Chat panel takes remaining space */
+    min-width: 350px; /* Ensure chat has a minimum width */
 }
 
-.graph-view-panel, .workflow-log-panel {
+.graph-view-panel {
     padding: 1.25rem;
+    flex-grow: 1; /* Allow graph view to take available space in left panel */
+    display: flex;
+    flex-direction: column;
 }
 
-.graph-view-panel h2, .workflow-log-panel h3 {
+.graph-view-panel h2 {
     margin-top: 0;
     margin-bottom: 1rem;
     color: #0056b3; /* Darker blue for headings */
@@ -106,15 +111,17 @@ body {
 
 .tab-pane {
     display: none;
-    flex-grow: 1;
-    overflow-y: auto;
+    flex-grow: 1; /* Allow tab content to grow */
+    overflow-y: auto; /* Scroll within tab content */
     background-color: #f8f9fa; /* Light background for content panes */
     border-radius: 8px;
     padding: 1rem;
+    min-height: 200px; /* Ensure tab panes have some minimum height */
 }
 
 .tab-pane.active {
-    display: block;
+    display: flex; /* Use flex for better internal layout if needed */
+    flex-direction: column;
 }
 
 #graphJsonViewPre {
@@ -127,8 +134,8 @@ body {
     word-wrap: break-word;
     font-family: 'SF Mono', Menlo, Monaco, Consolas, 'Courier New', monospace;
     font-size: 0.85em;
-    max-height: 400px; /* Limit height and allow scroll */
-    overflow-y: auto;
+    flex-grow: 1; /* Allow pre to take available space */
+    overflow-y: auto; /* Ensure pre itself can scroll if content is too tall */
 }
 
 .mermaid-container {
@@ -141,60 +148,13 @@ body {
     background-color: #ffffff;
     border: 1px solid #e0e0e0;
     border-radius: 6px;
+    flex-grow: 1; /* Allow mermaid container to grow */
 }
 .mermaid-container svg {
     max-width: 100%;
     height: auto;
     display: block; /* Remove extra space below SVG */
 }
-
-/* Workflow Log Panel */
-.workflow-log-panel {
-    border-top: 1px solid #e9ecef;
-    margin-top: 1rem; /* Space above the log panel if graph view is also present */
-    flex-grow: 1; /* Allow it to take available space in left panel */
-    min-height: 150px; /* Minimum height */
-    display: flex;
-    flex-direction: column;
-}
-.log-messages-container {
-    flex-grow: 1;
-    overflow-y: auto;
-    font-family: 'SF Mono', Menlo, Monaco, Consolas, 'Courier New', monospace;
-    font-size: 0.8em;
-    color: #495057;
-    padding: 0.5rem;
-    background-color: #f8f9fa;
-    border-radius: 6px;
-}
-.workflow-log-entry {
-    padding: 0.3rem 0.5rem;
-    margin-bottom: 0.2rem;
-    border-bottom: 1px dashed #e0e0e0;
-    word-break: break-all;
-}
-.workflow-log-entry:last-child {
-    border-bottom: none;
-}
-.log-timestamp {
-    color: #6c757d;
-    margin-right: 0.5em;
-    font-size: 0.9em;
-}
-.workflow-log-entry pre {
-    background-color: #e9ecef;
-    padding: 0.3rem;
-    border-radius: 4px;
-    margin-top: 0.2rem;
-    white-space: pre-wrap;
-    color: #212529;
-}
-/* Log message types - more subtle */
-.workflow-info { color: #0056b3; }
-.workflow-success { color: #198754; }
-.workflow-error { color: #dc3545; font-weight: 500; }
-.workflow-warning, .workflow-interrupt_confirmation_required { color: #ffc107; }
-
 
 /* Chat Panel */
 .chat-messages-container {
@@ -208,7 +168,7 @@ body {
 .message {
     padding: 0.75rem 1rem;
     border-radius: 18px;
-    max-width: 80%;
+    max-width: 85%; /* Slightly increased max-width */
     word-wrap: break-word;
     line-height: 1.5;
     font-size: 0.95em;
@@ -228,17 +188,19 @@ body {
 }
 .message.user-message .message-sender { color: rgba(255,255,255,0.8); text-align: right;}
 
-.message.agent-message, .message.system-message, .message.planner-message, .message.workflow-message {
+.message.agent-message {
     background-color: #e9ecef;
     color: #212529;
     align-self: flex-start;
     border-bottom-left-radius: 6px;
 }
-.message.agent-message .message-sender { color: #0056b3; }
-.message.system-message .message-sender { color: #6c757d; }
-.message.planner-message .message-sender { color: #fd7e14; } /* Orange for planner */
-.message.workflow-message .message-sender { color: #20c997; } /* Teal for workflow */
+.message.agent-message .message-sender { color: #0056b3; } /* Default agent */
 
+/* Specific sender types for chat messages */
+.message.system-message .message-sender { color: #6c757d; } /* Gray for System */
+.message.planner-message .message-sender { color: #fd7e14; } /* Orange for Planner */
+.message.workflow-message .message-sender { color: #20c997; } /* Teal for Workflow */
+.message.workflow-message { background-color: #e6fcf5; } /* Light teal background for workflow messages */
 
 .message.error-message {
     background-color: #f8d7da;
@@ -252,13 +214,14 @@ body {
 .message-content p:last-child { margin-bottom: 0; }
 .message-content ul, .message-content ol { margin: 0.5em 0; padding-left: 1.5em; }
 .message-content pre {
-    background-color: #282c34;
+    background-color: #282c34; /* Darker for code blocks within messages */
     color: #abb2bf;
     padding: 0.75em;
     border-radius: 6px;
     overflow-x: auto;
     font-size: 0.85em;
     margin: 0.5em 0;
+    border: 1px solid #444; /* Subtle border for code blocks */
 }
 .message-content code:not(pre code) { /* Inline code */
     background-color: rgba(0,0,0,0.05);
@@ -281,8 +244,8 @@ body {
     padding: 0.75rem 1rem;
     border-radius: 8px;
     border: 1px solid #ced4da;
-    resize: none; /* Allow only vertical resize if desired, or none */
-    min-height: 48px; /* Approx 2 lines with padding */
+    resize: none; 
+    min-height: 48px; 
     max-height: 150px;
     overflow-y: auto;
     font-size: 1em;
@@ -297,7 +260,7 @@ body {
 
 .chat-buttons {
     display: flex;
-    gap: 0.5rem; /* Space between buttons */
+    gap: 0.5rem; 
     align-items: flex-end;
 }
 .action-button {
@@ -311,7 +274,7 @@ body {
     align-items: center;
     justify-content: center;
     transition: background-color 0.2s ease, box-shadow 0.2s ease;
-    height: 48px; /* Match textarea height */
+    height: 48px; 
 }
 .action-button.primary-button {
     background-color: #007bff;
@@ -348,7 +311,7 @@ body {
     border-top-color: #ffffff;
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
-    display: none; /* Hidden by default */
+    display: none; 
     margin-left: 0.5rem;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -361,7 +324,7 @@ body {
     left: 0;
     width: 100%;
     height: 100%;
-    background-color: rgba(0, 0, 0, 0.5); /* Semi-transparent backdrop */
+    background-color: rgba(0, 0, 0, 0.6); /* Darker backdrop */
     display: flex;
     justify-content: center;
     align-items: center;
@@ -375,7 +338,7 @@ body {
     border-radius: 12px;
     box-shadow: 0 8px 25px rgba(0,0,0,0.15);
     width: 100%;
-    max-width: 650px; /* Slightly wider modal */
+    max-width: 650px; 
     max-height: 90vh;
     overflow-y: auto;
     display: flex;
@@ -390,13 +353,13 @@ body {
     font-weight: 600;
 }
 .modal-details p {
-    margin: 0.3rem 0;
+    margin: 0.4rem 0; /* Increased spacing */
     color: #495057;
     font-size: 0.95em;
 }
 .modal-details p strong {
     color: #212529;
-    min-width: 100px; /* Align labels somewhat */
+    min-width: 140px; /* Adjusted for better alignment */
     display: inline-block;
 }
 .modal-details code {
@@ -404,7 +367,7 @@ body {
     padding: 0.2em 0.4em;
     border-radius: 4px;
     font-family: 'SF Mono', Menlo, Monaco, Consolas, 'Courier New', monospace;
-    color: #c82333; /* Reddish for code elements */
+    color: #c82333; 
 }
 .payload-editor {
     margin-top: 0.5rem;
@@ -426,6 +389,11 @@ body {
     min-height: 180px;
     resize: vertical;
     background-color: #f8f9fa;
+}
+#modalPayload:focus {
+    border-color: #80bdff;
+    box-shadow: 0 0 0 0.2rem rgba(0,123,255,.25);
+    outline: none;
 }
 .modal-actions {
     margin-top: 1rem;
@@ -451,8 +419,7 @@ body {
     background: #a1a1a1;
 }
 
-/* Ensure panels with overflow:auto also get nice scrollbars */
-.tab-pane, .log-messages-container, .chat-messages-container, .modal-content {
-    scrollbar-width: thin; /* For Firefox */
-    scrollbar-color: #c1c1c1 #f1f1f1; /* For Firefox */
+.tab-pane, .chat-messages-container, .modal-content {
+    scrollbar-width: thin; 
+    scrollbar-color: #c1c1c1 #f1f1f1; 
 }
