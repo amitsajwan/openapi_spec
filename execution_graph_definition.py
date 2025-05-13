@@ -4,16 +4,13 @@ from typing import Any, Callable, Awaitable, Dict, Optional, Tuple, Union
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
-# Interrupt is not raised by nodes anymore in this pattern, but imported for clarity if needed elsewhere.
-# from langgraph.types import Interrupt
 
 from models import GraphOutput, Node, Edge, InputMapping, OutputMapping, ExecutionGraphState
 from api_executor import APIExecutor
 
 logger = logging.getLogger(__name__)
 
-# _get_value_from_path and _set_value_by_path remain the same
-
+# _get_value_from_path and _set_value_by_path remain the same (no changes from previous version you have)
 def _get_value_from_path(data_dict: Optional[Dict[str, Any]], path: str) -> Any:
     if not path or not isinstance(data_dict, dict):
         return None
@@ -51,14 +48,24 @@ def _set_value_by_path(data_dict: Dict[str, Any], path: str, value: Any):
     if keys:
         current_level[keys[-1]] = value
 
+
 class ExecutionGraphDefinition:
-    def __init__(self, graph_execution_plan: GraphOutput, api_executor: APIExecutor):
-        self.graph_plan = graph_execution_plan # Keep a reference for the manager
+    def __init__(
+        self,
+        graph_execution_plan: GraphOutput,
+        api_executor: APIExecutor
+        # REMOVED: websocket_callback and graph2_thread_id from constructor
+    ):
+        self.graph_plan = graph_execution_plan
         self.api_executor = api_executor
+        # REMOVED: self.websocket_callback and self.graph2_thread_id
         self.runnable_graph: Any = self._build_and_compile_graph()
         logger.info("ExecutionGraphDefinition initialized and Graph 2 compiled.")
 
+    # REMOVED: _send_ws_update helper method
+
     def _resolve_placeholders(self, template_string: str, state: ExecutionGraphState) -> str:
+        # ... (no changes to this method from previous version)
         if not isinstance(template_string, str):
             return str(template_string)
         resolved_string = template_string
@@ -81,6 +88,7 @@ class ExecutionGraphDefinition:
         resolved_body_payload_for_field_mapping: Dict[str, Any],
         resolved_headers: Dict[str, Any]
     ) -> None:
+        # ... (no changes to this method from previous version)
         if not node_definition.input_mappings:
             return
         current_extracted_ids = state.extracted_ids
@@ -99,9 +107,11 @@ class ExecutionGraphDefinition:
                 field_path_in_body = mapping.target_parameter_in.split("body.", 1)[1]
                 _set_value_by_path(resolved_body_payload_for_field_mapping, field_path_in_body, source_value)
 
+
     def _prepare_api_request_components(
         self, node_definition: Node, state: ExecutionGraphState
     ) -> Tuple[str, Dict[str, Any], Any, Dict[str, Any]]:
+        # ... (no changes to this method from previous version)
         path_template = node_definition.path or ""
         payload_template = node_definition.payload
         if isinstance(payload_template, dict):
@@ -164,6 +174,7 @@ class ExecutionGraphDefinition:
         self, node_definition: Node, state: ExecutionGraphState,
         current_body_payload: Any, current_query_params: Dict[str, Any], current_headers: Dict[str, Any]
     ) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
+        # ... (no changes to this method from previous version)
         operationId = node_definition.effective_id
         confirmation_key = f"confirmed_{operationId}"
         updated_body = current_body_payload.copy() if isinstance(current_body_payload, dict) else current_body_payload
@@ -171,14 +182,13 @@ class ExecutionGraphDefinition:
         updated_headers = current_headers.copy()
         current_confirmed_data = state.confirmed_data
         
-        # Check if this specific operation was confirmed (decision is True)
-        if current_confirmed_data.get(confirmation_key): # This implies decision was True
+        if current_confirmed_data.get(confirmation_key): 
             confirmed_details = current_confirmed_data.get(f"{confirmation_key}_details", {})
-            if "modified_payload" in confirmed_details: # User might have modified the payload
+            if "modified_payload" in confirmed_details: 
                 updated_body = confirmed_details["modified_payload"]
                 logger.info(f"Node '{operationId}': Applied modified payload from user confirmation.")
-            # Add similar checks for modified_query_params, modified_headers if UI supports modifying them
         return updated_body, updated_params, updated_headers
+
 
     async def _execute_api_and_process_outputs(
         self, node_definition: Node, api_path: str,
@@ -186,10 +196,16 @@ class ExecutionGraphDefinition:
     ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
         effective_id = node_definition.effective_id
         api_call_method = node_definition.method or "GET"
+
+        # REMOVED: WebSocket call for api_call_start
+
         api_call_result_dict = await self.api_executor.execute_api(
             operationId=effective_id, method=api_call_method, endpoint=api_path,
             payload=body_payload, query_params=query_params, headers=headers
         )
+        
+        # REMOVED: WebSocket call for api_call_end
+        
         extracted_data_for_state = {}
         status_code = api_call_result_dict.get("status_code")
         is_successful = isinstance(status_code, int) and 200 <= status_code < 300
@@ -207,40 +223,25 @@ class ExecutionGraphDefinition:
     def _make_node_runnable(
         self, node_definition: Node
     ) -> Callable[[ExecutionGraphState], Awaitable[Dict[str, Any]]]:
-        """
-        Creates an awaitable function for a given API node definition.
-        The graph will interrupt *before* this node if requires_confirmation is true.
-        This node, when run, checks if it was confirmed.
-        """
         async def node_executor(state: ExecutionGraphState) -> Dict[str, Any]:
             effective_id = node_definition.effective_id
-            logger.info(f"--- [Graph 2] Node Start: {effective_id} (OpID: {node_definition.operationId}) ---")
+            logger.info(f"--- [Graph 2 Node] Start: {effective_id} (OpID: {node_definition.operationId}) ---")
             
-            output_state_update: Dict[str, Any] = {} # Start with an empty update
+            output_state_update: Dict[str, Any] = {} 
 
             try:
-                # Prepare request components first. These might be needed by the manager
-                # if it needs to show them to the user during an interruption *before* this node.
                 api_path, query_params, body_payload, headers = self._prepare_api_request_components(node_definition, state)
                 
-                # If this node requires confirmation, it means the graph interrupted *before* it.
-                # Now we check if the confirmation was provided in state.confirmed_data.
                 if node_definition.requires_confirmation:
                     confirmation_key = f"confirmed_{effective_id}"
-                    # state.confirmed_data is guaranteed to be a dict
-                    if not state.confirmed_data.get(confirmation_key): # Decision was False or not present
-                        # This means user cancelled or something went wrong with resume.
-                        # The graph should ideally not have resumed to this node if confirmation was false.
-                        # For safety, we can skip execution or raise an error.
-                        # Let's log and skip, returning minimal state update.
+                    if not state.confirmed_data.get(confirmation_key): 
                         skip_message = f"Node '{effective_id}' requires confirmation, but it was not found or was negative in confirmed_data. Skipping execution."
                         logger.warning(skip_message)
                         output_state_update["error"] = skip_message 
-                        output_state_update["api_results"] = {effective_id: {"status_code": "SKIPPED_NO_CONFIRMATION", "error": skip_message}}
+                        output_state_update["api_results"] = {effective_id: {"status_code": "SKIPPED_NO_CONFIRMATION", "error": skip_message, "path_template": node_definition.path, "method": node_definition.method}}
+                        # REMOVED: WebSocket call for api_call_skipped
                         return output_state_update
 
-                # If here, either no confirmation needed, or it was confirmed (checked above).
-                # Apply any user-confirmed modifications from state.confirmed_data
                 final_body, final_params, final_headers = self._apply_confirmed_data_to_request(
                     node_definition, state, body_payload, query_params, headers
                 )
@@ -254,38 +255,33 @@ class ExecutionGraphDefinition:
                 if extracted_data:
                     output_state_update["extracted_ids"] = extracted_data
                 
-                # Clear the specific confirmation for this node now that it has been processed
-                # This prevents it from being "sticky" if the node were somehow re-run without a new interruption.
-                if node_definition.requires_confirmation:
-                    confirmation_key = f"confirmed_{effective_id}"
-                    # We need a way to update confirmed_data to remove this key or its details.
-                    # LangGraph's state merging (operator.ior) adds/updates keys.
-                    # To "remove" a confirmation, the manager would need to update state with a version of
-                    # confirmed_data that omits this key *after* this node successfully runs.
-                    # For now, the node itself cannot easily "remove" from the merged state.
-                    # The manager will handle clearing pending_confirmation_data.
-                    pass
-
-
-                logger.info(f"--- [Graph 2] Node End: {effective_id} (Execution successful) ---")
+                logger.info(f"--- [Graph 2 Node] End: {effective_id} (Execution result captured) ---")
                 return output_state_update
 
             except Exception as e:
                 error_message = f"Error in node {effective_id}: {type(e).__name__} - {e}"
                 logger.error(error_message, exc_info=True)
                 output_state_update["error"] = error_message
-                output_state_update["api_results"] = {effective_id: {"error": error_message, "status_code": "NODE_EXCEPTION"}}
+                # Store template path and method for context if API call itself failed to prepare/execute
+                output_state_update["api_results"] = {effective_id: {"error": error_message, "status_code": "NODE_EXCEPTION", "path_template": node_definition.path, "method": node_definition.method}}
+                # REMOVED: WebSocket call for api_call_error
                 return output_state_update
         return node_executor
 
     def _build_and_compile_graph(self) -> Any:
+        # ... (This method's internal logic remains largely the same as the one you have,
+        # ensure entry and finish points are set correctly for LangGraph v0.1.x:
+        # builder.set_entry_point(START) or builder.set_entry_point("node_name")
+        # builder.set_finish_point("node_name")
+        # The MemorySaver() should be instantiated: checkpointer=MemorySaver()
+        # The code provided in the previous step for this method was already correct for this.)
         logger.info(f"ExecutionGraphDefinition: Building graph. Plan: {self.graph_plan.description or 'N/A'}")
         builder = StateGraph(ExecutionGraphState)
         if not self.graph_plan.nodes:
             raise ValueError("Execution plan must contain at least one node.")
 
         actual_api_nodes_defs = []
-        nodes_requiring_interrupt_before: List[str] = []
+        nodes_requiring_interrupt_before: list[str] = [] 
 
         for node_def in self.graph_plan.nodes:
             node_id_str = str(node_def.effective_id).strip()
@@ -306,7 +302,6 @@ class ExecutionGraphDefinition:
         if not self.graph_plan.edges: logger.warning("Execution plan has no edges.")
 
         for edge in self.graph_plan.edges:
-            # (Edge processing logic remains the same as in execution_graph_definition_fix)
             plan_from_node_original_case = str(edge.from_node).strip()
             plan_to_node_original_case = str(edge.to_node).strip()
             is_plan_source_start_node = plan_from_node_original_case.upper() == "START_NODE"
@@ -323,27 +318,42 @@ class ExecutionGraphDefinition:
         
         if not has_start_edge and actual_api_nodes_defs:
             entry_point = str(actual_api_nodes_defs[0].effective_id).strip()
-            builder.set_entry_point(entry_point)
+            builder.set_entry_point(entry_point) 
             logger.info(f"No explicit START edge. Entry point set to: '{entry_point}'.")
         elif not actual_api_nodes_defs and not has_start_edge:
              logger.warning("Graph has no executable API nodes and no explicit entry point.")
+        elif has_start_edge : 
+            builder.set_entry_point(START) 
+            logger.info("Explicit START edge found. Entry point is START.")
 
-        if actual_api_nodes_defs: # Set finish points
-            all_source_ids_in_edges = {str(e.from_node).strip() for e in self.graph_plan.edges if str(e.from_node).strip().upper() != "START_NODE"}
+
+        if actual_api_nodes_defs: 
+            all_target_ids_in_edges = {str(e.to_node).strip() for e in self.graph_plan.edges if str(e.to_node).strip().upper() != "END_NODE"}
             for node_def in actual_api_nodes_defs:
                 node_id = str(node_def.effective_id).strip()
-                is_source_to_another = any(
-                    str(e.from_node).strip() == node_id and
-                    (str(e.to_node).strip().upper() == "END_NODE" or str(e.to_node).strip() in executable_node_ids_in_builder)
-                    for e in self.graph_plan.edges
-                )
-                if not is_source_to_another:
-                    logger.info(f"Node '{node_id}' is a leaf. Setting as finish point.")
-                    builder.set_finish_point(node_id)
+                is_source_for_any_edge = any(str(e.from_node).strip() == node_id for e in self.graph_plan.edges)
+                
+                # A node is a finish point if it's not a source for any edge,
+                # OR if all its outgoing edges point to END_NODE
+                points_only_to_end = True
+                if is_source_for_any_edge:
+                    for edge in self.graph_plan.edges:
+                        if str(edge.from_node).strip() == node_id and str(edge.to_node).strip().upper() != "END_NODE":
+                            points_only_to_end = False
+                            break
+                
+                if not is_source_for_any_edge or points_only_to_end:
+                    # Check if there's an explicit edge to END already defined for this node. If so, LangGraph handles it.
+                    # Otherwise, this node is a leaf or effectively a leaf.
+                    is_explicitly_ending = any(str(e.from_node).strip() == node_id and str(e.to_node).strip().upper() == "END_NODE" for e in self.graph_plan.edges)
+                    if not is_explicitly_ending:
+                        logger.info(f"Node '{node_id}' is a leaf or points only to END implicitly. Setting as finish point.")
+                        builder.set_finish_point(node_id)
         
         logger.info(f"Compiling execution graph. Nodes for interrupt_before: {nodes_requiring_interrupt_before}")
+        memory_saver = MemorySaver() # Instantiate the checkpointer
         return builder.compile(
-            checkpointer=MemorySaver(),
+            checkpointer=memory_saver, 
             interrupt_before=nodes_requiring_interrupt_before if nodes_requiring_interrupt_before else None
         )
 
@@ -351,9 +361,7 @@ class ExecutionGraphDefinition:
         return self.runnable_graph
 
     def get_node_definition(self, node_effective_id: str) -> Optional[Node]:
-        """Helper to get node definition from the plan, used by manager."""
         for node in self.graph_plan.nodes:
             if str(node.effective_id).strip() == node_effective_id:
                 return node
         return None
-
