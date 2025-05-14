@@ -1,156 +1,156 @@
-# main.py (Conceptual - showing only the WebSocket endpoint modification)
+# main.py
 import logging
-import json
 import uuid
+# import json # Not directly used here, but often useful
+import os
+import sys
+import asyncio
+from typing import Any, Dict, Optional # Removed Callable, Awaitable, Literal as they are not directly used here
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Depends
-from starlette.websockets import WebSocketState
+from fastapi import FastAPI, WebSocket # WebSocketDisconnect also imported but not directly used
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+# from starlette.websockets import WebSocketState # Not directly used here
 
-# Your existing imports
-# from models import BotState
-# from config import get_graph_for_session
-# from core_logic.graph_definition import create_graph_with_streaming_context # Or your compiled graph
-# from core_logic.websocket_helpers import send_intermediate_ws_messages
+# Models and Core Components
+# from models import BotState, GraphOutput as PlanSchema, ExecutionGraphState # Not directly used here
+from graph import build_graph
+from llm_config import initialize_llms # Now returns three LLMs
+from execution_graph_definition import ExecutionGraphDefinition # For type hinting if needed
+from execution_manager import GraphExecutionManager # For type hinting if needed
+from api_executor import APIExecutor as UserAPIExecutor
+from utils import SCHEMA_CACHE
 
-# Import websocket helpers (send_thinking_started/finished are now removed from it)
-from core_logic.websocket_helpers import (
-    send_error_message,
-    send_intermediate_message,
-    send_graph_update,
-    send_final_response,
-    send_api_response 
-    # send_status_update (if used for other statuses)
+# Refactored WebSocket handling logic
+from websocket_helpers import handle_websocket_connection, send_websocket_message_helper
+
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(), # Allow configuring log level via ENV
+    stream=sys.stdout,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(threadName)s - %(message)s'
 )
-
 logger = logging.getLogger(__name__)
-# app = FastAPI() # Your FastAPI app
-# compiled_graph = create_graph_with_streaming_context() # Your compiled LangGraph app
 
-# @app.websocket("/ws/openai_spec_agent/{session_id}") # Your WebSocket route
-async def websocket_endpoint(websocket: WebSocket, session_id: str): # Adjust params
-    await websocket.accept()
-    logger.info(f"WebSocket connection accepted for session_id: {session_id}")
+# --- FastAPI Application Setup ---
+app = FastAPI()
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+if not os.path.exists(STATIC_DIR):
+    logger.warning(f"Static directory {STATIC_DIR} does not exist. Frontend might not load.")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-    thread_id = f"ws_session_{session_id}_{uuid.uuid4()}"
-    config = {"configurable": {"thread_id": thread_id}}
-    logger.info(f"Using LangGraph config: {config}")
+# --- Global Application State ---
+langgraph_planning_app: Optional[Any] = None
+api_executor_instance: Optional[UserAPIExecutor] = None
+# No need to store utility_llm globally if it's only passed down once at startup
 
-    # current_graph_app = compiled_graph # Assuming 'compiled_graph' is your app
+active_graph2_executors: Dict[str, GraphExecutionManager] = {}
+active_graph2_definitions: Dict[str, ExecutionGraphDefinition] = {}
 
+
+# --- FastAPI Startup and Shutdown Events ---
+@app.on_event("startup")
+async def startup_event():
+    """Initializes global components when the FastAPI application starts."""
+    global langgraph_planning_app, api_executor_instance
+    logger.info("FastAPI application startup...")
     try:
-        while True:
-            raw_data_from_client = await websocket.receive_text()
-            client_data = json.loads(raw_data_from_client)
-            message_type = client_data.get("type")
-            
-            logger.info(f"Received message type '{message_type}' from session '{session_id}'")
-
-            try:
-                if message_type == "process_openapi_spec" or message_type == "user_interaction" or message_type == "run_workflow":
-                    # REMOVED: await send_thinking_started(websocket, "Processing your request...")
-
-                    graph_input_dict = {}
-                    if message_type == "process_openapi_spec":
-                        graph_input_dict = {
-                            "user_input": client_data.get("openapi_spec_string") or client_data.get("openapi_spec_url"),
-                            "openapi_spec_string": client_data.get("openapi_spec_string"),
-                            "openapi_spec_url": client_data.get("openapi_spec_url"),
-                            "spec_source": client_data.get("source"),
-                            "spec_file_name": client_data.get("file_name"),
-                            "plan_generation_goal": client_data.get("goal", "Generate a plan to interact with this API."),
-                            "chat_history": [], 
-                            "scratchpad": {"intermediate_messages": []},
-                            "websocket_session_id": session_id,
-                            "current_graph_thread_id": thread_id
-                        }
-                    elif message_type == "user_interaction":
-                        graph_input_dict = {
-                            "user_input": client_data.get("text"),
-                            "chat_history": [], 
-                            "execution_graph": client_data.get("current_graph"), 
-                            "scratchpad": {"intermediate_messages": []},
-                            "websocket_session_id": session_id,
-                            "current_graph_thread_id": thread_id
-                        }
-                    elif message_type == "run_workflow": # Handle run_workflow
-                        graph_input_dict = {
-                            "user_input": client_data.get("goal", "Execute the current workflow."), # The router can see this
-                            "execution_graph": client_data.get("graph"), # Pass the graph to be executed
-                            "intent_override": "setup_workflow_execution", # Hint for the router
-                            "chat_history": [],
-                            "scratchpad": {"intermediate_messages": []},
-                            "websocket_session_id": session_id,
-                            "current_graph_thread_id": thread_id
-                        }
-                    
-                    final_state_data = None
-                    # Replace `compiled_graph` with your actual compiled LangGraph application
-                    async for event in compiled_graph.astream_events(graph_input_dict, config=config, version="v2"):
-                        event_type = event["event"]
-                        event_name = event["name"]
-                        event_data = event["data"]
-
-                        if event_type == "on_chain_end" or event_type == "on_tool_end":
-                            output_state = event_data.get("output")
-                            if isinstance(output_state, dict):
-                                final_state_data = output_state # Keep track of the latest state
-                                new_ui_messages = output_state.get("scratchpad", {}).get("intermediate_messages", [])
-                                for msg_content in new_ui_messages:
-                                    await send_intermediate_message(websocket, msg_content)
-                                if "scratchpad" in output_state and "intermediate_messages" in output_state["scratchpad"]:
-                                    output_state["scratchpad"]["intermediate_messages"] = [] # Clear after sending
-                                
-                                current_graph_payload = output_state.get("execution_graph") # This should be a GraphOutput model dump
-                                if current_graph_payload:
-                                     await send_graph_update(websocket, current_graph_payload)
-
-                                api_call_result = output_state.get("scratchpad", {}).get("last_api_response")
-                                if api_call_result and isinstance(api_call_result, dict):
-                                    await send_api_response(websocket, api_call_result)
-                                    if "scratchpad" in output_state and "last_api_response" in output_state["scratchpad"]:
-                                        del output_state["scratchpad"]["last_api_response"] # Clear after sending
-
-
-                        if event_type == "on_chain_end" and (event_name == "__root__" or event_name.lower() == "agent" or event_name.lower() == "workflow"):
-                            final_output_map = event_data.get("output")
-                            if isinstance(final_output_map, dict):
-                                final_response_text = final_output_map.get("response", "Processing complete.")
-                                # Send the final response along with any other relevant data from final_output_map
-                                await send_final_response(websocket, final_response_text, data_payload=final_output_map)
-                                logger.info(f"Graph execution finished for {session_id}. Final response sent.")
-                            else: # If final output is not a dict, send a generic final response
-                                await send_final_response(websocket, "Processing complete.", data_payload={"output": final_output_map})
-
-
-                    # REMOVED: The explicit send_thinking_finished call.
-                    # The client will stop thinking upon receiving 'final_response' or 'error'.
-
-                # ... (other message_type handling like execute_api_call if you have it) ...
-                
-                else:
-                    logger.warning(f"Unknown message type from session {session_id}: {message_type}")
-                    await send_error_message(websocket, f"Unknown message type received: {message_type}")
-
-            except WebSocketDisconnect:
-                logger.info(f"WebSocket disconnected by client {session_id}.")
-                break 
-            except json.JSONDecodeError:
-                logger.error(f"Invalid JSON received from session {session_id}.")
-                await send_error_message(websocket, "Invalid JSON format in message.")
-                # Client will stop thinking on this error message.
-            except Exception as e:
-                logger.error(f"Error during WebSocket communication or graph processing for session {session_id}: {e}", exc_info=True)
-                await send_error_message(websocket, f"An server error occurred: {str(e)}")
-                # Client will stop thinking on this error message.
-            # REMOVED: The finally block that used to send send_thinking_finished.
-
+        # initialize_llms now returns router_llm, worker_llm, utility_llm
+        router_llm, worker_llm, utility_llm = initialize_llms()
+        
+        api_executor_instance = UserAPIExecutor(
+            base_url=os.getenv("DEFAULT_API_BASE_URL", None),
+            timeout=float(os.getenv("API_TIMEOUT", "30.0"))
+        )
+        
+        # Pass all three LLMs to build_graph
+        langgraph_planning_app = build_graph(
+            router_llm=router_llm,
+            worker_llm=worker_llm,
+            utility_llm=utility_llm, # New utility LLM
+            api_executor_instance=api_executor_instance,
+            checkpointer=None # No checkpointer for Graph 1 state persistence
+        )
+        logger.info("Main Planning LangGraph (Graph 1) built successfully with all LLMs.")
     except Exception as e:
-        logger.error(f"Unhandled exception in WebSocket handler for session {session_id}: {e}", exc_info=True)
-        if websocket.client_state == WebSocketState.CONNECTED:
-            try:
-                await send_error_message(websocket, "A critical server error occurred with the WebSocket connection.")
-            except Exception: 
-                pass
-    finally:
-        logger.info(f"Closing WebSocket connection for session_id: {session_id}.")
+        logger.critical(f"CRITICAL FAILURE during application startup: {e}", exc_info=True)
+        langgraph_planning_app = None
+        api_executor_instance = None
 
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleans up resources when the FastAPI application shuts down."""
+    logger.info("FastAPI application shutdown...")
+    if api_executor_instance and hasattr(api_executor_instance, 'close'):
+        if asyncio.iscoroutinefunction(getattr(api_executor_instance, 'close')):
+            await api_executor_instance.close()
+        else:
+            getattr(api_executor_instance, 'close')() # type: ignore
+        logger.info("APIExecutor closed.")
+    if SCHEMA_CACHE:
+        SCHEMA_CACHE.close()
+        logger.info("Schema cache closed.")
+    
+    logger.info(f"Cleaning up {len(active_graph2_executors)} active Graph 2 executors (if any)...")
+    for exec_id, executor in list(active_graph2_executors.items()):
+        logger.info(f"Potentially cleaning up executor for G2_Thread_ID: {exec_id}")
+        # Add executor.cleanup() or similar if GraphExecutionManager needs explicit cleanup
+        active_graph2_executors.pop(exec_id, None)
+        active_graph2_definitions.pop(exec_id, None)
+    logger.info("Graph 2 executor cleanup attempt complete.")
+
+
+# --- WebSocket Endpoint ---
+@app.websocket("/ws/openapi_agent")
+async def websocket_endpoint(websocket: WebSocket):
+    """Handles new WebSocket connections for the OpenAPI agent."""
+    await websocket.accept()
+    session_id = str(uuid.uuid4()) 
+    logger.info(f"WebSocket connection accepted. Assigned Session ID (Graph 1): {session_id}")
+
+    if not langgraph_planning_app or not api_executor_instance:
+        logger.error(
+            f"[{session_id}] Cannot handle WebSocket connection: Backend services are not initialized."
+        )
+        # Use the imported send_websocket_message_helper
+        await send_websocket_message_helper(
+            websocket=websocket,
+            msg_type="error",
+            content={"error": "Backend services are not initialized. Please try again later or contact support."},
+            session_id=session_id,
+            source_graph="system_critical"
+        )
+        await websocket.close(code=1011) 
+        return
+
+    await handle_websocket_connection(
+        websocket=websocket,
+        session_id=session_id,
+        langgraph_planning_app=langgraph_planning_app,
+        api_executor_instance=api_executor_instance,
+        active_graph2_executors=active_graph2_executors,
+        active_graph2_definitions=active_graph2_definitions
+    )
+
+
+# --- Static File Serving for Frontend ---
+@app.get("/", response_class=FileResponse)
+async def get_index_page():
+    """Serves the main HTML page for the frontend."""
+    index_path = os.path.join(STATIC_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    else:
+        logger.error(f"Frontend index.html not found at expected path: {index_path}")
+        return HTMLResponse(
+            "<h1>Frontend not found.</h1><p>Please ensure static files are correctly placed and "
+            f"the STATIC_DIR '{STATIC_DIR}' is correctly configured and accessible.</p>",
+            status_code=404
+        )
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("Starting Uvicorn server for local development...")
+    # Ensure the app is run as "main:app" where "main" is the filename and "app" is the FastAPI instance.
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
