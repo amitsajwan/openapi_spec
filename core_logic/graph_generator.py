@@ -1,287 +1,601 @@
-# core_logic/interaction_handler.py
+# core_logic/graph_generator.py
+import json
 import logging
+import os
 from typing import Any, Dict, Optional
 
+from pydantic import ValidationError as PydanticValidationError
+
 from models import BotState, GraphOutput
-from utils import llm_call_helper, parse_llm_json_output_with_model
-import os 
+from utils import (
+    llm_call_helper,
+    parse_llm_json_output_with_model,
+    check_for_cycles,
+)
 
 logger = logging.getLogger(__name__)
 
-# Configurable Limits
-MAX_APIS_IN_PROMPT_SUMMARY_SHORT = int(os.getenv("MAX_APIS_IN_PROMPT_SUMMARY_SHORT", "10"))
+# --- Configurable Limits from environment variables ---
+MAX_APIS_IN_PROMPT_SUMMARY_LONG = int(
+    os.getenv("MAX_APIS_IN_PROMPT_SUMMARY_LONG", "20")
+)
+MAX_TOTAL_APIS_THRESHOLD_FOR_TRUNCATION_LONG = int(
+    os.getenv("MAX_TOTAL_APIS_THRESHOLD_FOR_TRUNCATION_LONG", "25")
+)
+MAX_APIS_IN_PROMPT_SUMMARY_SHORT = int(
+    os.getenv("MAX_APIS_IN_PROMPT_SUMMARY_SHORT", "10")
+)
+MAX_TOTAL_APIS_THRESHOLD_FOR_TRUNCATION_SHORT = int(
+    os.getenv("MAX_TOTAL_APIS_THRESHOLD_FOR_TRUNCATION_SHORT", "15")
+)
 
-class InteractionHandler:
-    def __init__(self, worker_llm: Any, graph_generator_instance: Any, workflow_control_instance: Any, spec_processor_instance: Any):
+
+class GraphGenerator:
+    """
+    Handles the generation, verification, and refinement of API execution graphs.
+    """
+
+    def __init__(self, worker_llm: Any):
+        """
+        Initializes the GraphGenerator.
+
+        Args:
+            worker_llm: The language model used for generation and refinement tasks.
+        """
+        if not hasattr(worker_llm, "invoke"):
+            raise TypeError("worker_llm must have an 'invoke' method.")
         self.worker_llm = worker_llm
-        self.graph_generator = graph_generator_instance
-        self.workflow_control = workflow_control_instance
-        self.spec_processor = spec_processor_instance # Added for potential use
-        logger.info("InteractionHandler initialized.")
+        logger.info("GraphGenerator initialized.")
 
-    def describe_graph(self, state: BotState) -> BotState:
-        tool_name = "describe_graph"; state.response = "Preparing graph description..."; state.update_scratchpad_reason(tool_name, "Preparing to describe the current execution graph.")
-        if not state.execution_graph or not isinstance(state.execution_graph, GraphOutput): state.response = (state.response or "") + " No execution graph is currently available to describe or graph is invalid."; logger.warning("describe_graph: No execution_graph found in state or invalid type.")
-        else:
-            graph_desc = state.execution_graph.description
-            if not graph_desc or len(graph_desc) < 20: 
-                logger.info("Graph description is short or missing, generating a dynamic one."); node_summaries = []
-                for node in state.execution_graph.nodes: node_summaries.append(f"- {node.effective_id}: {node.summary or node.operationId[:50]}") 
-                nodes_str = "\n".join(node_summaries[:5]); 
-                if len(node_summaries) > 5: nodes_str += f"\n- ... and {len(node_summaries) - 5} more nodes."
-                prompt = (f"The following API execution graph has been generated for the goal: '{state.plan_generation_goal or 'general use'}'.\nNodes in the graph ({len(state.execution_graph.nodes)} total, sample):\n{nodes_str}\n\nPlease provide a concise, user-friendly natural language description of this workflow. Explain its overall purpose and the general sequence of operations. Use Markdown for readability (e.g., a brief introductory sentence, then bullet points for key stages if appropriate).")
-                try:
-                    dynamic_desc = llm_call_helper(self.worker_llm, prompt)
-                    if graph_desc and graph_desc != dynamic_desc: final_desc_for_user = f"**Overall Workflow Plan for: '{state.plan_generation_goal or 'General Use'}'**\n\n{dynamic_desc}\n\n*Original AI-generated graph description: {graph_desc}*"
-                    else: final_desc_for_user = f"**Current API Workflow for: '{state.plan_generation_goal or 'General Use'}'**\n\n{dynamic_desc}"
-                except Exception as e: logger.error(f"Error generating dynamic graph description: {e}"); final_desc_for_user = (f"**Current API Workflow for: '{state.plan_generation_goal or 'General Use'}'**\n\n{graph_desc or 'No detailed description available. The graph includes nodes like ' + ', '.join([n.effective_id for n in state.execution_graph.nodes[:3]]) + '...'}")
-            else: final_desc_for_user = f"**Current API Workflow for: '{state.plan_generation_goal or 'General Use'}'**\n\n{graph_desc}"
-            if state.execution_graph.refinement_summary: final_desc_for_user += f"\n\n**Last Refinement Note:** {state.execution_graph.refinement_summary}"
-            state.response = final_desc_for_user
-            if 'graph_to_send' not in state.scratchpad and state.execution_graph:
-                 try: state.scratchpad['graph_to_send'] = state.execution_graph.model_dump_json(indent=2)
-                 except Exception as e: logger.error(f"Error serializing graph for sending during describe_graph: {e}")
-        state.update_scratchpad_reason(tool_name, f"Graph description generated/retrieved. Response set: {state.response[:100]}..."); state.next_step = "responder"; return state
+    def _queue_intermediate_message(self, state: BotState, msg: str):
+        """
+        Helper to queue messages for the UI and set the current response in BotState.
+        This ensures that the user gets updates during long-running processes.
+        """
+        if "intermediate_messages" not in state.scratchpad:
+            state.scratchpad["intermediate_messages"] = []
+        # Avoid queuing exact same consecutive message if state.response was already it
+        if (
+            not state.scratchpad["intermediate_messages"]
+            or state.scratchpad["intermediate_messages"][-1] != msg
+        ):
+            state.scratchpad["intermediate_messages"].append(msg)
+        state.response = msg  # Update current response for logging or if it's the last one
 
-    def get_graph_json(self, state: BotState) -> BotState:
-        tool_name = "get_graph_json"; state.response = "Fetching graph JSON..."; state.update_scratchpad_reason(tool_name, "Attempting to provide graph JSON.")
-        if not state.execution_graph or not isinstance(state.execution_graph, GraphOutput): state.response = "No execution graph is currently available or graph is invalid."
-        else:
-            try: graph_json_str = state.execution_graph.model_dump_json(indent=2); state.scratchpad['graph_to_send'] = graph_json_str; state.response = f"The current API workflow graph is available in the graph view. You can also copy the JSON from there if needed."; logger.info("Provided graph JSON to scratchpad for UI.")
-            except Exception as e: logger.error(f"Error serializing execution_graph to JSON: {e}"); state.response = f"Error serializing graph to JSON: {str(e)}"
-        state.next_step = "responder"; return state
+    def _generate_execution_graph(
+        self, state: BotState, goal: Optional[str] = None
+    ) -> BotState:
+        """
+        Generates an API execution graph based on the user's goal and available APIs.
+        This is the primary method for creating the initial graph.
+        """
+        tool_name = "_generate_execution_graph"
+        current_goal = goal or state.plan_generation_goal or "General API workflow overview"
+        self._queue_intermediate_message(
+            state, f"Building API workflow graph for goal: '{current_goal[:70]}...'"
+        )
+        state.update_scratchpad_reason(tool_name, f"Generating graph. Goal: {current_goal}")
 
-    def answer_openapi_query(self, state: BotState) -> BotState:
-        tool_name = "answer_openapi_query"
-        state.response = "Thinking about your question..."
-        state.update_scratchpad_reason(tool_name, f"Attempting to answer user query: {state.user_input[:100] if state.user_input else 'N/A'}")
-
-        if not state.openapi_schema and not (state.execution_graph and isinstance(state.execution_graph, GraphOutput)):
-            state.response = "I don't have an OpenAPI specification loaded or a graph generated yet. Please provide one first."
+        if not state.identified_apis:
+            self._queue_intermediate_message(
+                state, "Cannot generate graph: No API operations identified."
+            )
+            state.execution_graph = None
+            state.update_scratchpad_reason(tool_name, state.response)
             state.next_step = "responder"
             return state
 
-        context_parts = []
-        if state.user_input:
-            context_parts.append(f"User Question: \"{state.user_input}\"")
+        # Prepare a summary of identified APIs for the LLM prompt
+        api_summaries_for_prompt = []
+        num_apis_to_summarize = MAX_APIS_IN_PROMPT_SUMMARY_LONG
+        truncate_threshold = MAX_TOTAL_APIS_THRESHOLD_FOR_TRUNCATION_LONG
 
-        if state.schema_summary:
-            context_parts.append(f"\n### API Specification Summary (from validated schema)\n{state.schema_summary}")
-
-        identified_apis_md = "\n### Identified API Operations (Sample):\n"
-        if state.identified_apis:
-            num_apis_to_list = MAX_APIS_IN_PROMPT_SUMMARY_SHORT 
-            for i, api in enumerate(state.identified_apis[:num_apis_to_list]):
-                identified_apis_md += (
-                    f"- **Operation ID:** `{api.get('operationId', 'N/A')}`\n"
-                    f"  - **Method & Path:** `{api.get('method', '?')} {api.get('path', '?')}`\n"
-                    f"  - **Summary:** _{api.get('summary', 'No summary')[:100]}..._\n"
+        for idx, api in enumerate(state.identified_apis):
+            if (
+                idx >= num_apis_to_summarize
+                and len(state.identified_apis) > truncate_threshold
+            ):
+                api_summaries_for_prompt.append(
+                    f"- ...and {len(state.identified_apis) - num_apis_to_summarize} more operations."
                 )
-            if len(state.identified_apis) > num_apis_to_list:
-                identified_apis_md += f"- ... and {len(state.identified_apis) - num_apis_to_list} more.\n"
+                break
+
+            likely_confirmation = api["method"].upper() in [
+                "POST",
+                "PUT",
+                "DELETE",
+                "PATCH",
+            ]
+            params_str_parts = []
+            if api.get("parameters"):
+                for p_idx, p_detail in enumerate(api["parameters"]):
+                    if p_idx >= 3: # Limit parameter details for brevity
+                        params_str_parts.append("...")
+                        break
+                    param_name = p_detail.get("name", "N/A")
+                    param_in = p_detail.get("in", "N/A")
+                    param_schema = p_detail.get("schema", {})
+                    param_type = (
+                        param_schema.get("type", "unknown")
+                        if isinstance(param_schema, dict)
+                        else "unknown"
+                    )
+                    params_str_parts.append(f"{param_name}({param_in}, {param_type})")
+            params_str = (
+                f"Params: {', '.join(params_str_parts)}"
+                if params_str_parts
+                else "No explicit params listed."
+            )
+
+            req_body_info = ""
+            if api.get("requestBody") and isinstance(api["requestBody"], dict):
+                content = api["requestBody"].get("content", {})
+                json_schema = content.get("application/json", {}).get("schema", {})
+                if json_schema and isinstance(json_schema, dict) and json_schema.get(
+                    "properties"
+                ):
+                    props = list(json_schema.get("properties", {}).keys())[:3]
+                    req_body_info = (
+                        f" ReqBody fields (sample from schema): {', '.join(props)}"
+                        f"{'...' if len(json_schema.get('properties', {})) > 3 else ''}."
+                    )
+
+            api_summaries_for_prompt.append(
+                f"- operationId: {api['operationId']} ({api['method']} {api['path']}), "
+                f"summary: {api.get('summary', 'N/A')[:80]}. {params_str}{req_body_info} "
+                f"likely_requires_confirmation: {'yes' if likely_confirmation else 'no'}"
+            )
+        apis_str = "\n".join(api_summaries_for_prompt)
+        feedback_str = (
+            f"Refinement Feedback: {state.graph_regeneration_reason}"
+            if state.graph_regeneration_reason
+            else ""
+        )
+
+        # Construct the prompt for the LLM
+        prompt = f"""
+        Goal: "{current_goal}". {feedback_str}
+        Available API Operations (summary with parameters and sample request body fields from validated schemas):\n{apis_str}
+
+        Design a logical and runnable API execution graph as a JSON object. The graph must achieve the specified Goal.
+        Consider typical API workflow patterns. For example:
+        - A 'create' operation (e.g., POST /items) should usually precede 'get by ID' (e.g., GET /items/{{{{itemId}}}}).
+        - Data created in one step (e.g., an ID from a POST response) MUST be mapped via `OutputMapping` and then used in subsequent steps.
+
+        The graph must adhere to the Pydantic models:
+        InputMapping: {{"source_operation_id": "str_effective_id_of_source_node", "source_data_path": "str_jsonpath_to_value_in_extracted_ids (e.g., '$.createdItemIdFromStep1')", "target_parameter_name": "str_param_name_in_target_node (e.g., 'itemId')", "target_parameter_in": "Literal['path', 'query', 'body', 'body.fieldName']"}}
+        OutputMapping: {{"source_data_path": "str_jsonpath_to_value_in_THIS_NODE_RESPONSE (e.g., '$.id', '$.data.token')", "target_data_key": "str_UNIQUE_key_for_shared_data_pool (e.g., 'createdItemId', 'userAuthToken')"}}
+        Node: {{ ... "payload": {{ "template_key": "realistic_example_value or {{{{placeholder_from_output_mapping}}}}" }} ... }}
+
+        CRITICAL INSTRUCTIONS FOR `payload` FIELD in Nodes (for POST, PUT, PATCH), using the schema information provided:
+        1.  **Accuracy is Key:** The `payload` dictionary MUST ONLY contain fields that are actually defined by the specific API's request body schema (as hinted in 'ReqBody fields (sample from schema)' or from your knowledge of the API).
+        2.  **Do Not Invent Fields:** Do NOT include any fields in the `payload` that are not part of the API's expected request body.
+        3.  **Realistic Values:** Use realistic example values for fields (e.g., for "name": "Example Product", for "email": "test@example.com").
+        4.  **Placeholders for Dynamic Data:** If a field's value should come from a previous step's output (via `OutputMapping`), use a placeholder like `{{{{key_from_output_mapping}}}}`. Ensure this placeholder matches a `target_data_key` from an `OutputMapping` of a preceding node.
+        5.  **Optional Fields:** If a field is optional according to the API spec and no value is known or relevant to the goal, OMIT it from the payload rather than inventing a value or using a generic placeholder. If a default is sensible and known, use it.
+
+        CRITICAL INSTRUCTIONS FOR DATA FLOW (e.g., Create Product then Get Product by ID):
+        1.  **Create Node (e.g., POST /products):**
+            * MUST have an `OutputMapping` to extract the ID of the newly created product from its response. Example: `{{"source_data_path": "$.id", "target_data_key": "newProductId"}}`. (Adjust `source_data_path` based on the actual API response structure for the ID).
+        2.  **Get/Update/Delete Node (e.g., GET /products/{{{{some_id_placeholder}}}}):**
+            * Its `path` MUST use a placeholder for the ID. This placeholder MUST exactly match the `target_data_key` from the "Create Node's" `OutputMapping`. Example Path: `/products/{{{{newProductId}}}}`.
+            * Alternatively, if the path is `/products/{{pathParamName}}`, an `InputMapping` is needed: `{{ "source_operation_id": "effective_id_of_create_node", "source_data_path": "$.newProductId", "target_parameter_name": "pathParamName", "target_parameter_in": "path" }}`.
+
+        General Instructions:
+        - Create "START_NODE" and "END_NODE" (method: "SYSTEM").
+        - Select 2-5 relevant API operations.
+        - Set `requires_confirmation: true` for POST, PUT, DELETE, PATCH.
+        - Connect nodes with `edges`. START_NODE to first API(s), last API(s) to END_NODE.
+        - Ensure logical sequence.
+        - Provide overall `description` and `refinement_summary`.
+
+        Output ONLY the JSON object for GraphOutput. Ensure valid JSON.
+        """
+
+        try:
+            llm_response = llm_call_helper(self.worker_llm, prompt)
+            # Attempt to parse the LLM's JSON output and validate against GraphOutput model
+            graph_output_candidate = parse_llm_json_output_with_model(
+                llm_response, expected_model=GraphOutput
+            )
+
+            if graph_output_candidate:
+                # Basic check for essential START_NODE and END_NODE
+                if not any(
+                    node.operationId == "START_NODE" for node in graph_output_candidate.nodes
+                ) or not any(
+                    node.operationId == "END_NODE" for node in graph_output_candidate.nodes
+                ):
+                    logger.error(
+                        "LLM generated graph is missing START_NODE or END_NODE."
+                    )
+                    state.graph_regeneration_reason = (
+                        "Generated graph missing START_NODE or END_NODE. "
+                        "Please ensure they are included."
+                    )
+                    # Fall through to retry logic without setting execution_graph
+                else:
+                    state.execution_graph = graph_output_candidate
+                    self._queue_intermediate_message(state, "API workflow graph generated.")
+                    logger.info(
+                        f"Graph generated. Description: {graph_output_candidate.description or 'N/A'}"
+                    )
+                    if graph_output_candidate.refinement_summary:
+                        logger.info(
+                            f"LLM summary for graph: {graph_output_candidate.refinement_summary}"
+                        )
+                    state.graph_regeneration_reason = None # Clear reason on successful generation
+                    state.graph_refinement_iterations = 0 # Reset refinement attempts
+                    state.next_step = "verify_graph" # Proceed to verification
+                    state.update_scratchpad_reason(
+                        tool_name, f"Graph gen success. Next: {state.next_step}"
+                    )
+                    return state # Successfully generated and validated graph
+
+            # If graph_output_candidate is None or START/END nodes are missing
+            error_msg = (
+                "LLM failed to produce a valid GraphOutput JSON, or it was structurally incomplete "
+                "(e.g., missing START/END nodes)."
+            )
+            logger.error(error_msg + f" Raw LLM output snippet: {llm_response[:300]}...")
+            self._queue_intermediate_message(
+                state,
+                "Failed to generate a valid execution graph (AI output format, structure, or missing critical nodes like START/END).",
+            )
+            state.execution_graph = None # Ensure graph is None on failure
+            state.graph_regeneration_reason = (
+                state.graph_regeneration_reason
+                or "LLM output was not a valid GraphOutput object or missed key structural elements."
+            )
+
+            # Retry logic for initial generation
+            current_attempts = state.scratchpad.get("graph_gen_attempts", 0)
+            if current_attempts < 1: # Allow one retry for initial generation
+                state.scratchpad["graph_gen_attempts"] = current_attempts + 1
+                logger.info(
+                    "Retrying initial graph generation once due to validation/parsing failure."
+                )
+                state.next_step = "_generate_execution_graph" # Loop back to this node
+            else:
+                logger.error(
+                    "Max initial graph generation attempts reached. Routing to handle_unknown."
+                )
+                state.next_step = "handle_unknown" # Give up after retry
+                state.scratchpad["graph_gen_attempts"] = 0 # Reset for future attempts if any
+
+        except Exception as e:
+            logger.error(
+                f"Error during graph generation LLM call or processing: {e}",
+                exc_info=False, # Set to True for full traceback if needed for debugging
+            )
+            self._queue_intermediate_message(state, f"Error generating graph: {str(e)[:150]}...")
+            state.execution_graph = None
+            state.graph_regeneration_reason = (
+                f"LLM call/processing error: {str(e)[:100]}..."
+            )
+            state.next_step = "handle_unknown" # Fallback on unexpected error
+
+        state.update_scratchpad_reason(
+            tool_name,
+            f"Graph gen status: {'Success' if state.execution_graph else 'Failed'}. Resp: {state.response}",
+        )
+        return state
+
+    def verify_graph(self, state: BotState) -> BotState:
+        """
+        Verifies the structural integrity and basic executability of the generated graph.
+        Checks for cycles, presence of START/END nodes, and essential fields.
+        """
+        tool_name = "verify_graph"
+        self._queue_intermediate_message(state, "Verifying API workflow graph...")
+        state.update_scratchpad_reason(
+            tool_name, "Verifying graph structure and integrity."
+        )
+
+        if not state.execution_graph or not isinstance(state.execution_graph, GraphOutput):
+            current_response = state.response or ""
+            self._queue_intermediate_message(
+                state,
+                current_response
+                + " No execution graph to verify (possibly due to generation error or wrong type).",
+            )
+            state.graph_regeneration_reason = (
+                state.graph_regeneration_reason or "No graph was generated to verify."
+            )
+            logger.warning(
+                f"verify_graph: No graph found or invalid type. Reason: {state.graph_regeneration_reason}. "
+                "Routing to _generate_execution_graph for regeneration."
+            )
+            state.next_step = "_generate_execution_graph"
+            return state
+
+        issues = []
+        try:
+            # Validate against Pydantic model (already done by parse_llm_json_output_with_model if successful)
+            # but can be re-validated here for safety or if graph was modified.
+            GraphOutput.model_validate(state.execution_graph.model_dump())
+
+            # Check for cycles
+            is_dag, cycle_msg = check_for_cycles(state.execution_graph)
+            if not is_dag:
+                issues.append(cycle_msg or "Graph contains cycles.")
+
+            # Check for START_NODE and END_NODE presence
+            node_ids = {node.effective_id for node in state.execution_graph.nodes}
+            if "START_NODE" not in node_ids:
+                issues.append("START_NODE is missing.")
+            if "END_NODE" not in node_ids:
+                issues.append("END_NODE is missing.")
+
+            # Check START_NODE/END_NODE connectivity (basic checks)
+            if "START_NODE" in node_ids:
+                start_outgoing = any(
+                    edge.from_node == "START_NODE" for edge in state.execution_graph.edges
+                )
+                start_incoming = any(
+                    edge.to_node == "START_NODE" for edge in state.execution_graph.edges
+                )
+                if not start_outgoing and len(state.execution_graph.nodes) > 2: # More than just START/END
+                    issues.append(
+                        "START_NODE has no outgoing edges to actual API operations."
+                    )
+                if start_incoming:
+                    issues.append("START_NODE should not have incoming edges.")
+
+            if "END_NODE" in node_ids:
+                end_incoming = any(
+                    edge.to_node == "END_NODE" for edge in state.execution_graph.edges
+                )
+                end_outgoing = any(
+                    edge.from_node == "END_NODE" for edge in state.execution_graph.edges
+                )
+                if not end_incoming and len(state.execution_graph.nodes) > 2: # More than just START/END
+                    issues.append(
+                        "END_NODE has no incoming edges from actual API operations."
+                    )
+                if end_outgoing:
+                    issues.append("END_NODE should not have outgoing edges.")
+            
+            # Check if API nodes (non-START/END) have method and path
+            for node in state.execution_graph.nodes:
+                if node.effective_id.upper() not in ["START_NODE", "END_NODE"]:
+                    if not node.method or not node.path:
+                        issues.append(f"Node '{node.effective_id}' is missing 'method' or 'path', required for execution.")
+
+
+        except PydanticValidationError as ve:
+            logger.error(f"Graph Pydantic validation failed during verify_graph: {ve}")
+            issues.append(f"Graph structure is invalid (Pydantic): {str(ve)[:200]}...")
+        except Exception as e:
+            logger.error(f"Unexpected error during graph verification: {e}", exc_info=True)
+            issues.append(
+                f"An unexpected error occurred during verification: {str(e)[:100]}."
+            )
+
+        if not issues:
+            self._queue_intermediate_message(
+                state,
+                "Graph verification successful (Structure, DAG, START/END nodes, basic execution fields).",
+            )
+            state.update_scratchpad_reason(tool_name, "Graph verification successful.")
+            logger.info("Graph verification successful.")
+            state.graph_regeneration_reason = None # Clear reason on success
+            state.scratchpad["refinement_validation_failures"] = 0 # Reset on successful verification
+
+            # Send graph to UI
+            try:
+                state.scratchpad["graph_to_send"] = state.execution_graph.model_dump_json(indent=2)
+                logger.info("Graph marked to be sent to UI after verification.")
+            except Exception as e:
+                logger.error(f"Error serializing graph for sending after verification: {e}")
+
+            logger.info("Graph verified. Proceeding to describe graph.")
+            state.next_step = "describe_graph"
+
+            # If this verification followed spec parsing, provide a comprehensive success message
+            if state.input_is_spec: # This flag is set by the router
+                api_title = state.openapi_schema.get('info', {}).get('title', 'the API') if state.openapi_schema else 'the API'
+                self._queue_intermediate_message(
+                    state,
+                    f"Successfully processed the OpenAPI specification for '{api_title}'. "
+                    f"Identified {len(state.identified_apis)} API operations, "
+                    f"generated example payloads, and created an API workflow graph with "
+                    f"{len(state.execution_graph.nodes)} steps. The graph is verified. "
+                    f"You can now ask questions, request specific plan refinements, or try to execute the workflow."
+                )
+                state.input_is_spec = False # Reset flag
+
         else:
-            identified_apis_md += "No specific API operations identified yet.\n"
-        context_parts.append(identified_apis_md)
+            error_details = " ".join(issues)
+            self._queue_intermediate_message(state, f"Graph verification failed: {error_details}.")
+            state.graph_regeneration_reason = f"Verification failed: {error_details}."
+            logger.warning(f"Graph verification failed: {error_details}.")
 
-        if state.execution_graph and isinstance(state.execution_graph, GraphOutput) and state.execution_graph.description:
-            graph_desc_md = f"\n### Current Workflow Graph ('{state.plan_generation_goal or 'General Purpose'}') Description:\n{state.execution_graph.description}"
-            if state.execution_graph.refinement_summary:
-                graph_desc_md += f"\nLast Refinement: {state.execution_graph.refinement_summary}"
-            context_parts.append(graph_desc_md)
-        elif state.execution_graph and isinstance(state.execution_graph, GraphOutput):
-            context_parts.append(f"\n### Current Workflow Graph ('{state.plan_generation_goal or 'General Purpose'}') exists but has no detailed description.")
+            if state.graph_refinement_iterations < state.max_refinement_iterations:
+                logger.info(
+                    f"Verification failed. Attempting graph refinement "
+                    f"(iteration {state.graph_refinement_iterations + 1})."
+                )
+                state.next_step = "refine_api_graph"
+            else:
+                logger.warning(
+                    "Max refinement iterations reached, but graph still has verification issues. "
+                    "Attempting full regeneration."
+                )
+                state.next_step = "_generate_execution_graph"
+                state.graph_refinement_iterations = 0 # Reset for full regeneration
+                state.scratchpad["graph_gen_attempts"] = 0 # Reset for full regeneration
 
-        # Provide all available payload descriptions for the LLM to reference if needed
-        payload_descriptions_md = "\n### Available Payload/Response Examples (for reference):\n"
-        if state.payload_descriptions:
-            for op_id, desc_text in state.payload_descriptions.items():
-                payload_descriptions_md += f"**For Operation ID `{op_id}`:**\n```text\n{desc_text[:300]}...\n```\n\n" # Show a snippet
-        else:
-            payload_descriptions_md += "No detailed payload/response examples have been generated yet.\n"
-        context_parts.append(payload_descriptions_md)
-        
-        full_context = "\n".join(context_parts)
-        if not full_context.strip():
-            full_context = "No specific API context available, but an OpenAPI spec might be loaded."
+        state.update_scratchpad_reason(
+            tool_name, f"Verification result: {state.response[:200]}..."
+        )
+        return state
 
-        prompt = f"""You are an expert API assistant. Your task is to answer the user's question based on the provided context. Use Markdown for formatting.
+    def refine_api_graph(self, state: BotState) -> BotState:
+        """
+        Attempts to refine the existing API execution graph based on feedback or verification failures.
+        """
+        tool_name = "refine_api_graph"
+        iteration = state.graph_refinement_iterations + 1
+        self._queue_intermediate_message(
+            state,
+            f"Refining API workflow graph (Attempt {iteration}/{state.max_refinement_iterations})...",
+        )
+        state.update_scratchpad_reason(
+            tool_name,
+            f"Refining graph. Iteration: {iteration}. Reason: {state.graph_regeneration_reason or 'General refinement request.'}",
+        )
 
-        Context:
-        {full_context}
+        if not state.execution_graph or not isinstance(state.execution_graph, GraphOutput):
+            self._queue_intermediate_message(
+                state, "No graph to refine or invalid graph type. Please generate a graph first."
+            )
+            logger.warning("refine_api_graph: No execution_graph found or invalid type.")
+            state.next_step = "_generate_execution_graph" # Try to generate one
+            return state
 
-        User Question: "{state.user_input}"
+        if iteration > state.max_refinement_iterations:
+            self._queue_intermediate_message(
+                state,
+                f"Max refinement iterations ({state.max_refinement_iterations}) reached. "
+                f"Using current graph (description: {state.execution_graph.description or 'N/A'}). "
+                "Please try a new goal or manually edit if needed.",
+            )
+            logger.warning("Max refinement iterations reached. Proceeding with current graph.")
+            state.next_step = "describe_graph" # Describe the last valid graph
+            return state
 
-        **Instructions for Answering:**
-        1.  **Understand the Question:** Determine if the user is asking for general information, details about a specific API, or "how-to" perform an action (e.g., "how to create a product").
-        2.  **For "How-To" Questions (e.g., "how to create X", "how do I update Y?"):**
-            a.  Identify the most relevant API operation(s) from the "Identified API Operations" list that would achieve the user's goal (e.g., a POST to `/products` for "create product").
-            b.  State the identified operation: its Operation ID, Method, and Path.
-            c.  Refer to the "Available Payload/Response Examples" for the identified Operation ID. Describe the necessary request body structure based on its example. Mention key fields and their expected data types or example values.
-            d.  List any important path or query parameters.
-            e.  Briefly describe the expected successful response.
-            f.  If multiple operations seem relevant, briefly mention them.
-        3.  **For Questions about Specific APIs (e.g., "what does 'getUser' do?"):**
-            a.  Find the API in the "Identified API Operations" list by its Operation ID or path.
-            b.  Provide its summary, method, path.
-            c.  If available, use its "Payload/Response Example" to describe its request/response.
-        4.  **For General Questions:** Use the API Specification Summary and other relevant context.
-        5.  **Clarity and Conciseness:** Provide a clear, concise, and helpful answer.
-        6.  **Formatting:** Use Markdown (headings, lists, bolding, code blocks for JSON examples or API paths).
-        7.  **Unavailable Information:** If the information is not available in the context, state that clearly. Do not invent details.
-        8.  **No Conversational Fluff:** Focus only on answering the question directly.
+        try:
+            current_graph_json = state.execution_graph.model_dump_json(indent=2)
+        except Exception as e:
+            logger.error(f"Error serializing current graph for refinement prompt: {e}")
+            self._queue_intermediate_message(
+                state, "Error preparing current graph for refinement. Cannot proceed."
+            )
+            state.next_step = "handle_unknown"
+            return state
 
-        Answer:
+        # Prepare context for the LLM refinement prompt
+        api_summaries_for_prompt = []
+        num_apis_to_summarize = MAX_APIS_IN_PROMPT_SUMMARY_SHORT
+        truncate_threshold = MAX_TOTAL_APIS_THRESHOLD_FOR_TRUNCATION_SHORT
+        for idx, api in enumerate(state.identified_apis):
+            if (
+                idx >= num_apis_to_summarize
+                and len(state.identified_apis) > truncate_threshold
+            ):
+                api_summaries_for_prompt.append(
+                    f"- ...and {len(state.identified_apis) - num_apis_to_summarize} more operations."
+                )
+                break
+            likely_confirmation = api["method"].upper() in [
+                "POST",
+                "PUT",
+                "DELETE",
+                "PATCH",
+            ]
+            api_summaries_for_prompt.append(
+                f"- opId: {api['operationId']} ({api['method']} {api['path']}), "
+                f"summary: {api.get('summary', 'N/A')[:70]}, "
+                f"confirm: {'yes' if likely_confirmation else 'no'}"
+            )
+        apis_ctx = "\n".join(api_summaries_for_prompt)
+
+        prompt = f"""
+        User's Overall Goal: "{state.plan_generation_goal or 'General workflow'}"
+        Feedback for Refinement: "{state.graph_regeneration_reason or 'General request to improve the graph.'}"
+        Current Graph (JSON to be refined, based on validated schemas):\n```json\n{current_graph_json}\n```
+        Available API Operations (sample for context, from validated schemas):\n{apis_ctx}
+
+        Task: Refine the current graph based on the feedback. Ensure the refined graph:
+        1.  Strictly adheres to the Pydantic model structure for GraphOutput, Node, Edge, InputMapping, OutputMapping.
+            - For `payload` in Nodes: ONLY include fields defined by the API's request body schema. DO NOT invent fields. Use realistic example values or placeholders like `{{{{key_from_output_mapping}}}}` if data comes from a prior step. Omit optional fields if value is unknown.
+        2.  Includes "START_NODE" and "END_NODE" correctly linked.
+        3.  All node `operationId`s (or `display_name` if used as `effective_id`) in edges must exist in the `nodes` list.
+        4.  Nodes intended for execution have `method` and `path` attributes.
+        5.  `input_mappings` and `output_mappings` are logical for data flow. `source_data_path` should be plausible JSON paths. `target_data_key` in output_mappings should be unique and descriptive.
+        6.  `requires_confirmation` is set appropriately.
+        7.  Addresses the specific feedback. Ensure logical dependencies (e.g., create before get/update).
+        8.  Provide a concise `refinement_summary` field in the JSON explaining what was changed or attempted.
+
+        Output ONLY the refined GraphOutput JSON object.
         """
         try:
-            state.response = llm_call_helper(self.worker_llm, prompt)
-            logger.info("Successfully generated answer for OpenAPI query.")
-        except Exception as e:
-            logger.error(f"Error generating answer for OpenAPI query: {e}", exc_info=False)
-            state.response = f"### Error Answering Query\nSorry, I encountered an error while trying to answer your question: {str(e)[:100]}..."
-        
-        state.update_scratchpad_reason(tool_name, f"Answered query. Response snippet: {state.response[:100]}...")
-        state.next_step = "responder"
-        return state
-
-    def interactive_query_planner(self, state: BotState) -> BotState:
-        tool_name = "interactive_query_planner"; state.response = "Planning how to address your interactive query..."; state.update_scratchpad_reason(tool_name, f"Entering interactive query planner for input: {state.user_input[:100] if state.user_input else 'N/A'}")
-        state.scratchpad.pop('interactive_action_plan', None); state.scratchpad.pop('current_interactive_action_idx', None); state.scratchpad.pop('current_interactive_results', None)
-        graph_summary = state.execution_graph.description[:150] + "..." if state.execution_graph and isinstance(state.execution_graph, GraphOutput) and state.execution_graph.description else "No graph currently generated."; payload_keys_sample = list(state.payload_descriptions.keys())[:3]
-        prompt = f"""User Query: "{state.user_input}"\n\nCurrent State Context:\n- API Spec Summary: {'Available (from validated spec)' if state.schema_summary else 'Not available.'}\n- Identified APIs count: {len(state.identified_apis) if state.identified_apis else 0}. Example OpIDs: {", ".join([api['operationId'] for api in state.identified_apis[:3]])}...\n- Example Payload Descriptions available for OpIDs (sample, from validated spec): {payload_keys_sample}...\n- Current Execution Graph Goal: {state.plan_generation_goal or 'Not set.'}\n- Current Graph Description: {graph_summary}\n- Workflow Execution Status: {state.workflow_execution_status}\n\nAvailable Internal Actions (choose one or more in sequence, output as a JSON list):\n1.  `rerun_payload_generation`: Regenerate payload/response examples for specific APIs, possibly with new user-provided context.\n    Params: {{ "operation_ids_to_update": ["opId1", "opId2"], "new_context": "User's new context string for generation" }}\n2.  `contextualize_graph_descriptions`: Rewrite descriptions within the *existing* graph (overall, nodes, edges) to reflect new user context or focus. This does NOT change graph structure.\n    Params: {{ "new_context_for_graph": "User's new context/focus for descriptions" }}\n3.  `regenerate_graph_with_new_goal`: Create a *new* graph if the user states a completely different high-level goal OR requests a significant structural change (add/remove/reorder API steps).\n    Params: {{ "new_goal_string": "User's new goal, incorporating the structural change (e.g., 'Workflow to X, then Y, and then Z as the last step')" }}\n4.  `refine_existing_graph_structure`: For minor structural adjustments to the existing graph (e.g., "add API Z after Y but before END_NODE", "remove API X"). This implies the overall goal is similar but the sequence/nodes need adjustment. The LLM will be asked to refine the current graph JSON.\n    Params: {{ "refinement_instructions_for_structure": "User's specific feedback for structural refinement (e.g., 'Add operation Z after Y', 'Ensure X comes before Y')" }}\n5.  `answer_query_directly`: If the query can be answered using existing information (API summary, API list, current graph description, existing payload examples) without modifications to artifacts.\n    Params: {{ "query_for_synthesizer": "The original user query or a rephrased one for direct answering." }}\n6.  `setup_workflow_execution_interactive`: If the user asks to run/execute the current graph. This action prepares the system for execution.\n    Params: {{ "initial_parameters": {{ "param1": "value1" }} }} (Optional initial parameters for the workflow, if provided by user)\n7.  `resume_workflow_with_payload_interactive`: If the workflow is 'paused_for_confirmation' and the user provides the necessary payload/confirmation to continue.\n    Params: {{ "confirmed_payload": {{...}} }} (The JSON payload confirmed or provided by the user)\n8.  `synthesize_final_answer`: (Usually the last step of a plan) Formulate a comprehensive answer to the user based on the outcomes of previous internal actions or if no other action is suitable.\n    Params: {{ "synthesis_prompt_instructions": "Instructions for the LLM on what to include in the final answer, summarizing actions taken or information gathered." }}\n\nTask:\n1. Analyze the user's query in the context of the current system state.\n2. Create a short, logical "interactive_action_plan" (a list of action objects, max 3-4 steps).\n   - For requests to run the graph, use `setup_workflow_execution_interactive`.\n   - If the graph is paused and user provides data, use `resume_workflow_with_payload_interactive`.\n   - For structural changes like "add X at the end", prefer `regenerate_graph_with_new_goal` or `refine_existing_graph_structure`.\n3. Provide a brief "user_query_understanding" (1-2 sentences).\n\nOutput ONLY a JSON object with this structure:\n{{\n  "user_query_understanding": "Brief interpretation of user's need.",\n  "interactive_action_plan": [\n    {{"action_name": "action_enum_value", "action_params": {{...}}, "description": "Briefly, why this action is chosen."}}\n  ]\n}}\nIf the query is very simple and can be answered directly, the plan might just be one "answer_query_directly" or "synthesize_final_answer" action.\nIf the query is ambiguous or cannot be handled by available actions, use "synthesize_final_answer" with instructions to inform the user."""
-        try:
             llm_response_str = llm_call_helper(self.worker_llm, prompt)
-            parsed_plan_data = parse_llm_json_output_with_model(llm_response_str) 
-            if parsed_plan_data and isinstance(parsed_plan_data, dict) and "interactive_action_plan" in parsed_plan_data and isinstance(parsed_plan_data["interactive_action_plan"], list) and "user_query_understanding" in parsed_plan_data:
-                state.scratchpad['user_query_understanding'] = parsed_plan_data["user_query_understanding"]; state.scratchpad['interactive_action_plan'] = parsed_plan_data["interactive_action_plan"]; state.scratchpad['current_interactive_action_idx'] = 0; state.scratchpad['current_interactive_results'] = [] 
-                state.response = f"Understood query: {state.scratchpad['user_query_understanding']}. Starting internal actions..."; logger.info(f"Interactive plan generated: {state.scratchpad['interactive_action_plan']}"); state.next_step = "interactive_query_executor"
-            else: logger.error(f"LLM failed to produce a valid interactive plan. Raw: {llm_response_str[:300]}"); raise ValueError("LLM failed to produce a valid interactive plan JSON structure with required keys.")
-        except Exception as e: logger.error(f"Error in interactive_query_planner: {e}", exc_info=False); state.response = f"Sorry, I encountered an error while planning how to address your request: {str(e)[:100]}..."; state.next_step = "answer_openapi_query" 
-        state.update_scratchpad_reason(tool_name, f"Interactive plan generated. Next: {state.next_step}. Response: {state.response[:100]}")
-        return state
+            refined_graph_candidate = parse_llm_json_output_with_model(
+                llm_response_str, expected_model=GraphOutput
+            )
 
-    def _internal_contextualize_graph_descriptions(self, state: BotState, new_context: str) -> str:
-        tool_name = "_internal_contextualize_graph_descriptions"
-        if not state.execution_graph or not isinstance(state.execution_graph, GraphOutput): return "No graph to contextualize or graph is invalid."
-        if not new_context: return "No new context provided for contextualization."
-        logger.info(f"Attempting to contextualize graph descriptions with context: {new_context[:100]}...")
-        if state.execution_graph.description:
-            prompt_overall = (f"Current overall graph description: \"{state.execution_graph.description}\"\nNew User Context/Focus: \"{new_context}\"\n\nRewrite the graph description to incorporate this new context/focus, keeping it concise. Output only the new description text.")
-            try: state.execution_graph.description = llm_call_helper(self.worker_llm, prompt_overall); logger.info(f"Overall graph description contextualized: {state.execution_graph.description[:100]}...")
-            except Exception as e: logger.error(f"Error contextualizing overall graph description: {e}")
-        nodes_to_update = [n for n in state.execution_graph.nodes if n.operationId not in ["START_NODE", "END_NODE"]][:3]
-        for node in nodes_to_update:
-            if node.description: 
-                prompt_node = (f"Current description for node '{node.effective_id}' ({node.summary}): \"{node.description}\"\nOverall User Context/Focus for the graph: \"{new_context}\"\n\nRewrite this node's description to align with the new context, focusing on its role in the workflow under this context. Output only the new description text for this node.")
-                try: node.description = llm_call_helper(self.worker_llm, prompt_node); logger.info(f"Node '{node.effective_id}' description contextualized: {node.description[:100]}...")
-                except Exception as e: logger.error(f"Error contextualizing node '{node.effective_id}' description: {e}")
-        if state.execution_graph: state.scratchpad['graph_to_send'] = state.execution_graph.model_dump_json(indent=2) 
-        state.update_scratchpad_reason(tool_name, f"Graph descriptions contextualized with context: {new_context[:70]}.")
-        return f"Graph descriptions have been updated to reflect the context: '{new_context[:70]}...'."
+            if refined_graph_candidate:
+                logger.info(
+                    f"Refinement attempt (iter {iteration}) produced a structurally valid GraphOutput."
+                )
+                state.execution_graph = refined_graph_candidate
+                refinement_summary = (
+                    refined_graph_candidate.refinement_summary
+                    or "AI provided no specific summary for this refinement."
+                )
+                state.update_scratchpad_reason(
+                    tool_name,
+                    f"LLM Refinement Summary (Iter {iteration}): {refinement_summary}",
+                )
+                self._queue_intermediate_message(
+                    state, f"Graph refined (Iteration {iteration}). Summary: {refinement_summary}"
+                )
+                state.graph_refinement_iterations = iteration
+                state.graph_regeneration_reason = None # Clear reason on successful refinement
+                state.scratchpad["refinement_validation_failures"] = 0 # Reset on successful refinement
+                state.next_step = "verify_graph" # Verify the refined graph
+            else:
+                error_msg = "LLM refinement failed to produce a GraphOutput JSON that is valid or self-consistent."
+                logger.error(
+                    error_msg
+                    + f" Raw LLM output snippet for refinement: {llm_response_str[:300]}..."
+                )
+                self._queue_intermediate_message(
+                    state,
+                    f"Error during graph refinement (iteration {iteration}): AI output was invalid. Will retry refinement or regenerate graph.",
+                )
+                state.graph_regeneration_reason = (
+                    state.graph_regeneration_reason
+                    or "LLM output for refinement was not a valid GraphOutput object or had structural issues."
+                )
+                state.scratchpad["refinement_validation_failures"] = state.scratchpad.get("refinement_validation_failures", 0) + 1
 
-    def interactive_query_executor(self, state: BotState) -> BotState:
-        tool_name = "interactive_query_executor"; plan = state.scratchpad.get('interactive_action_plan', []); idx = state.scratchpad.get('current_interactive_action_idx', 0); results = state.scratchpad.get('current_interactive_results', []) 
-        if not plan or idx >= len(plan):
-            final_response_message = "Finished interactive processing. "; 
-            if results: final_response_message += (str(results[-1])[:200] + "..." if len(str(results[-1])) > 200 else str(results[-1]))
-            else: final_response_message += "No specific actions were taken or results to report."
-            if not state.response: state.response = final_response_message
-            logger.info("Interactive plan execution completed or no plan."); state.next_step = "responder"; state.update_scratchpad_reason(tool_name, "Interactive plan execution completed or no plan."); return state
-        
-        action = plan[idx]; action_name = action.get("action_name"); action_params = action.get("action_params", {}); action_description = action.get("description", "No description for action.") 
-        state.response = f"Executing internal step ({idx + 1}/{len(plan)}): {action_description[:70]}..."; state.update_scratchpad_reason(tool_name, f"Executing action ({idx + 1}/{len(plan)}): {action_name} - {action_description}")
-        action_result_message = f"Action '{action_name}' completed." 
-        
-        try:
-            if action_name == "rerun_payload_generation":
-                op_ids = action_params.get("operation_ids_to_update", []); new_ctx = action_params.get("new_context", "")
-                if op_ids and new_ctx: 
-                    # Call the method on the spec_processor instance
-                    self.spec_processor._generate_payload_descriptions(state, target_apis=op_ids, context_override=new_ctx)
-                    action_result_message = f"Payload examples update requested for {op_ids} with context '{new_ctx[:30]}...'."
-                else: action_result_message = "Skipped rerun_payload_generation: Missing operation_ids or new_context."
-                results.append(action_result_message); state.next_step = "interactive_query_executor" 
-            
-            elif action_name == "contextualize_graph_descriptions":
-                new_ctx_graph = action_params.get("new_context_for_graph", "")
-                if new_ctx_graph: action_result_message = self._internal_contextualize_graph_descriptions(state, new_ctx_graph)
-                else: action_result_message = "Skipped contextualize_graph_descriptions: Missing new_context_for_graph."
-                results.append(action_result_message); state.next_step = "interactive_query_executor"
-            
-            elif action_name == "regenerate_graph_with_new_goal":
-                new_goal = action_params.get("new_goal_string")
-                if new_goal: 
-                    state.plan_generation_goal = new_goal; state.execution_graph = None; state.graph_refinement_iterations = 0
-                    state.scratchpad['graph_gen_attempts'] = 0; state.scratchpad['refinement_validation_failures'] = 0
-                    state = self.graph_generator._generate_execution_graph(state, goal=new_goal) 
-                    action_result_message = f"Graph regeneration started for new goal: {new_goal[:50]}..."
-                else: 
-                    action_result_message = "Skipped regenerate_graph_with_new_goal: Missing new_goal_string."
-                    state.next_step = "interactive_query_executor" 
-                results.append(action_result_message) 
+                if iteration < state.max_refinement_iterations:
+                    if state.scratchpad.get("refinement_validation_failures",0) >= 2: # If 2 consecutive refinement attempts fail validation
+                        logger.warning(f"Multiple consecutive refinement validation failures (iter {iteration}). Escalating to full graph regeneration.")
+                        self._queue_intermediate_message(state, state.response + " Attempting full regeneration due to persistent refinement issues.")
+                        state.next_step = "_generate_execution_graph"
+                        state.graph_refinement_iterations = 0 # Reset for full regeneration
+                        state.scratchpad['refinement_validation_failures'] = 0
+                        state.scratchpad['graph_gen_attempts'] = 0 # Reset for full regeneration
+                    else:
+                        state.next_step = "refine_api_graph" # Retry refinement
+                else:
+                    logger.warning(
+                        "Max refinement iterations reached after LLM output error during refinement. "
+                        "Describing last valid graph or failing."
+                    )
+                    state.next_step = "describe_graph" # Give up on refinement
 
-            elif action_name == "refine_existing_graph_structure":
-                refinement_instr = action_params.get("refinement_instructions_for_structure")
-                if refinement_instr and state.execution_graph and isinstance(state.execution_graph, GraphOutput): 
-                    state.graph_regeneration_reason = refinement_instr; state.scratchpad['refinement_validation_failures'] = 0
-                    state = self.graph_generator.refine_api_graph(state) 
-                    action_result_message = f"Graph refinement (structure) started with instructions: {refinement_instr[:50]}..."
-                elif not state.execution_graph or not isinstance(state.execution_graph, GraphOutput): 
-                    action_result_message = "Skipped refine_existing_graph_structure: No graph exists or invalid type."
-                    state.next_step = "interactive_query_executor"
-                else: 
-                    action_result_message = "Skipped refine_existing_graph_structure: Missing refinement_instructions_for_structure."
-                    state.next_step = "interactive_query_executor"
-                results.append(action_result_message) 
-
-            elif action_name == "answer_query_directly":
-                query_to_answer = action_params.get("query_for_synthesizer", state.user_input or ""); original_user_input = state.user_input; state.user_input = query_to_answer; 
-                state = self.answer_openapi_query(state); 
-                state.user_input = original_user_input; action_result_message = f"Direct answer generated for: {query_to_answer[:50]}..."; 
-                results.append(action_result_message) 
-            
-            elif action_name == "setup_workflow_execution_interactive":
-                state = self.workflow_control.setup_workflow_execution(state) 
-                action_result_message = f"Workflow execution setup initiated. Status: {state.workflow_execution_status}."
-                results.append(action_result_message) 
-                if idx + 1 < len(plan): logger.warning("More actions planned after setup_workflow_execution_interactive. These will likely be skipped as setup routes to responder.")
-            
-            elif action_name == "resume_workflow_with_payload_interactive":
-                confirmed_payload = action_params.get("confirmed_payload")
-                if confirmed_payload and isinstance(confirmed_payload, dict): 
-                    state = self.workflow_control.resume_workflow_with_payload(state, confirmed_payload) 
-                    action_result_message = f"Workflow resumption with payload prepared. Status: {state.workflow_execution_status}."
-                else: 
-                    action_result_message = "Skipped resume_workflow: Missing or invalid confirmed_payload."
-                    state.next_step = "responder" 
-                results.append(action_result_message)
-            
-            elif action_name == "synthesize_final_answer":
-                synthesis_instr = action_params.get("synthesis_prompt_instructions", "Summarize actions and provide a final response."); all_prior_results_summary = "; ".join([str(r)[:150] for r in results])
-                final_synthesis_prompt = (f"User's original query: '{state.user_input}'.\nMy understanding of the query: '{state.scratchpad.get('user_query_understanding', 'N/A')}'.\nInternal actions taken and their results (summary): {all_prior_results_summary if all_prior_results_summary else 'No specific actions taken or results to summarize.'}\nAdditional instructions for synthesis: {synthesis_instr}\n\nBased on all the above, formulate a comprehensive and helpful final answer for the user in Markdown format.")
-                try: state.response = llm_call_helper(self.worker_llm, final_synthesis_prompt); action_result_message = "Final answer synthesized."
-                except Exception as e: logger.error(f"Error synthesizing final answer: {e}"); state.response = f"Sorry, I encountered an error while synthesizing the final answer: {str(e)[:100]}"; action_result_message = "Error during final answer synthesis."
-                results.append(action_result_message); state.next_step = "responder" 
-            
-            else: 
-                action_result_message = f"Unknown or unhandled action: {action_name}."
-                logger.warning(action_result_message); results.append(action_result_message)
-                state.next_step = "interactive_query_executor" 
-        
-        except Exception as e_action: 
-            logger.error(f"Error executing action '{action_name}': {e_action}", exc_info=True)
-            action_result_message = f"Error during action '{action_name}': {str(e_action)[:100]}..."
-            results.append(action_result_message); state.response = action_result_message
-            state.next_step = "interactive_query_executor" 
-        
-        state.scratchpad['current_interactive_action_idx'] = idx + 1
-        state.scratchpad['current_interactive_results'] = results 
-        
-        if state.next_step == "interactive_query_executor": 
-            if state.scratchpad['current_interactive_action_idx'] >= len(plan): 
-                if action_name not in ["synthesize_final_answer", "answer_query_directly", "setup_workflow_execution_interactive", "resume_workflow_with_payload_interactive"]:
-                    logger.info(f"Interactive plan finished after action '{action_name}'. Finalizing with synthesis.")
-                    final_synthesis_instr = (f"The user's query was: '{state.user_input}'. My understanding was: '{state.scratchpad.get('user_query_understanding', 'N/A')}'. The following internal actions were taken with these results: {'; '.join([str(r)[:100] + '...' for r in results])}. Please formulate a comprehensive final answer to the user based on these actions and results.")
-                    try: state.response = llm_call_helper(self.worker_llm, final_synthesis_instr)
-                    except Exception as e_synth: logger.error(f"Error during final synthesis in interactive_query_executor: {e_synth}"); state.response = "Processed your request. " + (str(results[-1])[:100] if results else "")
-                state.next_step = "responder"
+        except Exception as e:
+            logger.error(
+                f"Error during graph refinement LLM call or processing (iter {iteration}): {e}",
+                exc_info=False,
+            )
+            self._queue_intermediate_message(
+                state, f"Error refining graph (iter {iteration}): {str(e)[:150]}..."
+            )
+            state.graph_regeneration_reason = (
+                state.graph_regeneration_reason
+                or f"Refinement LLM call/processing error (iter {iteration}): {str(e)[:100]}..."
+            )
+            if iteration < state.max_refinement_iterations:
+                state.next_step = "refine_api_graph" # Retry refinement
+            else:
+                logger.warning(
+                    "Max refinement iterations reached after exception. Describing graph or failing."
+                )
+                state.next_step = "describe_graph"
         return state
