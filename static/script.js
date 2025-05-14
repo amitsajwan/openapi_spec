@@ -1,6 +1,5 @@
 // static/script.js
 
-// Ensure this runs after the DOM is fully loaded
 document.addEventListener('DOMContentLoaded', () => {
     const specInput = document.getElementById('specInput');
     const specUrlInput = document.getElementById('specUrl');
@@ -16,6 +15,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const apiResponseContainer = document.getElementById('apiResponseContainer');
     const apiResponseContent = document.getElementById('apiResponseContent');
     const closeApiResponseButton = document.getElementById('closeApiResponse');
+    const runWorkflowButton = document.getElementById('runWorkflowButton'); // Added
 
     let ws;
     let isThinking = false; // Global state for thinking indicator
@@ -23,6 +23,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Function to show the thinking indicator
     function startThinking(message = "Processing...") {
+        if (isThinking) return; // Avoid multiple starts if already thinking
         isThinking = true;
         if (thinkingIndicatorText) thinkingIndicatorText.textContent = message;
         if (thinkingIndicatorContainer) {
@@ -31,36 +32,45 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         if (submitSpecButton) submitSpecButton.disabled = true;
         if (sendMessageButton) sendMessageButton.disabled = true;
-        // Optionally add a message to chat, but the indicator itself is primary
-        // addMessageToChat('status', message); 
+        if (runWorkflowButton) runWorkflowButton.disabled = true; // Disable run workflow button too
         console.log("UI: Thinking started - ", message);
     }
 
     // Function to hide the thinking indicator
     function stopThinking(message = "Done.") {
+        if (!isThinking) return; // Avoid multiple stops
         isThinking = false;
         if (thinkingIndicatorContainer) {
             thinkingIndicatorContainer.classList.add('opacity-0', 'pointer-events-none');
             thinkingIndicatorContainer.classList.remove('opacity-100');
         }
-        if (submitSpecButton) submitSpecButton.disabled = false;
-        if (sendMessageButton) sendMessageButton.disabled = false;
-        // Optionally add a status message to chat
-        // addMessageToChat('status', message);
+        // Re-enable buttons based on whether a spec is loaded or not
+        const specLoaded = currentGraph !== null; // Or some other indicator that a spec is active
+
+        if (submitSpecButton) submitSpecButton.disabled = false; // Always enable spec submission
+        if (sendMessageButton) sendMessageButton.disabled = !specLoaded; // Enable if spec loaded
+        if (runWorkflowButton) runWorkflowButton.disabled = !specLoaded; // Enable if spec loaded
+
         console.log("UI: Thinking stopped - ", message);
     }
     
     function connectWebSocket() {
-        // Determine WebSocket protocol (ws or wss)
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${wsProtocol}//${window.location.host}/ws/openai_spec_agent`;
+        // Assuming your WebSocket endpoint is /ws/openai_spec_agent/{some_session_id}
+        // For simplicity, using a fixed session_id or generating one client-side.
+        // In a real app, this might be user-specific and managed.
+        const sessionId = `client-${Date.now()}-${Math.random().toString(36).substring(2,7)}`;
+        const wsUrl = `${wsProtocol}//${window.location.host}/ws/openai_spec_agent/${sessionId}`;
         
         ws = new WebSocket(wsUrl);
 
         ws.onopen = function(event) {
-            console.log("WebSocket connection established.");
+            console.log("WebSocket connection established with session:", sessionId);
             addMessageToChat('status', "Connected to the agent.");
-            stopThinking("Connected."); // Ensure UI is reset on new connection
+            stopThinking("Connected."); 
+            // Initial button state
+            if (sendMessageButton) sendMessageButton.disabled = true; // Disabled until spec loaded
+            if (runWorkflowButton) runWorkflowButton.disabled = true; // Disabled until spec loaded
         };
 
         ws.onmessage = function(event) {
@@ -69,77 +79,83 @@ document.addEventListener('DOMContentLoaded', () => {
                 console.log("WebSocket message received:", parsed_event_data);
                 
                 const messageType = parsed_event_data.type;
-                const data = parsed_event_data.data || {}; // Ensure data object exists
+                const data = parsed_event_data.data || {};
 
                 switch (messageType) {
-                    case 'status_update':
-                        if (data.event === 'thinking_started') {
-                            startThinking(data.message || "Processing...");
-                        } else if (data.event === 'thinking_finished') {
-                            stopThinking(data.message || "Processing finished.");
-                        } else {
-                             addMessageToChat('status', `Status: ${data.event} - ${data.message || ''}`);
-                        }
+                    case 'status_update': // General status updates, not for thinking
+                        addMessageToChat('status', `Status: ${data.event} - ${data.message || ''}`);
                         break;
                     case 'intermediate_message':
                         addMessageToChat(data.source || 'assistant', data.message);
                         if (isThinking && data.message && thinkingIndicatorText) {
-                            // Update thinking indicator text with the latest intermediate message
-                            thinkingIndicatorText.textContent = data.message.length > 50 ? data.message.substring(0, 47) + "..." : data.message;
+                            thinkingIndicatorText.textContent = data.message.length > 70 ? data.message.substring(0, 67) + "..." : data.message;
                         }
                         break;
                     case 'graph_update':
                         if (data.graph) {
-                            currentGraph = data.graph; // Store the graph data
+                            currentGraph = data.graph; 
                             renderGraph(currentGraph);
                             addMessageToChat('status', "Workflow graph updated.");
+                            if (sendMessageButton) sendMessageButton.disabled = false; // Enable interaction
+                            if (runWorkflowButton) runWorkflowButton.disabled = false; // Enable run workflow
                         }
                         break;
                     case 'api_response':
                         displayApiResponse(data);
-                        // Typically, an api_response might come after "thinking" has finished for that specific call.
-                        // If it's part of a larger flow, the overall "thinking" might still be active.
+                        // This might be an intermediate step, so don't stop thinking unless it's the *final* part of a flow.
+                        // For now, assuming `final_response` marks the true end.
                         break;
                     case 'final_response':
                         addMessageToChat('assistant', data.message);
-                        if (data.result) { // Example: if final response has structured result
-                            // You might want to display this structured result differently
+                        if (data.graph) { // If final response also includes the graph
+                            currentGraph = data.graph;
+                            renderGraph(currentGraph);
+                        }
+                        if (data.result) { 
                             console.log("Final result data:", data.result);
                         }
-                        stopThinking(data.message || "Task complete."); // Ensure thinking stops
+                        stopThinking(data.message || "Task complete.");
+                        if (currentGraph && sendMessageButton) sendMessageButton.disabled = false;
+                        if (currentGraph && runWorkflowButton) runWorkflowButton.disabled = false;
                         break;
                     case 'error':
                         addMessageToChat('error', `Error: ${data.message}`);
                         stopThinking("An error occurred."); // Stop thinking on error
+                        // Buttons remain enabled to allow user to try again or submit new spec
+                        if (submitSpecButton) submitSpecButton.disabled = false;
+                        if (sendMessageButton) sendMessageButton.disabled = (currentGraph === null);
+                        if (runWorkflowButton) runWorkflowButton.disabled = (currentGraph === null);
                         break;
                     default:
-                        addMessageToChat('unknown', `Received: ${event.data}`);
+                        addMessageToChat('unknown', `Received unhandled message type '${messageType}': ${event.data.substring(0,100)}...`);
                 }
             } catch (e) {
-                console.error("Error processing WebSocket message:", e);
+                console.error("Error processing WebSocket message:", e, "Raw data:", event.data);
                 addMessageToChat('error', "Received an unparseable message from server.");
+                stopThinking("Error processing server message."); // Stop thinking if message parsing fails
             }
         };
 
         ws.onclose = function(event) {
-            console.log("WebSocket connection closed.", event.reason);
+            console.log("WebSocket connection closed.", event.reason, "Code:", event.code);
             addMessageToChat('status', "Connection closed. Attempting to reconnect in 5 seconds...");
-            stopThinking("Connection lost."); // Reset UI
-            setTimeout(connectWebSocket, 5000); // Attempt to reconnect
+            stopThinking("Connection lost."); 
+            isThinking = false; // Ensure isThinking is false
+            setTimeout(connectWebSocket, 5000); 
         };
 
         ws.onerror = function(error) {
             console.error("WebSocket error:", error);
-            addMessageToChat('error', "WebSocket connection error.");
-            // onclose will usually be called after onerror, so reconnection logic is there.
-            // stopThinking() will also be called by onclose.
+            addMessageToChat('error', "WebSocket connection error. Check console for details.");
+            // onclose will usually be called after onerror.
+            // stopThinking() will be called by onclose.
         };
     }
 
     function addMessageToChat(source, message, type = 'text') {
         if (!chatMessages) return;
         const messageElement = document.createElement('div');
-        messageElement.classList.add('mb-2', 'p-3', 'rounded-lg', 'max-w-2xl', 'break-words', 'text-sm');
+        messageElement.classList.add('mb-2', 'p-3', 'rounded-lg', 'max-w-2xl', 'break-words', 'text-sm', 'shadow-sm');
 
         let sourcePrefix = "";
         if (source === 'user') {
@@ -149,29 +165,35 @@ document.addEventListener('DOMContentLoaded', () => {
             messageElement.classList.add('bg-gray-200', 'text-gray-800', 'self-start', 'mr-auto');
             sourcePrefix = '<strong class="font-semibold">Agent:</strong> ';
         } else if (source === 'status') {
-            messageElement.classList.add('bg-yellow-100', 'text-yellow-700', 'self-center', 'text-xs', 'italic');
+            messageElement.classList.add('bg-yellow-100', 'text-yellow-800', 'self-center', 'text-xs', 'italic', 'text-center', 'py-1', 'px-2');
         } else if (source === 'error') {
             messageElement.classList.add('bg-red-100', 'text-red-700', 'self-start', 'mr-auto', 'font-semibold');
             sourcePrefix = '<strong class="font-semibold">Error:</strong> ';
-        } else { // unknown or system
-            messageElement.classList.add('bg-gray-50', 'text-gray-500', 'self-center', 'text-xs');
+        } else { 
+            messageElement.classList.add('bg-gray-50', 'text-gray-500', 'self-center', 'text-xs', 'italic', 'text-center', 'py-1', 'px-2');
         }
         
-        // Sanitize message before setting innerHTML if it can contain user-generated HTML
-        // For now, assuming messages are text or controlled HTML from backend
-        messageElement.innerHTML = sourcePrefix + message; 
+        // Basic sanitization to prevent HTML injection if message comes from untrusted source
+        const tempDiv = document.createElement('div');
+        tempDiv.textContent = message;
+        messageElement.innerHTML = sourcePrefix + tempDiv.innerHTML.replace(/\n/g, '<br>'); 
+        
         chatMessages.appendChild(messageElement);
-        chatMessages.scrollTop = chatMessages.scrollHeight; // Auto-scroll
+        chatMessages.scrollTop = chatMessages.scrollHeight; 
     }
 
     function sendWebSocketMessage(type, payload) {
         if (ws && ws.readyState === WebSocket.OPEN) {
+            // Start thinking indicator *before* sending the message
+            startThinking("Sending request..."); // Generic message, backend can update via intermediate_message
+            
             const message = JSON.stringify({ type: type, ...payload });
             ws.send(message);
             console.log("Sent to WS:", message);
         } else {
             addMessageToChat('error', "WebSocket is not connected. Cannot send message.");
             console.error("WebSocket is not connected.");
+            stopThinking("Connection error."); // Stop thinking if WS is not open
         }
     }
 
@@ -181,34 +203,38 @@ document.addEventListener('DOMContentLoaded', () => {
             const url = specUrlInput.value.trim();
             const file = specFileInput.files[0];
             let source = 'text';
+            let userMessage = "";
 
             if (file) {
                 const reader = new FileReader();
                 reader.onload = function(e) {
                     specData = e.target.result;
                     source = 'file';
-                    addMessageToChat('user', `Submitted OpenAPI Spec from file: ${file.name}`);
+                    userMessage = `Submitted OpenAPI Spec from file: ${file.name}`;
+                    addMessageToChat('user', userMessage);
                     sendWebSocketMessage('process_openapi_spec', { openapi_spec_string: specData, source: source, file_name: file.name });
                 };
                 reader.onerror = function(e) {
                     addMessageToChat('error', 'Error reading file.');
                     console.error("File reading error:", e);
+                    stopThinking("File error."); // Stop thinking if file read fails
                 };
                 reader.readAsText(file);
             } else if (url) {
-                specData = url; // The backend will fetch the URL
+                specData = url; 
                 source = 'url';
-                addMessageToChat('user', `Submitted OpenAPI Spec from URL: ${url}`);
+                userMessage = `Submitted OpenAPI Spec from URL: ${url}`;
+                addMessageToChat('user', userMessage);
                 sendWebSocketMessage('process_openapi_spec', { openapi_spec_url: specData, source: source });
             } else if (specData) {
                 source = 'text';
-                addMessageToChat('user', `Submitted OpenAPI Spec (text input)`);
+                userMessage = `Submitted OpenAPI Spec (text input)`;
+                addMessageToChat('user', userMessage);
                 sendWebSocketMessage('process_openapi_spec', { openapi_spec_string: specData, source: source });
             } else {
                 addMessageToChat('error', 'Please provide an OpenAPI spec (text, URL, or file).');
-                return;
+                return; // Don't send if no data
             }
-            // "Thinking" will be started by the backend's response.
         });
     }
 
@@ -217,7 +243,8 @@ document.addEventListener('DOMContentLoaded', () => {
             const messageText = userInput.value.trim();
             if (messageText) {
                 addMessageToChat('user', messageText);
-                sendWebSocketMessage('user_interaction', { text: messageText, current_graph: currentGraph });
+                // Pass current_graph if your backend needs it for context with user interactions
+                sendWebSocketMessage('user_interaction', { text: messageText, current_graph: currentGraph ? currentGraph.elements : null });
                 userInput.value = '';
             }
         });
@@ -226,7 +253,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (userInput) {
         userInput.addEventListener('keypress', function(event) {
             if (event.key === 'Enter' && !event.shiftKey) {
-                event.preventDefault(); // Prevent new line
+                event.preventDefault(); 
                 sendMessageButton.click();
             }
         });
@@ -235,10 +262,12 @@ document.addEventListener('DOMContentLoaded', () => {
     if (clearChatButton) {
         clearChatButton.addEventListener('click', () => {
             if (chatMessages) chatMessages.innerHTML = '';
-            if (graphContainer) graphContainer.innerHTML = ''; // Also clear graph
+            if (graphContainer) graphContainer.innerHTML = ''; 
             currentGraph = null;
             if (apiResponseContainer) apiResponseContainer.classList.add('hidden');
             addMessageToChat('status', 'Chat and graph cleared.');
+            if (sendMessageButton) sendMessageButton.disabled = true; // Disable until new spec loaded
+            if (runWorkflowButton) runWorkflowButton.disabled = true; // Disable until new spec loaded
         });
     }
     
@@ -247,6 +276,20 @@ document.addEventListener('DOMContentLoaded', () => {
             if (apiResponseContainer) apiResponseContainer.classList.add('hidden');
         });
     }
+    
+    // Placeholder for runCurrentWorkflow if you have a button for it
+    if (runWorkflowButton) { // Check if the button exists
+        window.runCurrentWorkflow = function() { // Make it global for onclick or add event listener
+            if (!currentGraph) {
+                addMessageToChat('error', "No workflow graph is loaded to run.");
+                return;
+            }
+            addMessageToChat('user', "Attempting to run the current workflow...");
+            // This message type 'run_workflow' needs to be handled by your backend
+            sendWebSocketMessage('run_workflow', { graph: currentGraph.elements, goal: currentGraph.goal || "Execute the current plan." });
+        };
+    }
+
 
     function displayApiResponse(data) {
         if (!apiResponseContainer || !apiResponseContent) return;
@@ -262,11 +305,9 @@ document.addEventListener('DOMContentLoaded', () => {
             contentHtml += '<p class="text-sm mt-2 mb-1"><span class="font-semibold">Body:</span></p>';
             let bodyContent = data.body;
             try {
-                // Try to parse if it's a JSON string, then re-stringify for pretty print
                 const parsedBody = JSON.parse(bodyContent);
                 bodyContent = JSON.stringify(parsedBody, null, 2);
             } catch (e) {
-                // Not a JSON string, or already an object. Or just plain text.
                 if (typeof bodyContent === 'object') {
                     bodyContent = JSON.stringify(bodyContent, null, 2);
                 }
@@ -280,11 +321,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function escapeHtml(unsafe) {
         if (typeof unsafe !== 'string') {
-            // If it's not a string (e.g., already an object from JSON.parse), stringify it
             try {
                 unsafe = JSON.stringify(unsafe, null, 2);
             } catch (e) {
-                return ''; // Or some error placeholder
+                return ''; 
             }
         }
         return unsafe
@@ -301,67 +341,84 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!cytoscape) addMessageToChat('error', "Cytoscape library not loaded. Cannot render graph.");
             return;
         }
-        graphContainer.innerHTML = ''; // Clear previous graph
+        graphContainer.innerHTML = ''; 
 
         try {
+            // Ensure graphData.elements exists and is an array or object
+            let elementsToRender = graphData.elements;
+            if (!elementsToRender) {
+                if (graphData.nodes && graphData.edges) { // Handle if elements is nested
+                    elementsToRender = { nodes: graphData.nodes, edges: graphData.edges };
+                } else {
+                    console.warn("Graph data.elements is missing or in unexpected format. Attempting to use graphData directly.", graphData);
+                    elementsToRender = graphData; // Fallback, might not work if format is wrong
+                }
+            }
+
+
             const cy = cytoscape({
                 container: graphContainer,
-                elements: graphData.elements,
+                elements: elementsToRender,
                 style: [
                     {
                         selector: 'node',
                         style: {
-                            'background-color': (ele) => ele.data('type') === 'llm_call' ? '#FF69B4' : (ele.data('type') === 'api_call' ? '#1E90FF' : (ele.data('type') === 'user_input' ? '#FFD700' : (ele.data('type') === 'knowledge_base' ? '#32CD32' : '#666'))),
+                            'background-color': (ele) => {
+                                const type = ele.data('type');
+                                if (type === 'llm_call') return '#FF69B4'; // Pink
+                                if (type === 'api_call') return '#1E90FF'; // DodgerBlue
+                                if (type === 'user_input') return '#FFD700'; // Gold
+                                if (type === 'knowledge_base') return '#32CD32'; // LimeGreen
+                                if (type === 'start_node') return '#90EE90'; // LightGreen
+                                if (type === 'end_node') return '#FA8072'; // Salmon
+                                return '#666'; // Default
+                            },
                             'label': 'data(label)',
                             'width': 'label',
                             'height': 'label',
-                            'padding': '12px', // Increased padding
+                            'padding': '12px', 
                             'text-valign': 'center',
                             'text-halign': 'center',
-                            'shape': 'round-rectangle', // More modern shape
-                            'font-size': '10px', // Smaller font for fitting more text
-                            'color': '#fff', // White text for better contrast on dark backgrounds
-                            'text-outline-width': 1, // Thin outline for text
-                            'text-outline-color': '#333', // Dark outline
+                            'shape': 'round-rectangle', 
+                            'font-size': '10px', 
+                            'color': '#fff', 
+                            'text-outline-width': 1, 
+                            'text-outline-color': '#333', 
                             'border-width': 2,
-                            'border-color': '#4A5568' // Darker border
+                            'border-color': '#4A5568' 
                         }
                     },
                     {
                         selector: 'edge',
                         style: {
                             'width': 2,
-                            'line-color': '#9CA3AF', // Softer edge color
+                            'line-color': '#9CA3AF', 
                             'target-arrow-color': '#9CA3AF',
                             'target-arrow-shape': 'triangle',
-                            'curve-style': 'bezier', // Smoother curves
-                            'label': 'data(label)', // Edge labels if provided
+                            'curve-style': 'bezier', 
+                            'label': 'data(label)', 
                             'font-size': '8px',
                             'color': '#4A5568',
                             'text-rotation': 'autorotate',
                             'text-margin-y': -10
                         }
                     },
-                    { // Style for selected nodes
+                    { 
                         selector: 'node:selected',
                         style: {
                             'border-width': 3,
-                            'border-color': '#F59E0B' // Amber color for selection
+                            'border-color': '#F59E0B' 
                         }
                     }
                 ],
                 layout: {
-                    name: 'dagre', // Directed graph layout
-                    rankDir: 'TB', // Top-to-Bottom
-                    spacingFactor: 1.2,
-                    padding: 20
+                    name: 'dagre', 
+                    rankDir: 'TB', 
+                    spacingFactor: 1.3, // Increased spacing slightly
+                    padding: 30 // Increased padding
                 }
             });
 
-            // Pan and zoom controls (optional, if you want to add cytoscape.js-panzoom)
-            // cy.panzoom({}); 
-
-            // Tooltip for nodes
             cy.nodes().forEach(node => {
                 let content = `<strong>ID:</strong> ${node.id()}<br/><strong>Type:</strong> ${node.data('type') || 'N/A'}`;
                 if (node.data('description')) {
@@ -370,53 +427,39 @@ document.addEventListener('DOMContentLoaded', () => {
                 if(node.data('status')) {
                     content += `<br/><strong>Status:</strong> ${node.data('status')}`;
                 }
-                // Create a tippy instance for each node
-                // Ensure Tippy.js is loaded for this to work
+                
                 if (typeof tippy === 'function') {
-                    tippy(node.popperRef(), {
+                    const tippyInstance = tippy(node.popperRef(), {
                         content: content,
-                        trigger: 'manual', // We'll show/hide manually or on hover
+                        trigger: 'manual', 
                         allowHTML: true,
                         placement: 'top',
                         arrow: true,
-                        interactive: true, // Allows clicking links in tooltip
-                        theme: 'light-border', // Or your custom theme
-                        onShow(instance) {
-                            // You can add custom logic when tooltip shows
-                        },
-                    }).show(); // Show by default, or use mouseover/mouseout
+                        interactive: true, 
+                        theme: 'light-border', 
+                    });
+                    node.scratch('tippy', tippyInstance); // Store for later use
                     
-                    // Example: Show on mouseover, hide on mouseout
-                    let tip = node.scratch().tippy; // Get the tippy instance if stored
-                    if (!tip && typeof tippy === 'function') {
-                         tip = tippy(node.popperRef(), { /* ... options ... */ });
-                         node.scratch().tippy = tip; // Store it
-                    }
-                    
-                    node.on('mouseover', (event) => event.target.scratch().tippy && event.target.scratch().tippy.show());
-                    node.on('mouseout', (event) => event.target.scratch().tippy && event.target.scratch().tippy.hide());
+                    node.on('mouseover', (event) => event.target.scratch('tippy') && event.target.scratch('tippy').show());
+                    node.on('mouseout', (event) => event.target.scratch('tippy') && event.target.scratch('tippy').hide());
                     node.on('tap', function(event) {
-                        // Handle node click, e.g., show details in a side panel
                         console.log('Clicked node:', event.target.data());
                         addMessageToChat('status', `Node clicked: ${event.target.data('label') || event.target.id()}`);
-                        // You could also send this node's data to the backend for more actions
-                        // sendWebSocketMessage('node_interaction', { node_id: event.target.id(), node_data: event.target.data() });
                     });
 
-                } else {
+                } else if (!window.tippyWarningShown) {
                     console.warn("Tippy.js not loaded, tooltips will not be available for graph nodes.");
+                    window.tippyWarningShown = true; // Show warning only once
                 }
             });
-             // Fit graph to view with padding
-            cy.fit(null, 30); // 30px padding
+            cy.fit(null, 30); 
 
         } catch (e) {
-            console.error("Error rendering graph:", e);
-            addMessageToChat('error', "Failed to render workflow graph.");
-            if (graphContainer) graphContainer.innerHTML = '<p class="text-red-500">Error rendering graph. Check console.</p>';
+            console.error("Error rendering graph:", e, "Graph data used:", graphData);
+            addMessageToChat('error', "Failed to render workflow graph. Check console.");
+            if (graphContainer) graphContainer.innerHTML = '<p class="text-red-500 p-4">Error rendering graph. Please check the console for details.</p>';
         }
     }
     
-    // Initial connection
     connectWebSocket();
 });
