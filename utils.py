@@ -1,208 +1,148 @@
 # utils.py
-import hashlib
-import json
 import logging
-import os
-from typing import Any, Dict, List, Optional, Tuple, Type
-from pydantic import BaseModel, ValidationError
-import diskcache
-
-# Attempt to import from models.py, with fallbacks for standalone use/linting
-try:
-    from models import GraphOutput, Node, Edge # BaseModel is implicitly imported by Pydantic models
-except ImportError:
-    logging.warning("utils.py: Could not import full models from models.py. Using dummy classes for basic type hinting.")
-    # Basic dummy classes if models.py isn't found (primarily for linting)
-    class BaseModel:
-        @classmethod
-        def model_validate(cls, data): return data
-        def model_dump_json(self, indent=None): return json.dumps(self.__dict__, indent=indent if indent else 2)
-
-    class GraphOutput(BaseModel): pass
-    class Node(BaseModel):
-        @property
-        def effective_id(self) -> str: return getattr(self, 'display_name', None) or getattr(self, 'operationId', 'unknown_node')
-    class Edge(BaseModel): pass
-
+import json
+import yaml # Keep yaml import if used elsewhere or for future use
+import re
+from typing import Any, Dict, Optional
+from langchain_core.language_models.base import BaseLanguageModel # For type hinting
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage # For type hinting
 
 logger = logging.getLogger(__name__)
 
-# --- Persistent Caching Setup ---
-CACHE_DIR = os.path.join(os.getcwd(), ".openapi_cache")
-SCHEMA_CACHE: Optional[diskcache.Cache] = None
-try:
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    SCHEMA_CACHE = diskcache.Cache(CACHE_DIR)
-    logger.info(f"Initialized schema cache at: {CACHE_DIR}")
-except Exception as e:
-    logger.error(f"Failed to initialize disk cache at {CACHE_DIR}: {e}. Caching disabled.", exc_info=True)
+# --- LLM Call Helper ---
+def llm_call_helper(llm: BaseLanguageModel, prompt: str, system_prompt: Optional[str] = None) -> str:
+    """
+    Helper function to make a call to an LLM and return the string content.
+    Includes basic error handling.
+    """
+    messages = []
+    if system_prompt:
+        messages.append(SystemMessage(content=system_prompt))
+    messages.append(HumanMessage(content=prompt))
+    
+    try:
+        response = llm.invoke(messages)
+        if isinstance(response, AIMessage):
+            return response.content
+        elif isinstance(response, str): # Some LLMs might return str directly
+            return response
+        else:
+            logger.error(f"LLM call returned unexpected type: {type(response)}. Content: {str(response)[:200]}")
+            raise ValueError(f"LLM response was not an AIMessage or string: {type(response)}")
+    except Exception as e:
+        logger.error(f"Error during LLM call: {e}", exc_info=True)
+        # Depending on policy, you might re-raise, return a default, or handle specific errors
+        raise # Re-raise the exception to be handled by the caller
+
+
+# --- LLM Output Fence Stripping Utility ---
+def strip_llm_json_output_fences(llm_output_str: str) -> str:
+    """
+    Strips markdown code block fences (e.g., ```json ... ``` or ``` ... ```)
+    from a string, typically an LLM output expected to be JSON.
+    It handles optional language specifiers like 'json'.
+    Iteratively strips to handle potential nested or repeated fences.
+    """
+    if not isinstance(llm_output_str, str):
+        logger.warning(f"strip_llm_json_output_fences received non-string input type: {type(llm_output_str)}. Returning as is.")
+        return llm_output_str # Or raise TypeError
+
+    current_text = llm_output_str.strip()
+    previous_text = None
+    
+    # Regex to find markdown code blocks, capturing the content inside.
+    # It matches ``` optionally followed by a language (e.g., json, yaml), then content, then ```.
+    # Ensures it matches the outermost pair for each iteration.
+    # Language specifier allows letters, numbers, underscore, plus, hyphen.
+    # Using re.IGNORECASE for the language specifier (e.g. ```JSON is same as ```json)
+    regex_pattern = r"^\s*```(?:[a-zA-Z0-9_+\-]+)?\s*([\s\S]*?)\s*```\s*$"
+
+    while current_text and current_text != previous_text:
+        previous_text = current_text
+        match = re.match(regex_pattern, current_text, re.DOTALL | re.IGNORECASE)
+        if match:
+            current_text = match.group(1).strip() # Get the content and strip it
+        else:
+            # Fallback for simpler cases or malformed fences not caught by the main regex.
+            # This handles cases like just ``` at the start or end without full block structure,
+            # or if the content itself starts/ends with ``` after a previous strip.
+            lines = current_text.splitlines()
+            stripped_leading = False
+            if lines and lines[0].strip().lower().startswith("```"): # Check for ```json, ```yaml etc.
+                # More robustly remove the first line if it's a fence start
+                first_line_content = lines[0].strip()
+                if re.match(r"```(?:[a-zA-Z0-9_+\-]+)?\s*$", first_line_content, re.IGNORECASE):
+                    lines.pop(0)
+                    stripped_leading = True
+            
+            stripped_trailing = False
+            if lines and lines[-1].strip() == "```":
+                lines.pop(-1)
+                stripped_trailing = True
+            
+            if stripped_leading or stripped_trailing:
+                current_text = "\n".join(lines).strip()
+            else:
+                # No standard markdown block found by regex, and no simple leading/trailing ``` lines removed.
+                break # Exit loop as no changes were made in this iteration.
+    
+    # Final check: if the result is still wrapped in quotes (e.g. LLM returns '"{\\"key\\": \\"value\\"}"')
+    # This can happen if the LLM tries to escape a JSON string within a string.
+    if len(current_text) >= 2 and current_text.startswith('"') and current_text.endswith('"'):
+        try:
+            # Attempt to parse the inner string as JSON. If successful, it means the outer quotes were extraneous.
+            # E.g. "\"{\\\"key\\\": \\\"value\\\"}\"" -> "{\"key\": \"value\"}"
+            potential_json_inner = json.loads(current_text)
+            if isinstance(potential_json_inner, str): # If un-quoting resulted in another string that is valid JSON
+                 current_text = potential_json_inner
+        except json.JSONDecodeError:
+            pass # Not a double-quoted JSON string, leave as is.
+
+
+    return current_text
+
+
+# --- Schema Caching (Example, adjust as needed) ---
+SCHEMA_CACHE: Optional[Any] = None # Placeholder for a cache object (e.g., from cachetools)
+# Example using a simple dict for non-persistent cache if cachetools is not available
+# SCHEMA_CACHE = {} 
+
+def initialize_schema_cache(maxsize=10, ttl=3600):
+    """Initializes the schema cache if cachetools is available."""
+    global SCHEMA_CACHE
+    try:
+        from cachetools import TTLCache
+        SCHEMA_CACHE = TTLCache(maxsize=maxsize, ttl=ttl)
+        logger.info(f"Schema cache initialized with TTLCache (maxsize={maxsize}, ttl={ttl}).")
+    except ImportError:
+        SCHEMA_CACHE = {} # Fallback to simple dict if cachetools not installed
+        logger.warning("cachetools library not found. Using a simple dictionary for schema caching (non-persistent, no TTL).")
 
 def get_cache_key(spec_text: str) -> str:
-    """Generates a SHA256 cache key for the spec text."""
+    """Generates a cache key from the spec text (e.g., using a hash)."""
+    import hashlib
     return hashlib.sha256(spec_text.encode('utf-8')).hexdigest()
 
 def load_cached_schema(cache_key: str) -> Optional[Dict[str, Any]]:
-    """Loads a parsed schema from cache."""
-    if SCHEMA_CACHE is None: return None
-    try:
-        schema = SCHEMA_CACHE.get(cache_key)
-        if schema:
-            logger.debug(f"Cache hit for key: {cache_key}")
-            return schema
-        return None
-    except Exception as e:
-        logger.error(f"Error loading schema from cache (key: {cache_key}): {e}", exc_info=True)
-        return None
+    """Loads a schema from the cache."""
+    if SCHEMA_CACHE is not None:
+        try:
+            cached_data = SCHEMA_CACHE.get(cache_key)
+            if cached_data:
+                logger.info(f"Schema found in cache for key: {cache_key[:10]}...")
+                return cached_data
+        except Exception as e: # Handle potential errors with cache interaction
+            logger.warning(f"Error accessing schema cache for loading: {e}")
+    return None
 
-def save_schema_to_cache(cache_key: str, schema: Dict[str, Any]):
-    """Saves a parsed schema to cache."""
-    if SCHEMA_CACHE is None: return
-    try:
-        SCHEMA_CACHE.set(cache_key, schema)
-        logger.debug(f"Saved schema to cache with key: {cache_key}")
-    except Exception as e:
-        logger.error(f"Error saving schema to cache (key: {cache_key}): {e}", exc_info=True)
+def save_schema_to_cache(cache_key: str, schema_data: Dict[str, Any]):
+    """Saves a schema to the cache."""
+    if SCHEMA_CACHE is not None:
+        try:
+            SCHEMA_CACHE[cache_key] = schema_data
+            logger.info(f"Schema saved to cache with key: {cache_key[:10]}...")
+        except Exception as e: # Handle potential errors with cache interaction
+            logger.warning(f"Error accessing schema cache for saving: {e}")
 
-# --- Graph Utilities ---
-def check_for_cycles(graph: GraphOutput) -> Tuple[bool, str]:
-    """Checks if the graph is a DAG. Returns (is_dag, message)."""
-    if not isinstance(graph, GraphOutput) or not isinstance(graph.nodes, list):
-        return False, "Invalid graph structure."
-
-    adj: Dict[str, List[str]] = {node.effective_id: [] for node in graph.nodes if isinstance(node, Node)}
-    node_ids = set(adj.keys())
-
-    if not node_ids:
-        return True, "Graph has no valid nodes."
-
-    if not isinstance(graph.edges, list):
-        return False, "Invalid graph edges structure."
-
-    for edge in graph.edges:
-        if isinstance(edge, Edge) and edge.from_node in adj and edge.to_node in node_ids:
-            if edge.to_node not in adj[edge.from_node]: # Avoid duplicates if input has them
-                 adj[edge.from_node].append(edge.to_node)
-        else:
-            logger.warning(f"Skipping invalid edge in cycle check: {getattr(edge, 'from_node', 'N/A')}->{getattr(edge, 'to_node', 'N/A')}")
-
-
-    visited: Dict[str, int] = {node_id: 0 for node_id in node_ids} # 0: unvisited, 1: visiting, 2: visited
-    path: List[str] = []
-
-    def has_cycle_util(node_id: str) -> bool:
-        visited[node_id] = 1 # Mark as visiting
-        path.append(node_id)
-
-        for neighbor_id in adj.get(node_id, []):
-            if visited[neighbor_id] == 1: # Cycle detected
-                # Construct cycle path for message
-                try:
-                    cycle_start_index = path.index(neighbor_id)
-                    nonlocal cycle_message_detail
-                    cycle_message_detail = " -> ".join(path[cycle_start_index:] + [neighbor_id])
-                except ValueError:
-                    cycle_message_detail = f"Involving {neighbor_id} and {node_id}"
-                return True
-            if visited[neighbor_id] == 0:
-                if has_cycle_util(neighbor_id):
-                    return True
-        
-        visited[node_id] = 2 # Mark as visited
-        path.pop()
-        return False
-
-    cycle_message_detail = ""
-    for node_id in node_ids:
-        if visited[node_id] == 0:
-            if has_cycle_util(node_id):
-                return False, f"Cycle detected: {cycle_message_detail}"
-    return True, "No cycles detected."
-
-
-# --- LLM Call Helper ---
-def llm_call_helper(llm: Any, prompt: Any, attempt: int = 1, max_attempts: int = 2) -> str:
-    """Helper for LLM calls with logging and basic error handling."""
-    prompt_repr = str(prompt)[:500] + '...' if len(str(prompt)) > 500 else str(prompt)
-    logger.debug(f"LLM call (Attempt {attempt}/{max_attempts}) Prompt: {prompt_repr}")
-    try:
-        response_obj = llm.invoke(prompt)
-        content = ""
-        if hasattr(response_obj, 'content'):
-            content = response_obj.content
-        elif isinstance(response_obj, str):
-            content = response_obj
-        else:
-            logger.warning(f"LLM response object type ({type(response_obj)}) has no 'content' and is not str. Trying str().")
-            content = str(response_obj)
-        
-        if not isinstance(content, str):
-            logger.warning(f"LLM content is not a string ({type(content)}). Converting to string.")
-            content = str(content)
-
-        logger.debug(f"LLM call successful. Response: {content[:500]}...")
-        return content
-    except Exception as e:
-        logger.error(f"LLM call failed (Attempt {attempt}/{max_attempts}): {e}", exc_info=True)
-        if attempt < max_attempts:
-            logger.info(f"Retrying LLM call for: {prompt_repr.splitlines()[0] if isinstance(prompt_repr, str) else 'Structured Prompt'}")
-            # Consider adding a small delay before retrying if appropriate
-            return llm_call_helper(llm, prompt, attempt + 1, max_attempts)
-        raise # Re-raise after max attempts
-
-# --- JSON Parsing Helper ---
-def parse_llm_json_output_with_model(llm_output: str, expected_model: Optional[Type[BaseModel]] = None) -> Any:
-    """
-    Parses JSON output from LLM string, handles markdown, and optional Pydantic validation.
-    Returns parsed data (dict, list, or Pydantic model instance), or None on failure.
-    """
-    if not isinstance(llm_output, str):
-        logger.error(f"Cannot parse non-string LLM output as JSON. Type: {type(llm_output)}")
-        return None
-
-    json_block = llm_output.strip()
-    logger.debug(f"Attempting to parse LLM JSON output (first 500 chars): {json_block[:500]}...")
-
-    # Extract from markdown code fences if present
-    if json_block.startswith("```"):
-        match = re.search(r"```(?:json|JSON)?\s*([\s\S]*?)\s*```", json_block, re.DOTALL)
-        if match:
-            json_block = match.group(1).strip()
-            logger.debug("Extracted JSON content from markdown fence.")
-        else: # Fallback for simple fence removal if regex fails
-            if json_block.startswith("```json"): json_block = json_block[7:]
-            elif json_block.startswith("```JSON"): json_block = json_block[7:]
-            elif json_block.startswith("```"): json_block = json_block[3:]
-            if json_block.endswith("```"): json_block = json_block[:-3]
-            json_block = json_block.strip()
-
-
-    try:
-        parsed_data = json.loads(json_block)
-        logger.debug("Successfully parsed JSON string.")
-
-        if expected_model and issubclass(expected_model, BaseModel) and hasattr(expected_model, 'model_validate'):
-            logger.debug(f"Validating parsed JSON against Pydantic model: {expected_model.__name__}")
-            try:
-                validated_data = expected_model.model_validate(parsed_data)
-                logger.debug("Pydantic validation successful.")
-                return validated_data
-            except ValidationError as ve:
-                logger.error(f"Pydantic validation failed for {expected_model.__name__}: {ve}")
-                logger.debug(f"Data that failed Pydantic validation: {parsed_data}")
-                return None # Validation failed
-        return parsed_data # No Pydantic validation requested or model was not suitable
-    except json.JSONDecodeError as jde:
-        # Try to find the problematic character and context
-        # jde.doc contains the full string, jde.pos is the character index
-        context_start = max(0, jde.pos - 30)
-        context_end = min(len(jde.doc), jde.pos + 30)
-        problem_snippet = jde.doc[context_start:context_end]
-        logger.error(f"JSON parsing failed: {jde.msg}. At char {jde.pos}. Snippet: '{problem_snippet}'")
-        logger.debug(f"Full text attempted for JSON parsing: {json_block}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error during JSON parsing/validation: {e}", exc_info=True)
-        return None
-
-# Ensure regex is imported if not already at the top
-import re
+# Initialize cache on module load (optional, or call explicitly in main.py startup)
+# initialize_schema_cache()
