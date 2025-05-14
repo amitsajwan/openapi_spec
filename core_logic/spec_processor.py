@@ -4,6 +4,7 @@ import logging
 from typing import Any, Dict, List, Optional, Callable
 import yaml
 import os
+import re # Import regex for more robust stripping
 
 from models import BotState, GraphOutput # GraphOutput for type hints
 from utils import (
@@ -53,11 +54,29 @@ class SpecProcessor:
             state.scratchpad["intermediate_messages"].append(msg)
         state.response = msg
 
+    def _strip_markdown_code_block(self, text: str) -> str:
+        """
+        Strips markdown code block delimiters (```language ... ``` or ``` ... ```)
+        from the beginning and end of a string.
+        """
+        # Regex to find markdown code blocks, capturing the content inside
+        # It handles optional language specifiers (like json, yaml)
+        # and ensures it matches the start and end of the string (after stripping whitespace)
+        stripped_text = text.strip()
+        match = re.match(r"^```(?:[a-zA-Z0-9]*)?\s*([\s\S]*?)\s*```$", stripped_text, re.DOTALL)
+        if match:
+            # If a match is found, return the captured group (the content inside)
+            return match.group(1).strip()
+        # If no markdown block is found, return the original stripped text
+        return stripped_text
+
+
     def _llm_cleanup_spec_text(self, spec_text: str, tool_name_for_log: str) -> str:
         """
         Uses an LLM to perform minor cleanup of the OpenAPI spec text.
         Focuses on correcting common syntax issues like unquoted strings or numbers
         where strings are expected (e.g., for descriptions, $refs, some keys).
+        Also strips markdown code blocks from the LLM's response.
         """
         logger.info(f"[{tool_name_for_log}] Attempting LLM-based cleanup of the spec text.")
         prompt = f"""
@@ -86,14 +105,16 @@ Original OpenAPI specification text:
 Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanations, apologies, or introductory/concluding remarks.
         """
         try:
-            # Assuming llm_call_helper returns the string content from the LLM
-            cleaned_spec_text_from_llm = llm_call_helper(self.worker_llm, prompt)
+            cleaned_spec_text_from_llm_raw = llm_call_helper(self.worker_llm, prompt)
             
-            if not isinstance(cleaned_spec_text_from_llm, str):
-                logger.warning(f"[{tool_name_for_log}] LLM cleanup did not return a string (got {type(cleaned_spec_text_from_llm)}). Using original spec text.")
+            if not isinstance(cleaned_spec_text_from_llm_raw, str):
+                logger.warning(f"[{tool_name_for_log}] LLM cleanup did not return a string (got {type(cleaned_spec_text_from_llm_raw)}). Using original spec text.")
                 return spec_text
 
-            cleaned_spec_text = cleaned_spec_text_from_llm.strip() # Remove leading/trailing whitespace
+            # Strip markdown code blocks if present
+            cleaned_spec_text_stripped_md = self._strip_markdown_code_block(cleaned_spec_text_from_llm_raw)
+            
+            cleaned_spec_text = cleaned_spec_text_stripped_md.strip() # Final strip of any surrounding whitespace
 
             # Basic check to see if LLM returned something reasonable
             if cleaned_spec_text and len(cleaned_spec_text) > 0.3 * len(spec_text): # Heuristic: not drastically shorter or empty
@@ -102,7 +123,7 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
                     logger.debug(f"[{tool_name_for_log}] Spec changed by LLM. Original (snippet):\n{spec_text[:300]}...\nCleaned (snippet):\n{cleaned_spec_text[:300]}...")
                 return cleaned_spec_text
             else:
-                logger.warning(f"[{tool_name_for_log}] LLM cleanup returned an unexpectedly short or empty response. Using original spec text.")
+                logger.warning(f"[{tool_name_for_log}] LLM cleanup returned an unexpectedly short or empty response (after stripping MD). Using original spec text.")
                 return spec_text
         except Exception as e:
             logger.error(f"[{tool_name_for_log}] Error during LLM cleanup: {e}. Using original spec text.", exc_info=True)
@@ -118,7 +139,7 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
             tool_name, "Attempting to preprocess, parse and validate (v3.x) OpenAPI spec."
         )
         
-        original_spec_text = state.openapi_spec_string # Keep a copy of the original input
+        original_spec_text = state.openapi_spec_string 
         
         logger.debug(f"[{tool_name}] Initial spec_text type: {type(original_spec_text)}")
         if isinstance(original_spec_text, str):
@@ -133,7 +154,7 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
             state.openapi_spec_string = None
             return state
         
-        if not isinstance(original_spec_text, str): # Should be caught above, but double check
+        if not isinstance(original_spec_text, str): 
             error_msg = f"Invalid type for OpenAPI specification: expected a string, but got {type(original_spec_text)}. Cannot proceed."
             logger.error(f"[{tool_name}] {error_msg}")
             self._queue_intermediate_message(state, error_msg)
@@ -142,7 +163,6 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
             state.next_step = "responder"
             return state
 
-        # --- LLM Pre-cleanup Step ---
         self._queue_intermediate_message(state, "Attempting minor cleanup of the specification using AI...")
         spec_text_to_parse = self._llm_cleanup_spec_text(original_spec_text, tool_name)
         
@@ -152,9 +172,7 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
         else:
             self._queue_intermediate_message(state, "No significant adjustments made by AI pre-cleanup, or cleanup was skipped/failed.")
             logger.info(f"[{tool_name}] Spec text remained unchanged after LLM pre-cleanup attempt.")
-        # --- End LLM Pre-cleanup Step ---
 
-        # Use the (potentially cleaned) spec_text_to_parse for caching and further processing
         cache_key = get_cache_key(spec_text_to_parse)
         cached_full_analysis_key = f"{cache_key}_full_analysis_v3_validated_or_parsed"
 
@@ -171,8 +189,8 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
                         state.execution_graph = GraphOutput.model_validate(graph_dict) if isinstance(graph_dict, dict) else graph_dict
                     
                     state.schema_cache_key = cache_key
-                    state.openapi_spec_text = spec_text_to_parse # Store the cleaned spec text
-                    state.openapi_spec_string = None # Clear the original raw string from state
+                    state.openapi_spec_text = spec_text_to_parse 
+                    state.openapi_spec_string = None 
                     logger.info(f"Loaded processed OpenAPI data and analysis from cache: {cached_full_analysis_key}")
                     self._queue_intermediate_message(state, "OpenAPI specification and derived analysis (v3 validated or parsed) loaded from cache.")
                     if state.execution_graph and isinstance(state.execution_graph, GraphOutput):
@@ -189,11 +207,12 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
         logger.debug(f"[{tool_name}] Attempting to parse spec_text (length: {len(spec_text_to_parse)}) as JSON/YAML after potential LLM cleanup.")
         try:
             cleaned_spec_text_for_parsing = spec_text_to_parse.strip()
+            # Try JSON first if it looks like it, otherwise YAML
             if cleaned_spec_text_for_parsing.startswith("{") and cleaned_spec_text_for_parsing.endswith("}"):
                 logger.debug(f"[{tool_name}] Trying to parse potentially cleaned spec as JSON.")
                 parsed_spec_dict = json.loads(cleaned_spec_text_for_parsing)
                 logger.debug(f"[{tool_name}] Successfully parsed potentially cleaned spec as JSON.")
-            else: # Assume YAML
+            else: 
                 logger.debug(f"[{tool_name}] Trying to parse potentially cleaned spec as YAML.")
                 parsed_spec_dict = yaml.safe_load(cleaned_spec_text_for_parsing)
                 logger.debug(f"[{tool_name}] Successfully parsed potentially cleaned spec as YAML.")
@@ -234,7 +253,7 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
         try:
             logger.debug(f"[{tool_name}] Detected OpenAPI version string: '{spec_version_str}', is_swagger_v2: {is_swagger_v2}")
             
-            if parsed_spec_dict is None: # Should not happen if previous checks passed
+            if parsed_spec_dict is None: 
                 raise ValueError("parsed_spec_dict became None before validation, this should not happen.")
 
             if spec_version_str.startswith("3.0"):
@@ -258,7 +277,7 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
 
             state.openapi_schema = parsed_spec_dict
             state.schema_cache_key = cache_key
-            state.openapi_spec_text = spec_text_to_parse # Store the cleaned and potentially validated spec
+            state.openapi_spec_text = spec_text_to_parse 
             state.openapi_spec_string = None
 
             if validation_performed and validation_successful:
@@ -271,7 +290,7 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
             state.openapi_schema = None; state.openapi_spec_string = None
             error_detail = str(val_e.message if hasattr(val_e, 'message') else val_e)
             if hasattr(val_e, 'instance') and hasattr(val_e, 'schema_path'):
-                 error_detail_path = "->".join(map(str, val_e.schema_path)) # type: ignore
+                 error_detail_path = "->".join(map(str, val_e.schema_path)) 
                  error_detail = f"Validation error at path '{error_detail_path}' for instance segment '{str(val_e.instance)[:100]}...': {val_e.message}"
             self._queue_intermediate_message(state, f"OpenAPI 3.x specification is invalid: {error_detail[:500]}")
             logger.error(f"[{tool_name}] OpenAPI 3.x Validation failed: {error_detail}", exc_info=False)
@@ -279,12 +298,10 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
         except TypeError as te: 
             type_error_arg = "unknown"
             try:
-                # Attempt to get the type that caused the error if possible
-                # This is highly dependent on the structure of the TypeError and its cause
                 if te.__cause__ and hasattr(te.__cause__, 'args') and te.__cause__.args:
                     type_error_arg = type(te.__cause__.args[0]).__name__
-            except: # pylint: disable=bare-except
-                pass # Best effort
+            except: 
+                pass 
 
             logger.error(f"[{tool_name}] TypeError during validation or processing: {te}", exc_info=True)
             logger.error(f"[{tool_name}] This often means an incorrect data type (e.g., got '{type_error_arg}') was encountered where a string or other type was expected. This could be due to an issue in the spec, an error in the LLM cleanup, or the validator library. Original spec snippet: {original_spec_text[:200]}... Cleaned spec snippet: {spec_text_to_parse[:200]}...")
