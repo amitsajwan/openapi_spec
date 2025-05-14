@@ -7,7 +7,7 @@ import os
 
 from models import BotState, GraphOutput # GraphOutput for type hints
 from utils import (
-    llm_call_helper,
+    llm_call_helper, # Assuming this can take a simple string prompt and return a string
     load_cached_schema,
     save_schema_to_cache,
     get_cache_key,
@@ -34,7 +34,7 @@ MAX_PAYLOAD_SAMPLES_TO_GENERATE_SINGLE_PASS = int(
 class SpecProcessor:
     """
     Handles parsing, validation (for OpenAPI 3.0.x, 3.1.x), and initial analysis
-    of OpenAPI specifications.
+    of OpenAPI specifications. Includes an LLM-based pre-cleanup step.
     """
 
     def __init__(self, worker_llm: Any):
@@ -53,49 +53,115 @@ class SpecProcessor:
             state.scratchpad["intermediate_messages"].append(msg)
         state.response = msg
 
+    def _llm_cleanup_spec_text(self, spec_text: str, tool_name_for_log: str) -> str:
+        """
+        Uses an LLM to perform minor cleanup of the OpenAPI spec text.
+        Focuses on correcting common syntax issues like unquoted strings or numbers
+        where strings are expected (e.g., for descriptions, $refs, some keys).
+        """
+        logger.info(f"[{tool_name_for_log}] Attempting LLM-based cleanup of the spec text.")
+        prompt = f"""
+The following text is an OpenAPI specification, potentially in JSON or YAML format.
+It might contain minor syntax errors, such as values that should be strings but are unquoted numbers or booleans
+(e.g., a `description: 123` instead of `description: "123"`, or a `$ref: 404` instead of `$ref: "#/components/schemas/ErrorModel"`).
+Another common issue is using an integer where a string is expected for a key or specific value.
+
+Your task is to:
+1.  Carefully review the specification.
+2.  Identify and correct ONLY minor syntax issues. Primarily focus on:
+    a.  Ensuring that textual fields (like `description`, `summary`, `title`, `operationId`, `version`, `format` for strings, `type` when it should be "string", "integer", "number", "boolean", "object", "array") have string values, correctly quoted if necessary in JSON or appropriately formatted in YAML.
+    b.  Ensuring `$ref` values are ALWAYS strings (e.g., `"$ref": "#/components/schemas/MyObject"`). If you see a numeric or boolean `$ref` value, it's an error; try to infer a plausible string path if the context is clear (like a component name), or at least convert it to a quoted string like `"$ref": "UNKNOWN_REF_WAS_NUMBER_123"` if unsure of the path.
+    c.  Ensuring all keys in mappings (objects/dictionaries) are strings. If you see numeric keys where string keys are expected (e.g., status codes in `responses` like `200` should be strings like `"200"` if they are not already), ensure they are strings.
+    d.  Correcting simple type mismatches, like a field `version: 1` that should be `version: "1.0"`.
+3.  The output MUST be a valid YAML or JSON representation of the specification. Prefer YAML for readability if the input format is ambiguous, otherwise try to match the input format.
+4.  Do NOT alter the semantic meaning or overall structure of the API specification. Only fix obvious, minor syntax and type errors.
+5.  If the input text appears to be largely correct or if you are unsure about a change that might alter semantics, return it as close to the original as possible but ensuring basic well-formedness (e.g., valid JSON/YAML).
+6.  Pay special attention to values that are clearly meant to be identifiers or paths (like those in `$ref`) and ensure they are strings.
+
+Original OpenAPI specification text:
+```
+{spec_text}
+```
+
+Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanations, apologies, or introductory/concluding remarks.
+        """
+        try:
+            # Assuming llm_call_helper returns the string content from the LLM
+            cleaned_spec_text_from_llm = llm_call_helper(self.worker_llm, prompt)
+            
+            if not isinstance(cleaned_spec_text_from_llm, str):
+                logger.warning(f"[{tool_name_for_log}] LLM cleanup did not return a string (got {type(cleaned_spec_text_from_llm)}). Using original spec text.")
+                return spec_text
+
+            cleaned_spec_text = cleaned_spec_text_from_llm.strip() # Remove leading/trailing whitespace
+
+            # Basic check to see if LLM returned something reasonable
+            if cleaned_spec_text and len(cleaned_spec_text) > 0.3 * len(spec_text): # Heuristic: not drastically shorter or empty
+                logger.info(f"[{tool_name_for_log}] LLM cleanup performed. Original length: {len(spec_text)}, Cleaned length: {len(cleaned_spec_text)}")
+                if cleaned_spec_text != spec_text.strip(): # Log if actual changes were made
+                    logger.debug(f"[{tool_name_for_log}] Spec changed by LLM. Original (snippet):\n{spec_text[:300]}...\nCleaned (snippet):\n{cleaned_spec_text[:300]}...")
+                return cleaned_spec_text
+            else:
+                logger.warning(f"[{tool_name_for_log}] LLM cleanup returned an unexpectedly short or empty response. Using original spec text.")
+                return spec_text
+        except Exception as e:
+            logger.error(f"[{tool_name_for_log}] Error during LLM cleanup: {e}. Using original spec text.", exc_info=True)
+            return spec_text
+
+
     def parse_openapi_spec(self, state: BotState) -> BotState:
         tool_name = "parse_openapi_spec"
         self._queue_intermediate_message(
-            state, "Parsing OpenAPI specification (with v3.x validation)..."
+            state, "Preprocessing and parsing OpenAPI specification (with v3.x validation)..."
         )
         state.update_scratchpad_reason(
-            tool_name, "Attempting to parse and validate (v3.x) OpenAPI spec."
+            tool_name, "Attempting to preprocess, parse and validate (v3.x) OpenAPI spec."
         )
-        spec_text = state.openapi_spec_string
         
-        # Enhanced Log: Check initial spec_text type and content
-        logger.debug(f"[{tool_name}] Initial spec_text type: {type(spec_text)}")
-        if isinstance(spec_text, str):
-            logger.debug(f"[{tool_name}] Initial spec_text (first 200 chars): {spec_text[:200]}")
+        original_spec_text = state.openapi_spec_string # Keep a copy of the original input
+        
+        logger.debug(f"[{tool_name}] Initial spec_text type: {type(original_spec_text)}")
+        if isinstance(original_spec_text, str):
+            logger.debug(f"[{tool_name}] Initial spec_text (first 200 chars): {original_spec_text[:200]}")
         else:
-            logger.warning(f"[{tool_name}] Initial spec_text is not a string.")
+            logger.warning(f"[{tool_name}] Initial spec_text is not a string: {type(original_spec_text)}")
 
-
-        if not spec_text:
+        if not original_spec_text:
             self._queue_intermediate_message(state, "No OpenAPI specification text provided.")
             state.update_scratchpad_reason(tool_name, "No spec text in state.")
             state.next_step = "responder"
             state.openapi_spec_string = None
             return state
         
-        # Explicitly check if spec_text is a string before proceeding
-        if not isinstance(spec_text, str):
-            error_msg = f"Invalid type for OpenAPI specification: expected a string, but got {type(spec_text)}. Cannot proceed."
+        if not isinstance(original_spec_text, str): # Should be caught above, but double check
+            error_msg = f"Invalid type for OpenAPI specification: expected a string, but got {type(original_spec_text)}. Cannot proceed."
             logger.error(f"[{tool_name}] {error_msg}")
             self._queue_intermediate_message(state, error_msg)
             state.openapi_schema = None
-            state.openapi_spec_string = None # Clear invalid input
+            state.openapi_spec_string = None 
             state.next_step = "responder"
             return state
 
-        cache_key = get_cache_key(spec_text)
+        # --- LLM Pre-cleanup Step ---
+        self._queue_intermediate_message(state, "Attempting minor cleanup of the specification using AI...")
+        spec_text_to_parse = self._llm_cleanup_spec_text(original_spec_text, tool_name)
+        
+        if spec_text_to_parse.strip() != original_spec_text.strip():
+            self._queue_intermediate_message(state, "AI performed minor adjustments to the specification text before parsing.")
+            logger.info(f"[{tool_name}] Original spec text was modified by LLM pre-cleanup.")
+        else:
+            self._queue_intermediate_message(state, "No significant adjustments made by AI pre-cleanup, or cleanup was skipped/failed.")
+            logger.info(f"[{tool_name}] Spec text remained unchanged after LLM pre-cleanup attempt.")
+        # --- End LLM Pre-cleanup Step ---
+
+        # Use the (potentially cleaned) spec_text_to_parse for caching and further processing
+        cache_key = get_cache_key(spec_text_to_parse)
         cached_full_analysis_key = f"{cache_key}_full_analysis_v3_validated_or_parsed"
 
         if SCHEMA_CACHE:
             cached_schema_artifacts = load_cached_schema(cached_full_analysis_key)
             if cached_schema_artifacts and isinstance(cached_schema_artifacts, dict):
                 try:
-                    # ... (cache loading logic as before) ...
                     state.openapi_schema = cached_schema_artifacts.get("openapi_schema")
                     state.schema_summary = cached_schema_artifacts.get("schema_summary")
                     state.identified_apis = cached_schema_artifacts.get("identified_apis", [])
@@ -103,9 +169,10 @@ class SpecProcessor:
                     graph_dict = cached_schema_artifacts.get("execution_graph")
                     if graph_dict:
                         state.execution_graph = GraphOutput.model_validate(graph_dict) if isinstance(graph_dict, dict) else graph_dict
+                    
                     state.schema_cache_key = cache_key
-                    state.openapi_spec_text = spec_text 
-                    state.openapi_spec_string = None
+                    state.openapi_spec_text = spec_text_to_parse # Store the cleaned spec text
+                    state.openapi_spec_string = None # Clear the original raw string from state
                     logger.info(f"Loaded processed OpenAPI data and analysis from cache: {cached_full_analysis_key}")
                     self._queue_intermediate_message(state, "OpenAPI specification and derived analysis (v3 validated or parsed) loaded from cache.")
                     if state.execution_graph and isinstance(state.execution_graph, GraphOutput):
@@ -119,43 +186,44 @@ class SpecProcessor:
         parsed_spec_dict: Optional[Dict[str, Any]] = None
         error_message: Optional[str] = None
         
-        logger.debug(f"[{tool_name}] Attempting to parse spec_text (length: {len(spec_text)}) as JSON/YAML.")
+        logger.debug(f"[{tool_name}] Attempting to parse spec_text (length: {len(spec_text_to_parse)}) as JSON/YAML after potential LLM cleanup.")
         try:
-            if spec_text.strip().startswith("{"):
-                logger.debug(f"[{tool_name}] Trying to parse as JSON.")
-                parsed_spec_dict = json.loads(spec_text)
-                logger.debug(f"[{tool_name}] Successfully parsed as JSON.")
-            else:
-                logger.debug(f"[{tool_name}] Trying to parse as YAML.")
-                parsed_spec_dict = yaml.safe_load(spec_text) # This expects a stream (string or file)
-                logger.debug(f"[{tool_name}] Successfully parsed as YAML.")
+            cleaned_spec_text_for_parsing = spec_text_to_parse.strip()
+            if cleaned_spec_text_for_parsing.startswith("{") and cleaned_spec_text_for_parsing.endswith("}"):
+                logger.debug(f"[{tool_name}] Trying to parse potentially cleaned spec as JSON.")
+                parsed_spec_dict = json.loads(cleaned_spec_text_for_parsing)
+                logger.debug(f"[{tool_name}] Successfully parsed potentially cleaned spec as JSON.")
+            else: # Assume YAML
+                logger.debug(f"[{tool_name}] Trying to parse potentially cleaned spec as YAML.")
+                parsed_spec_dict = yaml.safe_load(cleaned_spec_text_for_parsing)
+                logger.debug(f"[{tool_name}] Successfully parsed potentially cleaned spec as YAML.")
+
         except json.JSONDecodeError as json_e:
-            error_message = f"JSON parsing failed: {json_e.msg} (at line {json_e.lineno} column {json_e.colno})"
-            logger.error(f"[{tool_name}] {error_message}")
+            error_message = f"JSON parsing failed after cleanup: {json_e.msg} (at line {json_e.lineno} column {json_e.colno})"
+            logger.error(f"[{tool_name}] {error_message}. Original spec (snippet): {original_spec_text[:200]}... Cleaned spec (snippet): {spec_text_to_parse[:200]}...")
         except yaml.YAMLError as yaml_e:
-            error_message = f"YAML parsing failed: {yaml_e}"
-            logger.error(f"[{tool_name}] {error_message}")
+            error_message = f"YAML parsing failed after cleanup: {yaml_e}"
+            logger.error(f"[{tool_name}] {error_message}. Original spec (snippet): {original_spec_text[:200]}... Cleaned spec (snippet): {spec_text_to_parse[:200]}...")
         except Exception as e_parse:
-            error_message = f"Unexpected error during spec parsing: {type(e_parse).__name__} - {e_parse}"
+            error_message = f"Unexpected error during spec parsing after cleanup: {type(e_parse).__name__} - {e_parse}"
             logger.error(f"[{tool_name}] {error_message}", exc_info=True)
 
         if error_message:
             state.openapi_schema = None; state.openapi_spec_string = None
-            self._queue_intermediate_message(state, f"Failed to parse specification: {error_message}")
-            logger.error(f"Parsing failed. Input snippet: {spec_text[:200]}...")
+            self._queue_intermediate_message(state, f"Failed to parse specification (even after AI cleanup attempt): {error_message}")
             state.next_step = "responder"
             state.update_scratchpad_reason(tool_name, f"Parsing failed. Response: {state.response}")
             return state
 
         if not parsed_spec_dict or not isinstance(parsed_spec_dict, dict):
             state.openapi_schema = None; state.openapi_spec_string = None
-            self._queue_intermediate_message(state, "Parsed content is not a valid dictionary structure.")
-            logger.error(f"Parsed content is not a dictionary. Type: {type(parsed_spec_dict)}. Input snippet: {spec_text[:200]}...")
+            self._queue_intermediate_message(state, "Parsed content (post-cleanup) is not a valid dictionary structure.")
+            logger.error(f"Parsed content (post-cleanup) is not a dictionary. Type: {type(parsed_spec_dict)}. Input snippet: {spec_text_to_parse[:200]}...")
             state.next_step = "responder"
             state.update_scratchpad_reason(tool_name, "Parsed content not a dict.")
             return state
         
-        logger.debug(f"[{tool_name}] Successfully parsed spec into a dictionary. Top-level keys: {list(parsed_spec_dict.keys())}")
+        logger.debug(f"[{tool_name}] Successfully parsed spec into a dictionary after potential cleanup. Top-level keys: {list(parsed_spec_dict.keys())}")
 
         spec_version_str = str(parsed_spec_dict.get("openapi", "")).strip()
         is_swagger_v2 = "swagger" in parsed_spec_dict and str(parsed_spec_dict.get("swagger", "")).strip().startswith("2")
@@ -166,21 +234,17 @@ class SpecProcessor:
         try:
             logger.debug(f"[{tool_name}] Detected OpenAPI version string: '{spec_version_str}', is_swagger_v2: {is_swagger_v2}")
             
-            # Ensure parsed_spec_dict is not None before passing to validator
-            if parsed_spec_dict is None: # Should have been caught earlier, but defensive check
+            if parsed_spec_dict is None: # Should not happen if previous checks passed
                 raise ValueError("parsed_spec_dict became None before validation, this should not happen.")
 
             if spec_version_str.startswith("3.0"):
                 logger.info(f"[{tool_name}] Attempting to validate as OpenAPI v3.0.x (Version: {spec_version_str}).")
-                logger.debug(f"[{tool_name}] Data type passed to openapi_v30_spec_validator: {type(parsed_spec_dict)}")
-                # logger.debug(f"[{tool_name}] Data snippet: {str(parsed_spec_dict)[:1000]}...") # Potentially very long
                 validated_spec_dict = openapi_v30_spec_validator.validate(parsed_spec_dict)
                 parsed_spec_dict = validated_spec_dict 
                 validation_performed = True; validation_successful = True
                 logger.info(f"[{tool_name}] OpenAPI 3.0.x validated successfully.")
             elif spec_version_str.startswith("3.1"):
                 logger.info(f"[{tool_name}] Attempting to validate as OpenAPI v3.1.x (Version: {spec_version_str}).")
-                logger.debug(f"[{tool_name}] Data type passed to openapi_v31_spec_validator: {type(parsed_spec_dict)}")
                 validated_spec_dict = openapi_v31_spec_validator.validate(parsed_spec_dict)
                 parsed_spec_dict = validated_spec_dict
                 validation_performed = True; validation_successful = True
@@ -194,7 +258,7 @@ class SpecProcessor:
 
             state.openapi_schema = parsed_spec_dict
             state.schema_cache_key = cache_key
-            state.openapi_spec_text = spec_text
+            state.openapi_spec_text = spec_text_to_parse # Store the cleaned and potentially validated spec
             state.openapi_spec_string = None
 
             if validation_performed and validation_successful:
@@ -212,11 +276,20 @@ class SpecProcessor:
             self._queue_intermediate_message(state, f"OpenAPI 3.x specification is invalid: {error_detail[:500]}")
             logger.error(f"[{tool_name}] OpenAPI 3.x Validation failed: {error_detail}", exc_info=False)
             state.next_step = "responder"
-        except TypeError as te: # Catch the specific TypeError
+        except TypeError as te: 
+            type_error_arg = "unknown"
+            try:
+                # Attempt to get the type that caused the error if possible
+                # This is highly dependent on the structure of the TypeError and its cause
+                if te.__cause__ and hasattr(te.__cause__, 'args') and te.__cause__.args:
+                    type_error_arg = type(te.__cause__.args[0]).__name__
+            except: # pylint: disable=bare-except
+                pass # Best effort
+
             logger.error(f"[{tool_name}] TypeError during validation or processing: {te}", exc_info=True)
-            logger.error(f"[{tool_name}] This often means a None value was passed to a function expecting a string, possibly from an unresolved or null $ref in the spec, or an issue within the validator library when processing the spec structure.")
+            logger.error(f"[{tool_name}] This often means an incorrect data type (e.g., got '{type_error_arg}') was encountered where a string or other type was expected. This could be due to an issue in the spec, an error in the LLM cleanup, or the validator library. Original spec snippet: {original_spec_text[:200]}... Cleaned spec snippet: {spec_text_to_parse[:200]}...")
             self._queue_intermediate_message(
-                state, f"Error processing OpenAPI spec: A None value was encountered where a string was expected. This might be due to an issue with $ref resolution or a null value in your spec. Specific error: {te}"
+                state, f"Error processing OpenAPI spec: A data type mismatch occurred (e.g., got '{type_error_arg}' where a string might be expected). This might be due to an issue in the spec itself or the AI cleanup. Specific error: {te}"
             )
             state.openapi_schema = None; state.openapi_spec_string = None
             state.next_step = "responder"
@@ -236,41 +309,24 @@ class SpecProcessor:
         tool_name = "_generate_llm_schema_summary"
         self._queue_intermediate_message(state, "Generating API summary...")
         state.update_scratchpad_reason(tool_name, "Generating schema summary.")
-
         if not state.openapi_schema:
             state.schema_summary = "Could not generate summary: No schema loaded."
             logger.warning(state.schema_summary)
             self._queue_intermediate_message(state, state.schema_summary)
             return
-
-        spec_info = state.openapi_schema.get("info", {})
-        title = spec_info.get("title", "N/A")
-        version = spec_info.get("version", "N/A")
-        description = spec_info.get("description", "N/A")
-        num_paths = len(state.openapi_schema.get("paths", {}))
-
+        spec_info = state.openapi_schema.get("info", {}); title = spec_info.get("title", "N/A"); version = spec_info.get("version", "N/A"); description = spec_info.get("description", "N/A"); num_paths = len(state.openapi_schema.get("paths", {}))
         paths_preview_list = []
         for p, m_dict in list(state.openapi_schema.get("paths", {}).items())[:3]:
             methods = list(m_dict.keys()) if isinstance(m_dict, dict) else '[methods not parsable]'
             paths_preview_list.append(f"  {p}: {methods}")
         paths_preview = "\n".join(paths_preview_list)
-
         validation_note = ""
         spec_version_str = str(state.openapi_schema.get("openapi", "")).strip()
         if spec_version_str.startswith("3.0") or spec_version_str.startswith("3.1"):
             validation_note = "The schema was validated for OpenAPI 3.x, so $ref pointers should be resolved."
         else:
             validation_note = "The schema was parsed; $ref pointers might be unresolved if not OpenAPI 3.x or if validation was skipped for other versions."
-
-
-        summary_prompt = (
-            f"Summarize the following API specification. Focus on its main purpose, "
-            f"key resources/capabilities, and any mentioned authentication schemes. Be concise (around 100-150 words).\n\n"
-            f"Title: {title}\nVersion: {version}\nDescription: {description[:500]}...\n"
-            f"Number of paths: {num_paths}\nExample Paths (first 3):\n{paths_preview}\n\n"
-            f"Note: {validation_note}\n"
-            f"Concise Summary:"
-        )
+        summary_prompt = (f"Summarize the following API specification. Focus on its main purpose, key resources/capabilities, and any mentioned authentication schemes. Be concise (around 100-150 words).\n\nTitle: {title}\nVersion: {version}\nDescription: {description[:500]}...\nNumber of paths: {num_paths}\nExample Paths (first 3):\n{paths_preview}\n\nNote: {validation_note}\nConcise Summary:")
         try:
             state.schema_summary = llm_call_helper(self.worker_llm, summary_prompt)
             logger.info("Schema summary generated.")
@@ -279,94 +335,57 @@ class SpecProcessor:
             logger.error(f"Error generating schema summary: {e}", exc_info=False)
             state.schema_summary = f"Error generating summary: {str(e)[:150]}..."
             self._queue_intermediate_message(state, state.schema_summary)
-        
-        state.update_scratchpad_reason(
-            tool_name,
-            f"Summary status: {'Success' if state.schema_summary and not state.schema_summary.startswith('Error') else 'Failed'}",
-        )
+        state.update_scratchpad_reason(tool_name, f"Summary status: {'Success' if state.schema_summary and not state.schema_summary.startswith('Error') else 'Failed'}")
 
     def _identify_apis_from_schema(self, state: BotState):
         tool_name = "_identify_apis_from_schema"
         self._queue_intermediate_message(state, "Identifying API operations...")
         state.update_scratchpad_reason(tool_name, "Identifying APIs.")
-
         if not state.openapi_schema:
             state.identified_apis = []
             logger.warning("No schema to identify APIs from.")
             self._queue_intermediate_message(state, "Cannot identify APIs: No schema loaded.")
             return
-
         apis = []
         paths = state.openapi_schema.get("paths", {})
         for path_url, path_item in paths.items():
-            if not isinstance(path_item, dict):
-                logger.warning(f"Skipping non-dictionary path item at '{path_url}'")
-                continue
+            if not isinstance(path_item, dict): logger.warning(f"Skipping non-dictionary path item at '{path_url}'"); continue
             for method, operation_details in path_item.items():
-                if method.lower() not in {
-                    "get", "post", "put", "delete", "patch", "options", "head", "trace"
-                } or not isinstance(operation_details, dict):
-                    continue
-                
-                op_id_suffix = path_url.replace('/', '_').replace('{', '').replace('}', '').strip('_')
-                default_op_id = f"{method.lower()}_{op_id_suffix or 'root'}"
-
-                api_info = {
-                    "operationId": operation_details.get("operationId", default_op_id),
-                    "path": path_url,
-                    "method": method.upper(),
-                    "summary": operation_details.get("summary", ""),
-                    "description": operation_details.get("description", ""),
-                    "parameters": operation_details.get("parameters", []), 
-                    "requestBody": operation_details.get("requestBody", {}), 
-                    "responses": operation_details.get("responses", {}), 
-                }
+                if method.lower() not in {"get", "post", "put", "delete", "patch", "options", "head", "trace"} or not isinstance(operation_details, dict): continue
+                op_id_suffix = path_url.replace('/', '_').replace('{', '').replace('}', '').strip('_'); default_op_id = f"{method.lower()}_{op_id_suffix or 'root'}"
+                api_info = {"operationId": operation_details.get("operationId", default_op_id), "path": path_url, "method": method.upper(), "summary": operation_details.get("summary", ""), "description": operation_details.get("description", ""), "parameters": operation_details.get("parameters", []), "requestBody": operation_details.get("requestBody", {}), "responses": operation_details.get("responses", {})}
                 apis.append(api_info)
         state.identified_apis = apis
         logger.info(f"Identified {len(apis)} API operations.")
         self._queue_intermediate_message(state, f"Identified {len(apis)} API operations.")
         state.update_scratchpad_reason(tool_name, f"Identified {len(apis)} APIs.")
 
+
     def _generate_payload_descriptions(
         self,
         state: BotState,
         target_apis: Optional[List[str]] = None,
-        context_override: Optional[str] = None, # Corrected: removed extra ']'
+        context_override: Optional[str] = None,
     ):
         tool_name = "_generate_payload_descriptions"
-        self._queue_intermediate_message(
-            state, "Creating payload and response examples..."
-        )
-        state.update_scratchpad_reason(
-            tool_name,
-            f"Generating payload descriptions. Targets: {target_apis or 'subset'}. Context: {bool(context_override)}",
-        )
-
+        self._queue_intermediate_message(state, "Creating payload and response examples...")
+        state.update_scratchpad_reason(tool_name, f"Generating payload descriptions. Targets: {target_apis or 'subset'}. Context: {bool(context_override)}")
         if not state.identified_apis:
             logger.warning("No APIs identified, cannot generate payload descriptions.")
-            self._queue_intermediate_message(state, "Cannot create payload examples: No APIs identified.")
-            return
-
+            self._queue_intermediate_message(state, "Cannot create payload examples: No APIs identified."); return
         payload_descs = state.payload_descriptions or {}
         apis_to_process = []
-        # ... (logic for selecting apis_to_process remains the same) ...
-        if target_apis:
-            apis_to_process = [api for api in state.identified_apis if api["operationId"] in target_apis]
+        if target_apis: apis_to_process = [api for api in state.identified_apis if api["operationId"] in target_apis]
         else:
             apis_with_payload_info = [api for api in state.identified_apis if api.get("requestBody") or any(p.get("in") in ["body", "formData"] for p in api.get("parameters", []))]
             unprocessed_apis = [api for api in apis_with_payload_info if api["operationId"] not in payload_descs]
-            if unprocessed_apis:
-                apis_to_process = unprocessed_apis[:MAX_PAYLOAD_SAMPLES_TO_GENERATE_INITIAL]
-            else:
-                apis_to_process = apis_with_payload_info[:MAX_PAYLOAD_SAMPLES_TO_GENERATE_SINGLE_PASS]
-
+            if unprocessed_apis: apis_to_process = unprocessed_apis[:MAX_PAYLOAD_SAMPLES_TO_GENERATE_INITIAL]
+            else: apis_to_process = apis_with_payload_info[:MAX_PAYLOAD_SAMPLES_TO_GENERATE_SINGLE_PASS]
         logger.info(f"Attempting to generate payload descriptions for {len(apis_to_process)} APIs.")
         processed_count = 0
         for api_op in apis_to_process:
-            # ... (prompt construction and LLM call logic remains the same, ensuring validation_note_for_payload is set correctly) ...
             op_id = api_op["operationId"]
-            if op_id in payload_descs and not context_override and not target_apis and processed_count > 0:
-                continue
+            if op_id in payload_descs and not context_override and not target_apis and processed_count > 0: continue
             self._queue_intermediate_message(state, f"Generating payload example for '{op_id}'...")
             params_summary_list = []
             for p_idx, p_detail in enumerate(api_op.get("parameters", [])):
@@ -386,7 +405,7 @@ class SpecProcessor:
             responses = api_op.get("responses", {});
             for status_code, resp_details in responses.items():
                 if status_code.startswith("2") and isinstance(resp_details, dict):
-                    content = resp_details.get("content", {}); json_content = content.get("application/json", {}); schema = json_content.get("schema", {}) 
+                    content = resp_details.get("content", {}); json_content = content.get('application/json', {}); schema = json_content.get("schema", {}) 
                     if schema: success_response_schema_str = json.dumps(schema, indent=2)[:300] + "..."; break
             validation_note_for_payload = ""
             spec_version_str_payload = str(state.openapi_schema.get("openapi", "")).strip() if state.openapi_schema else ""
@@ -419,7 +438,6 @@ class SpecProcessor:
         self, state: BotState, graph_generator_func: Callable[[BotState, Optional[str]], BotState]
     ) -> BotState:
         tool_name = "process_schema_pipeline"
-        # ... (rest of the method remains the same, ensuring it calls the updated sub-methods) ...
         self._queue_intermediate_message(state, "Starting API analysis pipeline...")
         state.update_scratchpad_reason(tool_name, "Starting schema pipeline.")
         if not state.openapi_schema:
@@ -446,4 +464,3 @@ class SpecProcessor:
             logger.info(f"Saved processed data and analysis to cache: {cached_full_analysis_key}")
         state.update_scratchpad_reason(tool_name, f"Schema processing pipeline completed. Next step determined by graph generation: {state.next_step}")
         return state
-
