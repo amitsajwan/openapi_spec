@@ -7,3 +7,4 @@ python-dotenv
 PyYAML
 diskcache
 pydantic >= 2.0
+openapi-spec-validator # Added for dereferencing
