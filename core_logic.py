@@ -12,14 +12,16 @@ from utils import (
     get_cache_key, check_for_cycles, parse_llm_json_output_with_model,
     SCHEMA_CACHE
 )
-from pydantic import ValidationError as PydanticValidationError 
+from pydantic import ValidationError as PydanticValidationError # Alias to avoid confusion
 from api_executor import APIExecutor
 
+# Import specific validators for different OpenAPI versions
 from openapi_spec_validator import (
     openapi_v2_spec_validator, 
     openapi_v30_spec_validator, 
     openapi_v31_spec_validator
 )
+# Import the specific exception class from its module path
 from openapi_spec_validator.validation.exceptions import OpenAPIValidationError 
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,7 @@ class OpenAPICoreLogic:
             return state
 
         cache_key = get_cache_key(spec_text)
+        # Using a more descriptive cache key for the fully processed (validated) schema
         cached_full_analysis_key = f"{cache_key}_full_analysis_validated" 
         cached_schema_artifacts = load_cached_schema(cached_full_analysis_key)
 
@@ -120,19 +123,23 @@ class OpenAPICoreLogic:
         try:
             spec_version_str = parsed_spec_dict.get('openapi', parsed_spec_dict.get('swagger'))
             
+            # The .validate() methods raise an error on failure and return None on success.
+            # They operate on the parsed_spec_dict, resolving references internally for validation.
             if spec_version_str and spec_version_str.startswith('2.'):
                 logger.info(f"Attempting to validate as OpenAPI v2 (Swagger) specification (Version: {spec_version_str}).")
                 openapi_v2_spec_validator.validate(parsed_spec_dict)
-            elif spec_version_str and spec_version_str.startswith('3.0'):
+            elif spec_version_str and spec_version_str.startswith('3.0'): # Explicitly handle 3.0.x
                 logger.info(f"Attempting to validate as OpenAPI v3.0.x specification (Version: {spec_version_str}).")
                 openapi_v30_spec_validator.validate(parsed_spec_dict)
-            elif spec_version_str and spec_version_str.startswith('3.1'):
+            elif spec_version_str and spec_version_str.startswith('3.1'): # Explicitly handle 3.1.x
                 logger.info(f"Attempting to validate as OpenAPI v3.1.x specification (Version: {spec_version_str}).")
                 openapi_v31_spec_validator.validate(parsed_spec_dict)
             else:
                 logger.warning(f"Unknown or unsupported OpenAPI version string: '{spec_version_str}'. Attempting with v3.0 validator as a default.")
                 openapi_v30_spec_validator.validate(parsed_spec_dict) 
             
+            # If validation passed (no exception raised), the parsed_spec_dict is considered validated.
+            # References within it were resolvable by the validator.
             state.openapi_schema = parsed_spec_dict 
             state.schema_cache_key = cache_key 
             state.openapi_spec_text = spec_text 
@@ -142,10 +149,11 @@ class OpenAPICoreLogic:
             state.response = "OpenAPI specification parsed and validated. Starting analysis pipeline..."
             state.next_step = "process_schema_pipeline"
 
-        except OpenAPIValidationError as val_e: 
+        except OpenAPIValidationError as val_e: # Catch the specific, correctly imported exception
             state.openapi_schema = None 
             state.openapi_spec_string = None
             error_detail = str(val_e.message if hasattr(val_e, 'message') else val_e)
+            # Provide more context if available from the error object
             if hasattr(val_e, 'instance') and hasattr(val_e, 'schema_path'):
                  error_detail_path = "->".join(map(str, val_e.schema_path))
                  error_detail = f"Validation error at path '{error_detail_path}' for instance segment '{str(val_e.instance)[:100]}...': {val_e.message}"
@@ -305,7 +313,6 @@ class OpenAPICoreLogic:
         apis_str = "\n".join(api_summaries_for_prompt)
         feedback_str = f"Refinement Feedback: {state.graph_regeneration_reason}" if state.graph_regeneration_reason else ""
         
-        # Enhanced prompt to be very explicit about field names for Node and Edge
         prompt = f"""
         Goal: "{current_goal}". {feedback_str}
         Available API Operations (summary with parameters and sample request body fields from validated schemas):\n{apis_str}
@@ -315,47 +322,30 @@ class OpenAPICoreLogic:
         - A 'create' operation (e.g., POST /items) should usually precede 'get by ID' (e.g., GET /items/{{{{itemId}}}}).
         - Data created in one step (e.g., an ID from a POST response) MUST be mapped via `OutputMapping` and then used in subsequent steps.
 
-        The graph JSON must strictly adhere to the following Pydantic model structure:
-        GraphOutput: {{ 
-            "description": "str (Overall workflow description)", 
-            "nodes": [Node], 
-            "edges": [Edge], 
-            "refinement_summary": "str (Summary of changes if this is a refinement)" 
-        }}
-        Node: {{
-            "operationId": "str (REQUIRED, e.g., 'getUser', 'START_NODE', 'END_NODE')", 
-            "display_name": "str (Optional, for uniqueness if same operationId is used multiple times)",
-            "summary": "str (Optional, short summary of the API operation)", 
-            "description": "str (Optional, detailed description of this step's purpose in the workflow)",
-            "method": "str (e.g., 'GET', 'POST', 'SYSTEM' for START_NODE/END_NODE)",
-            "path": "str (e.g., '/users/{{{{userId}}}}', '/start' for START_NODE)",
-            "payload": {{ "template_key": "realistic_example_value or {{{{placeholder_from_output_mapping}}}}" }},
-            "input_mappings": [InputMapping (Optional)], 
-            "output_mappings": [OutputMapping (Optional)],
-            "requires_confirmation": "bool (default: false, set to true for POST/PUT/DELETE/PATCH)"
-        }}
-        Edge: {{
-            "from_node": "str (REQUIRED, effective_id of source node, or 'START_NODE' if from LangGraph START)", 
-            "to_node": "str (REQUIRED, effective_id of target node, or 'END_NODE' if to LangGraph END)",
-            "description": "str (Optional, describes the condition or reason for the edge)"
-        }}
-        InputMapping: {{"source_operation_id": "str (effective_id of source node)", "source_data_path": "str (JSONPath like '$.id')", "target_parameter_name": "str (name of param in target)", "target_parameter_in": "Literal['path', 'query', 'body', 'body.fieldName']"}}
-        OutputMapping: {{"source_data_path": "str (JSONPath from this node's response, e.g., '$.data.id')", "target_data_key": "str (unique key for shared data pool, e.g., 'createdItemId')"}}
-
-        CRITICAL FIELD NAMES:
-        - For Nodes, use "operationId". Do NOT use "id".
-        - For Edges, use "from_node" and "to_node". Do NOT use "from" or "to".
-
+        The graph must adhere to the Pydantic models:
+        InputMapping: {{"source_operation_id": "str_effective_id_of_source_node", "source_data_path": "str_jsonpath_to_value_in_extracted_ids (e.g., '$.createdItemIdFromStep1')", "target_parameter_name": "str_param_name_in_target_node (e.g., 'itemId')", "target_parameter_in": "Literal['path', 'query', 'body', 'body.fieldName']"}}
+        OutputMapping: {{"source_data_path": "str_jsonpath_to_value_in_THIS_NODE_RESPONSE (e.g., '$.id', '$.data.token')", "target_data_key": "str_UNIQUE_key_for_shared_data_pool (e.g., 'createdItemId', 'userAuthToken')"}}
+        Node: {{ ... "payload": {{ "template_key": "realistic_example_value or {{{{placeholder_from_output_mapping}}}}" }} ... }} 
+        
         CRITICAL INSTRUCTIONS FOR `payload` FIELD in Nodes (for POST, PUT, PATCH), using the schema information provided:
-        1.  **Accuracy is Key:** The `payload` dictionary MUST ONLY contain fields that are actually defined by the specific API's request body schema.
+        1.  **Accuracy is Key:** The `payload` dictionary MUST ONLY contain fields that are actually defined by the specific API's request body schema (as hinted in 'ReqBody fields (sample from schema)' or from your knowledge of the API).
         2.  **Do Not Invent Fields:** Do NOT include any fields in the `payload` that are not part of the API's expected request body.
-        3.  **Realistic Values:** Use realistic example values for fields.
-        4.  **Placeholders for Dynamic Data:** If a field's value should come from a previous step's output, use a placeholder like `{{{{key_from_output_mapping}}}}`.
-        5.  **Optional Fields:** OMIT optional fields if no value is known or relevant.
+        3.  **Realistic Values:** Use realistic example values for fields (e.g., for "name": "Example Product", for "email": "test@example.com").
+        4.  **Placeholders for Dynamic Data:** If a field's value should come from a previous step's output (via `OutputMapping`), use a placeholder like `{{{{key_from_output_mapping}}}}`. Ensure this placeholder matches a `target_data_key` from an `OutputMapping` of a preceding node.
+        5.  **Optional Fields:** If a field is optional according to the API spec and no value is known or relevant to the goal, OMIT it from the payload rather than inventing a value or using a generic placeholder. If a default is sensible and known, use it.
+
+        CRITICAL INSTRUCTIONS FOR DATA FLOW (e.g., Create Product then Get Product by ID):
+        1.  **Create Node (e.g., POST /products):**
+            * MUST have an `OutputMapping` to extract the ID of the newly created product from its response. Example: `{{"source_data_path": "$.id", "target_data_key": "newProductId"}}`. (Adjust `source_data_path` based on the actual API response structure for the ID).
+        2.  **Get/Update/Delete Node (e.g., GET /products/{{{{some_id_placeholder}}}}):**
+            * Its `path` MUST use a placeholder for the ID. This placeholder MUST exactly match the `target_data_key` from the "Create Node's" `OutputMapping`. Example Path: `/products/{{{{newProductId}}}}`.
+            * Alternatively, if the path is `/products/{{pathParamName}}`, an `InputMapping` is needed: `{{ "source_operation_id": "effective_id_of_create_node", "source_data_path": "$.newProductId", "target_parameter_name": "pathParamName", "target_parameter_in": "path" }}`.
 
         General Instructions:
-        - Include "START_NODE" and "END_NODE" (method: "SYSTEM") as the first and last nodes respectively in the `nodes` list.
-        - Connect nodes with `edges`. `START_NODE` should connect to the first actual API operation(s). The last actual API operation(s) should connect to `END_NODE`.
+        - Create "START_NODE" and "END_NODE" (method: "SYSTEM").
+        - Select 2-5 relevant API operations.
+        - Set `requires_confirmation: true` for POST, PUT, DELETE, PATCH.
+        - Connect nodes with `edges`. START_NODE to first API(s), last API(s) to END_NODE.
         - Ensure logical sequence.
         - Provide overall `description` and `refinement_summary`.
 
@@ -364,19 +354,13 @@ class OpenAPICoreLogic:
         
         try:
             llm_response = llm_call_helper(self.worker_llm, prompt)
-            # Attempt to parse the LLM response using the GraphOutput model
             graph_output_candidate = parse_llm_json_output_with_model(llm_response, expected_model=GraphOutput)
 
-            if graph_output_candidate: # This means Pydantic validation passed
-                # Additional check for START_NODE/END_NODE presence, though Pydantic might not enforce this if they are optional in a list.
-                # However, our Node model makes operationId required.
-                has_start_node = any(node.operationId == "START_NODE" for node in graph_output_candidate.nodes)
-                has_end_node = any(node.operationId == "END_NODE" for node in graph_output_candidate.nodes)
-
-                if not has_start_node or not has_end_node:
-                    logger.error("LLM generated graph is missing START_NODE or END_NODE, despite successful Pydantic parsing of other fields.")
-                    state.graph_regeneration_reason = "Generated graph missing START_NODE or END_NODE. Please ensure they are included with correct 'operationId'."
-                    # This state will lead to retry or failure handling below
+            if graph_output_candidate:
+                if not any(node.operationId == "START_NODE" for node in graph_output_candidate.nodes) or \
+                   not any(node.operationId == "END_NODE" for node in graph_output_candidate.nodes):
+                    logger.error("LLM generated graph is missing START_NODE or END_NODE.")
+                    state.graph_regeneration_reason = "Generated graph missing START_NODE or END_NODE. Please ensure they are included."
                 else:
                     state.execution_graph = graph_output_candidate
                     state.response = "API workflow graph generated."
@@ -388,26 +372,25 @@ class OpenAPICoreLogic:
                     state.next_step = "verify_graph" 
                     state.update_scratchpad_reason(tool_name, f"Graph gen success. Next: {state.next_step}")
                     return state 
-            
-            # If graph_output_candidate is None (Pydantic validation failed) or missing START/END nodes
-            error_msg = "LLM failed to produce a valid GraphOutput JSON according to the schema (e.g., missing required fields like 'operationId' for nodes, 'from_node'/'to_node' for edges, or START/END nodes)."
-            logger.error(error_msg + f" Raw LLM output snippet: {llm_response[:500]}...") # Log more of the output
-            state.response = "Failed to generate a valid execution graph. The AI's output did not match the required structure (e.g., missing 'operationId', 'from_node'/'to_node', or START/END nodes)."
+
+            error_msg = "LLM failed to produce a valid GraphOutput JSON, or it was structurally incomplete (e.g., missing START/END nodes)."
+            logger.error(error_msg + f" Raw LLM output snippet: {llm_response[:300]}...")
+            state.response = "Failed to generate a valid execution graph (AI output format, structure, or missing critical nodes like START/END)."
             state.execution_graph = None 
-            state.graph_regeneration_reason = state.graph_regeneration_reason or "LLM output did not adhere to the required graph structure (missing operationId, from_node/to_node, or START/END nodes)."
+            state.graph_regeneration_reason = state.graph_regeneration_reason or "LLM output was not a valid GraphOutput object or missed key structural elements."
             
             current_attempts = state.scratchpad.get('graph_gen_attempts', 0)
-            if current_attempts < 1: # Allow one retry for initial generation
+            if current_attempts < 1: 
                 state.scratchpad['graph_gen_attempts'] = current_attempts + 1
-                logger.info("Retrying initial graph generation once due to schema validation failure.")
+                logger.info("Retrying initial graph generation once due to validation/parsing failure.")
                 state.next_step = "_generate_execution_graph" 
             else:
-                logger.error("Max initial graph generation attempts reached after schema validation failure. Routing to handle_unknown.")
+                logger.error("Max initial graph generation attempts reached. Routing to handle_unknown.")
                 state.next_step = "handle_unknown" 
                 state.scratchpad['graph_gen_attempts'] = 0 
 
-        except Exception as e: # Catch any other unexpected errors
-            logger.error(f"Error during graph generation LLM call or processing: {e}", exc_info=True) # Log full traceback for unexpected
+        except Exception as e:
+            logger.error(f"Error during graph generation LLM call or processing: {e}", exc_info=False)
             state.response = f"Error generating graph: {str(e)[:150]}..."
             state.execution_graph = None
             state.graph_regeneration_reason = f"LLM call/processing error: {str(e)[:100]}..."
@@ -465,7 +448,7 @@ class OpenAPICoreLogic:
                 'execution_graph': state.execution_graph.model_dump() if state.execution_graph and isinstance(state.execution_graph, GraphOutput) else None, 
                 'plan_generation_goal': state.plan_generation_goal
             }
-            cached_full_analysis_key = f"{state.schema_cache_key}_full_analysis_validated" 
+            cached_full_analysis_key = f"{state.schema_cache_key}_full_analysis_validated" # reflect that schema is validated
             save_schema_to_cache(cached_full_analysis_key, full_analysis_data)
             logger.info(f"Saved fully analyzed and validated data to cache: {cached_full_analysis_key}")
             
@@ -477,12 +460,16 @@ class OpenAPICoreLogic:
         if not state.execution_graph or not isinstance(state.execution_graph, GraphOutput): state.response = state.response or "No execution graph to verify (possibly due to generation error or wrong type)."; state.graph_regeneration_reason = state.graph_regeneration_reason or "No graph was generated to verify."; logger.warning(f"verify_graph: No graph found or invalid type. Reason: {state.graph_regeneration_reason}. Routing to _generate_execution_graph for regeneration."); state.next_step = "_generate_execution_graph"; return state
         issues = []
         try:
+            # Validate against Pydantic model
             GraphOutput.model_validate(state.execution_graph.model_dump()) 
+            # Check for cycles
             is_dag, cycle_msg = check_for_cycles(state.execution_graph)
             if not is_dag: issues.append(cycle_msg or "Graph contains cycles.")
+            # Check for START_NODE and END_NODE presence
             node_ids = {node.effective_id for node in state.execution_graph.nodes}
             if "START_NODE" not in node_ids: issues.append("START_NODE is missing.")
             if "END_NODE" not in node_ids: issues.append("END_NODE is missing.")
+            # Check START_NODE/END_NODE connectivity
             if "START_NODE" in node_ids:
                 start_outgoing = any(edge.from_node == "START_NODE" for edge in state.execution_graph.edges); start_incoming = any(edge.to_node == "START_NODE" for edge in state.execution_graph.edges)
                 if not start_outgoing and len(state.execution_graph.nodes) > 2 : issues.append("START_NODE has no outgoing edges to actual API operations.")
@@ -491,10 +478,11 @@ class OpenAPICoreLogic:
                 end_incoming = any(edge.to_node == "END_NODE" for edge in state.execution_graph.edges); end_outgoing = any(edge.from_node == "END_NODE" for edge in state.execution_graph.edges)
                 if not end_incoming and len(state.execution_graph.nodes) > 2: issues.append("END_NODE has no incoming edges from actual API operations.")
                 if end_outgoing: issues.append("END_NODE should not have outgoing edges.")
+            # Check if API nodes have method and path
             for node in state.execution_graph.nodes:
                 if node.effective_id.upper() not in ["START_NODE", "END_NODE"]: 
                     if not node.method or not node.path: issues.append(f"Node '{node.effective_id}' is missing 'method' or 'path', required for execution.")
-        except PydanticValidationError as ve: 
+        except PydanticValidationError as ve: # Catch Pydantic validation errors
             logger.error(f"Graph Pydantic validation failed during verify_graph: {ve}"); issues.append(f"Graph structure is invalid (Pydantic): {str(ve)[:200]}...") 
         except Exception as e: 
             logger.error(f"Unexpected error during graph verification: {e}", exc_info=True); issues.append(f"An unexpected error occurred during verification: {str(e)[:100]}.")
@@ -531,40 +519,25 @@ class OpenAPICoreLogic:
         for idx, api in enumerate(state.identified_apis): 
             if idx >= num_apis_to_summarize and len(state.identified_apis) > truncate_threshold: api_summaries_for_prompt.append(f"- ...and {len(state.identified_apis) - num_apis_to_summarize} more operations."); break
             likely_confirmation = api['method'].upper() in ["POST", "PUT", "DELETE", "PATCH"]
-            api_summaries_for_prompt.append(f"- operationId: {api['operationId']} ({api['method']} {api['path']}), summary: {api.get('summary', 'N/A')[:70]}, confirm: {'yes' if likely_confirmation else 'no'}")
+            api_summaries_for_prompt.append(f"- opId: {api['operationId']} ({api['method']} {api['path']}), summary: {api.get('summary', 'N/A')[:70]}, confirm: {'yes' if likely_confirmation else 'no'}")
         apis_ctx = "\n".join(api_summaries_for_prompt)
         
-        # Enhanced prompt for refinement, similar explicitness as _generate_execution_graph
         prompt = f"""
         User's Overall Goal: "{state.plan_generation_goal or 'General workflow'}"
         Feedback for Refinement: "{state.graph_regeneration_reason or 'General request to improve the graph.'}"
         Current Graph (JSON to be refined, based on validated schemas):\n```json\n{current_graph_json}\n```
         Available API Operations (sample for context, from validated schemas):\n{apis_ctx}
 
-        Task: Refine the current graph based on the feedback. Ensure the refined graph strictly adheres to the Pydantic model structure:
-        GraphOutput: {{ "description": "str", "nodes": [Node], "edges": [Edge], "refinement_summary": "str" }}
-        Node: {{
-            "operationId": "str (REQUIRED)", "display_name": "str (Optional)", "summary": "str (Optional)", 
-            "description": "str (Optional)", "method": "str", "path": "str", "payload": {{...}},
-            "input_mappings": [InputMapping (Optional)], "output_mappings": [OutputMapping (Optional)],
-            "requires_confirmation": "bool"
-        }}
-        Edge: {{ "from_node": "str (REQUIRED)", "to_node": "str (REQUIRED)", "description": "str (Optional)" }}
-        
-        CRITICAL FIELD NAMES:
-        - For Nodes, use "operationId". Do NOT use "id".
-        - For Edges, use "from_node" and "to_node". Do NOT use "from" or "to".
-
-        CRITICAL INSTRUCTIONS FOR `payload` FIELD:
-        - Only include fields defined by the API's request body schema. Do not invent. Use realistic values or `{{{{placeholders}}}}`. Omit optional fields if value unknown.
-
-        General Instructions for Refinement:
-        - Ensure "START_NODE" and "END_NODE" are correctly linked.
-        - All `operationId`s in edges must exist in the `nodes` list.
-        - API nodes must have `method` and `path`.
-        - `input_mappings` and `output_mappings` must be logical.
-        - Address the specific feedback.
-        - Provide a concise `refinement_summary` explaining changes.
+        Task: Refine the current graph based on the feedback. Ensure the refined graph:
+        1.  Strictly adheres to the Pydantic model structure for GraphOutput, Node, Edge, InputMapping, OutputMapping.
+            - For `payload` in Nodes: ONLY include fields defined by the API's request body schema. DO NOT invent fields. Use realistic example values or placeholders like `{{{{key_from_output_mapping}}}}` if data comes from a prior step. Omit optional fields if value is unknown.
+        2.  Includes "START_NODE" and "END_NODE" correctly linked.
+        3.  All node `operationId`s (or `display_name` if used as `effective_id`) in edges must exist in the `nodes` list.
+        4.  Nodes intended for execution have `method` and `path` attributes.
+        5.  `input_mappings` and `output_mappings` are logical for data flow. `source_data_path` should be plausible JSON paths. `target_data_key` in output_mappings should be unique and descriptive.
+        6.  `requires_confirmation` is set appropriately.
+        7.  Addresses the specific feedback. Ensure logical dependencies (e.g., create before get/update).
+        8.  Provide a concise `refinement_summary` field in the JSON explaining what was changed or attempted.
 
         Output ONLY the refined GraphOutput JSON object.
         """
@@ -576,14 +549,14 @@ class OpenAPICoreLogic:
                 state.execution_graph = refined_graph_candidate; refinement_summary = refined_graph_candidate.refinement_summary or "AI provided no specific summary for this refinement."; state.update_scratchpad_reason(tool_name, f"LLM Refinement Summary (Iter {iteration}): {refinement_summary}")
                 state.graph_refinement_iterations = iteration; state.response = f"Graph refined (Iteration {iteration}). Summary: {refinement_summary}"; state.graph_regeneration_reason = None; state.scratchpad['refinement_validation_failures'] = 0; state.next_step = "verify_graph" 
             else:
-                error_msg = "LLM refinement failed to produce a GraphOutput JSON that is valid or self-consistent (e.g. missing 'operationId', 'from_node'/'to_node')."; logger.error(error_msg + f" Raw LLM output snippet for refinement: {llm_response_str[:300]}..."); state.response = f"Error during graph refinement (iteration {iteration}): AI output was invalid. Will retry refinement or regenerate graph."; state.graph_regeneration_reason = state.graph_regeneration_reason or "LLM output for refinement was not a valid GraphOutput object or had structural issues (e.g. missing 'operationId', 'from_node'/'to_node')."
+                error_msg = "LLM refinement failed to produce a GraphOutput JSON that is valid or self-consistent."; logger.error(error_msg + f" Raw LLM output snippet for refinement: {llm_response_str[:300]}..."); state.response = f"Error during graph refinement (iteration {iteration}): AI output was invalid. Will retry refinement or regenerate graph."; state.graph_regeneration_reason = state.graph_regeneration_reason or "LLM output for refinement was not a valid GraphOutput object or had structural issues."
                 state.scratchpad['refinement_validation_failures'] = state.scratchpad.get('refinement_validation_failures', 0) + 1
                 if iteration < state.max_refinement_iterations:
                     if state.scratchpad['refinement_validation_failures'] >= 2: logger.warning(f"Multiple consecutive refinement validation failures (iter {iteration}). Escalating to full graph regeneration."); state.response += " Attempting full regeneration due to persistent refinement issues."; state.next_step = "_generate_execution_graph"; state.graph_refinement_iterations = 0; state.scratchpad['refinement_validation_failures'] = 0; state.scratchpad['graph_gen_attempts'] = 0 
                     else: state.next_step = "refine_api_graph" 
                 else: logger.warning(f"Max refinement iterations reached after LLM output error during refinement. Describing last valid graph or failing."); state.next_step = "describe_graph" 
         except Exception as e:
-            logger.error(f"Error during graph refinement LLM call or processing (iter {iteration}): {e}", exc_info=True); state.response = f"Error refining graph (iter {iteration}): {str(e)[:150]}..."; state.graph_regeneration_reason = state.graph_regeneration_reason or f"Refinement LLM call/processing error (iter {iteration}): {str(e)[:100]}..."
+            logger.error(f"Error during graph refinement LLM call or processing (iter {iteration}): {e}", exc_info=False); state.response = f"Error refining graph (iter {iteration}): {str(e)[:150]}..."; state.graph_regeneration_reason = state.graph_regeneration_reason or f"Refinement LLM call/processing error (iter {iteration}): {str(e)[:100]}..."
             if iteration < state.max_refinement_iterations: state.next_step = "refine_api_graph" 
             else: logger.warning(f"Max refinement iterations reached after exception. Describing graph or failing."); state.next_step = "describe_graph"
         return state
