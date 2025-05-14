@@ -24,7 +24,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Function to show the thinking indicator
     function startThinking(message = "Processing...") {
-        if (isThinking) return;
+        if (isThinking) { // If already thinking, just update message if different
+            if (thinkingIndicatorText && thinkingIndicatorText.textContent !== message) {
+                thinkingIndicatorText.textContent = message;
+            }
+            return;
+        }
         isThinking = true;
         if (thinkingIndicatorText) thinkingIndicatorText.textContent = message;
         if (thinkingIndicatorContainer) {
@@ -46,24 +51,23 @@ document.addEventListener('DOMContentLoaded', () => {
             thinkingIndicatorContainer.classList.remove('opacity-100');
         }
         // Re-enable buttons based on whether a spec/graph is loaded
-        const specOrGraphLoaded = currentGraph !== null; 
+        const specOrGraphLoaded = currentGraph !== null;
         if (submitSpecButton) submitSpecButton.disabled = false;
         if (sendMessageButton) sendMessageButton.disabled = !specOrGraphLoaded;
         if (runWorkflowButton) runWorkflowButton.disabled = !specOrGraphLoaded;
         console.log("UI: Thinking stopped - ", message);
     }
-    
+
     function connectWebSocket() {
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        // The user's script.js uses this path. If session ID is needed, backend should handle it.
-        const wsUrl = `${wsProtocol}//${window.location.host}/ws/openapi_agent`; 
-        
+        const wsUrl = `${wsProtocol}//${window.location.host}/ws/openapi_agent`;
+
         ws = new WebSocket(wsUrl);
 
         ws.onopen = function(event) {
             console.log("WebSocket connection established.");
             addMessageToChat('status', "Connected to the agent.", "connection_status");
-            stopThinking("Connected.");
+            stopThinking("Connected."); // Reset UI
             // Initial button states
             if (sendMessageButton) sendMessageButton.disabled = true;
             if (runWorkflowButton) runWorkflowButton.disabled = true;
@@ -73,40 +77,28 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
                 const parsed_event_data = JSON.parse(event.data);
                 console.log("WebSocket message received:", parsed_event_data);
-                
-                const messageType = parsed_event_data.type; // This is the WebSocket message type
-                const data = parsed_event_data.content || parsed_event_data.data || {}; // Accommodate different backend structures
-                const source = parsed_event_data.source || 'assistant'; // Backend might specify source ('graph1_planning', 'graph2_execution', 'system')
+
+                const messageType = parsed_event_data.type;
+                const data = parsed_event_data.content || parsed_event_data.data || {};
+                const source = parsed_event_data.source || 'assistant';
 
                 switch (messageType) {
-                    // This case handles the thinking indicator based on explicit backend signals
-                    // If you switch to client-managed thinking, this case would be removed/changed.
-                    case 'status_update': // This was for backend-controlled thinking
-                        if (data.event === 'thinking_started') {
-                            startThinking(data.message || "Processing...");
-                        } else if (data.event === 'thinking_finished') {
-                            stopThinking(data.message || "Processing finished.");
-                        } else {
-                             addMessageToChat('status', `Status: ${data.event} - ${data.message || ''}`, messageType);
-                        }
-                        break;
-                    
-                    // These are message types from your backend's send_websocket_message_helper
-                    case 'status': // General status from backend
+                    case 'status': // General status from backend (not for thinking indicator)
                     case 'info':
                     case 'warning':
                         addMessageToChat(source, data.message || 'Status update.', messageType);
                         break;
-                    case 'intermediate': // Intermediate messages from Graph 1
-                    case 'intermediate_message': // For compatibility with previous naming
+                    case 'intermediate':
+                    case 'intermediate_message':
                         addMessageToChat(source, data.message, messageType);
+                        // Update thinking indicator text with the latest intermediate message
                         if (isThinking && data.message && thinkingIndicatorText) {
                             thinkingIndicatorText.textContent = data.message.length > 70 ? data.message.substring(0, 67) + "..." : data.message;
                         }
                         break;
                     case 'graph_update':
-                        if (data.graph || data.nodes || data.elements) { // data itself might be the graph object
-                            currentGraph = data.graph || data; // data might be the graph object directly
+                        if (data.graph || data.nodes || data.elements) {
+                            currentGraph = data.graph || data;
                             renderGraph(currentGraph);
                             addMessageToChat('status', "Workflow graph updated.", messageType);
                             if (sendMessageButton) sendMessageButton.disabled = false;
@@ -117,50 +109,50 @@ document.addEventListener('DOMContentLoaded', () => {
                         break;
                     case 'api_response':
                         displayApiResponse(data);
+                        // An api_response might be intermediate. Rely on 'final' or 'error' to stop thinking.
                         break;
-                    case 'final': // Final response from Graph 1
-                    case 'final_response': // For compatibility
+                    case 'final': // Final response from Graph 1 or other processes
+                    case 'final_response':
                         addMessageToChat(source, data.message || "Processing complete.", messageType);
-                        if (data.graph) { 
+                        if (data.graph) {
                             currentGraph = data.graph;
                             renderGraph(currentGraph);
                         }
-                        // This stopThinking call is for backend-controlled thinking.
-                        // If client-managed, it would be handled differently.
-                        stopThinking(data.message || "Task complete."); 
-                        if (currentGraph) {
+                        stopThinking(data.message || "Task complete."); // Stop thinking
+                        if (currentGraph) { // Re-enable buttons if graph is present
                             if (sendMessageButton) sendMessageButton.disabled = false;
                             if (runWorkflowButton) runWorkflowButton.disabled = false;
                         }
                         break;
                     case 'error':
                         addMessageToChat('error', `Error: ${data.error || data.message || 'Unknown error.'}`, messageType);
-                        // This stopThinking call is for backend-controlled thinking.
-                        stopThinking("An error occurred."); 
+                        stopThinking("An error occurred."); // Stop thinking
+                        // Buttons are re-enabled by stopThinking based on currentGraph
                         break;
-                    
-                    // Graph 2 specific events (as per your websocket_helpers.py)
+
+                    // Graph 2 specific events
                     case 'human_intervention_required':
                         addMessageToChat(source, data.message || `Action required for node ${data.node_id}`, messageType);
-                        // Potentially show modal here based on data
+                        // Potentially show modal here
+                        // If this is the end of a flow waiting for user, we might stop thinking here too.
+                        // For now, assume a 'final' or 'error' will eventually come, or user action restarts thinking.
                         break;
-                    case 'execution_update': // Generic update from Graph 2
+                    case 'execution_update':
                     case 'tool_start':
                     case 'tool_end':
                     case 'llm_start':
                     case 'llm_stream':
                     case 'llm_end':
-                         addMessageToChat(source, data.message || `Execution update: ${messageType}`, messageType);
-                         if (isThinking && data.message && thinkingIndicatorText) {
+                        addMessageToChat(source, data.message || `Execution update: ${messageType}`, messageType);
+                        if (isThinking && data.message && thinkingIndicatorText) {
                             thinkingIndicatorText.textContent = data.message.length > 70 ? data.message.substring(0, 67) + "..." : data.message;
                         }
-                         break;
+                        break;
                     case 'execution_completed':
                     case 'execution_failed':
                     case 'workflow_timeout':
                         addMessageToChat(source, data.message || `Workflow ${messageType}.`, messageType);
-                        // This stopThinking call is for backend-controlled thinking.
-                        stopThinking(`Workflow ${messageType}.`);
+                        stopThinking(`Workflow ${messageType}.`); // Stop thinking
                         break;
 
                     default:
@@ -169,22 +161,22 @@ document.addEventListener('DOMContentLoaded', () => {
             } catch (e) {
                 console.error("Error processing WebSocket message:", e, "Raw data:", event.data);
                 addMessageToChat('error', "Received an unparseable message from server.", "parse_error");
-                // This stopThinking call is for backend-controlled thinking.
-                stopThinking("Error processing server message.");
+                stopThinking("Error processing server message."); // Stop thinking on parse error
             }
         };
 
         ws.onclose = function(event) {
             console.log("WebSocket connection closed.", event.reason, "Code:", event.code);
             addMessageToChat('status', "Connection closed. Attempting to reconnect in 5 seconds...", "connection_status");
-            stopThinking("Connection lost."); 
-            isThinking = false; 
-            setTimeout(connectWebSocket, 5000); 
+            stopThinking("Connection lost.");
+            isThinking = false; // Explicitly set
+            setTimeout(connectWebSocket, 5000);
         };
 
         ws.onerror = function(error) {
             console.error("WebSocket error:", error);
             addMessageToChat('error', "WebSocket connection error. Check console for details.", "ws_error");
+            // onclose will usually follow, which calls stopThinking
         };
     }
 
@@ -197,35 +189,36 @@ document.addEventListener('DOMContentLoaded', () => {
         if (lastMessageElement &&
             lastMessageElement.dataset.source === source &&
             lastMessageElement.dataset.wsMessageType === wsMessageType &&
-            (source === 'assistant' || source === 'graph1_planning' || source === 'graph2_execution') && // Only append for these sources
-            (wsMessageType === 'intermediate' || wsMessageType === 'intermediate_message' || wsMessageType === 'llm_stream' || wsMessageType === 'status' || wsMessageType === 'execution_update') // Only for these types
+            (source === 'assistant' || source === 'graph1_planning' || source === 'graph2_execution' || source === 'agent') &&
+            (wsMessageType === 'intermediate' || wsMessageType === 'intermediate_message' || wsMessageType === 'llm_stream' || wsMessageType === 'status' || wsMessageType === 'execution_update')
            ) {
             appendToLast = true;
         }
         
-        // Sanitize message if it's not explicitly HTML
         let sanitizedMessage = message;
-        if (!isHtml) {
+        if (!isHtml && typeof message === 'string') { // Ensure message is a string before textContent
             const tempDiv = document.createElement('div');
-            tempDiv.textContent = message; // Ensures text is treated as text
-            sanitizedMessage = tempDiv.innerHTML.replace(/\n/g, '<br>'); // Convert newlines to <br>
+            tempDiv.textContent = message;
+            sanitizedMessage = tempDiv.innerHTML.replace(/\n/g, '<br>');
+        } else if (!isHtml && message === undefined) {
+            sanitizedMessage = ""; // Handle undefined message
+        } else if (isHtml) {
+            sanitizedMessage = message; // Trust pre-formatted HTML
         }
 
 
         if (appendToLast && lastMessageElement) {
-            // Find the content span within the last message element to append to
             const contentSpan = lastMessageElement.querySelector('.message-text-content');
             if (contentSpan) {
                 contentSpan.innerHTML += '<br>' + sanitizedMessage;
             } else { 
-                // Fallback if no specific content span, append to whole innerHTML (less ideal)
                 lastMessageElement.innerHTML += '<br>' + sanitizedMessage;
             }
         } else {
             const messageElement = document.createElement('div');
             messageElement.classList.add('mb-2', 'p-3', 'rounded-lg', 'max-w-2xl', 'break-words', 'text-sm', 'shadow-sm');
             messageElement.dataset.source = source;
-            messageElement.dataset.wsMessageType = wsMessageType; // Store the WebSocket message type
+            messageElement.dataset.wsMessageType = wsMessageType;
 
             let sourcePrefix = "";
             let prefixClasses = "font-semibold message-sender-tag";
@@ -241,11 +234,11 @@ document.addEventListener('DOMContentLoaded', () => {
             } else if (source === 'status' || source === 'system' || source === 'system_critical' || source === 'system_warning') {
                 messageElement.classList.add('bg-yellow-100', 'text-yellow-800', 'self-center', 'text-xs', 'italic', 'text-center', 'py-1', 'px-2');
                 sourcePrefix = 'Status:';
-                if(source === 'system_critical') messageElement.classList.replace('bg-yellow-100','bg-red-200'); messageElement.classList.replace('text-yellow-800','text-red-800');
+                if(source === 'system_critical') {messageElement.classList.replace('bg-yellow-100','bg-red-200'); messageElement.classList.replace('text-yellow-800','text-red-800');}
             } else if (source === 'error' || source === 'system_error') {
                 messageElement.classList.add('bg-red-100', 'text-red-700', 'self-start', 'mr-auto', 'font-semibold');
                 sourcePrefix = 'Error:';
-            } else { // unknown
+            } else { 
                 messageElement.classList.add('bg-gray-50', 'text-gray-500', 'self-center', 'text-xs', 'italic');
                 sourcePrefix = 'System:';
             }
@@ -258,17 +251,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function sendWebSocketMessage(type, payload) {
         if (ws && ws.readyState === WebSocket.OPEN) {
-            // This script version relies on backend to send thinking_started/finished
-            // If you want client-managed thinking, call startThinking() here.
-            // startThinking("Sending request..."); 
-
-            const message = JSON.stringify({ type: type, ...payload }); // Ensure payload is spread if it's an object
+            // Client-managed thinking: Start thinking indicator *before* sending.
+            startThinking("Sending request..."); 
+            
+            const message = JSON.stringify({ type: type, ...payload }); 
             ws.send(message);
             console.log("Sent to WS:", message);
         } else {
             addMessageToChat('error', "WebSocket is not connected. Cannot send message.", "ws_error_send");
             console.error("WebSocket is not connected.");
-            // stopThinking("Connection error."); // If client-managed thinking
+            stopThinking("Connection error."); // Stop thinking if WS is not open
         }
     }
 
@@ -277,11 +269,8 @@ document.addEventListener('DOMContentLoaded', () => {
             let specData = specInput.value.trim();
             const url = specUrlInput.value.trim();
             const file = specFileInput.files[0];
-            let source_type = 'text'; // Renamed from 'source' to avoid conflict
             let userMessage = "";
-
-            // Prepare the payload for the backend
-            let payload = { source: source_type }; // Default source
+            let payload = { source: 'text' }; // Default source
 
             if (file) {
                 const reader = new FileReader();
@@ -297,11 +286,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 reader.onerror = function(e) {
                     addMessageToChat('error', 'Error reading file.', "file_error");
                     console.error("File reading error:", e);
+                    stopThinking("File error."); // Stop thinking if file read fails
                 };
                 reader.readAsText(file);
             } else if (url) {
                 payload.source = 'url';
-                payload.openapi_spec_url = url; // Backend will fetch
+                payload.openapi_spec_url = url;
                 userMessage = `Submitted OpenAPI Spec from URL: ${url}`;
                 addMessageToChat('user', userMessage, "user_spec_submission");
                 sendWebSocketMessage('process_openapi_spec', payload);
@@ -313,7 +303,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 sendWebSocketMessage('process_openapi_spec', payload);
             } else {
                 addMessageToChat('error', 'Please provide an OpenAPI spec (text, URL, or file).', "input_error");
-                return;
+                return; 
             }
         });
     }
@@ -323,15 +313,9 @@ document.addEventListener('DOMContentLoaded', () => {
             const messageText = userInput.value.trim();
             if (messageText) {
                 addMessageToChat('user', messageText, "user_interaction");
-                // Pass current_graph if your backend needs it for context
-                // The backend message structure for 'user_interaction' might expect 'text' and 'current_graph' in a 'content' object.
-                // Adjust based on your backend's send_websocket_message_helper and how it structures the received JSON.
-                // For now, assuming backend directly uses top-level keys from the payload.
                 sendWebSocketMessage('user_interaction', { 
                     text: messageText, 
-                    current_graph_elements: currentGraph ? currentGraph.elements : null, // Or send full currentGraph if needed
-                    // The backend's handle_websocket_connection and _initialize_bot_state_for_turn
-                    // will need to correctly parse this.
+                    current_graph_elements: currentGraph ? currentGraph.elements : null,
                 });
                 userInput.value = '';
             }
@@ -365,52 +349,37 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
     
-    // --- runCurrentWorkflow ---
-    // Make it globally accessible if called by onclick, or add event listener
     window.runCurrentWorkflow = function() {
-        if (!currentGraph || !currentGraph.elements) { // Check if graph and its elements exist
+        if (!currentGraph || (!currentGraph.elements && (!currentGraph.nodes || !currentGraph.edges))) { 
             addMessageToChat('error', "No workflow graph is loaded or graph is empty.", "workflow_error");
             return;
         }
         addMessageToChat('user', "Attempting to run the current workflow...", "user_action");
-        // The backend's handle_websocket_connection will receive this.
-        // It needs to route it appropriately, likely to Graph 1 to set up Graph 2.
-        // The payload should match what _initialize_bot_state_for_turn and the router expect.
-        sendWebSocketMessage('user_interaction', { // Using 'user_interaction' to go through the main router
-            text: "run workflow", // User input that the router can understand
-            // current_graph: currentGraph, // Send the whole graph object if needed by the router/planner
-            // For simplicity, the router might just look for the "run workflow" text.
-            // If Graph 1 needs the graph data to initiate Graph 2, ensure it's available in BotState.
+        sendWebSocketMessage('user_interaction', { 
+            text: "run workflow", 
         });
     };
-    // If runWorkflowButton exists, you could also do:
-    // if (runWorkflowButton) {
-    // runWorkflowButton.addEventListener('click', runCurrentWorkflow);
-    // }
 
 
     function displayApiResponse(data) {
         if (!apiResponseContainer || !apiResponseContent) return;
         
-        let contentHtml = `<h3 class="text-lg font-semibold mb-2">${data.operation_id || data.node_id || 'API Response'}</h3>`; // Use node_id if operation_id missing
+        let contentHtml = `<h3 class="text-lg font-semibold mb-2">${data.operation_id || data.node_id || 'API Response'}</h3>`;
         contentHtml += `<p class="text-sm mb-1"><span class="font-semibold">Status:</span> ${data.status_code || 'N/A'}</p>`;
         
         if (data.headers) {
             contentHtml += '<p class="text-sm mb-1"><span class="font-semibold">Headers:</span></p>';
             contentHtml += `<pre class="bg-gray-100 p-2 rounded text-xs overflow-x-auto max-h-32"><code>${escapeHtml(JSON.stringify(data.headers, null, 2))}</code></pre>`;
         }
-        if (data.body || data.error) { // Check for body or error
+        if (data.body || data.error) { 
             contentHtml += `<p class="text-sm mt-2 mb-1"><span class="font-semibold">${data.error ? 'Error Body:' : 'Body:'}</span></p>`;
-            let bodyContent = data.body || data.error; // Display error if body is not present
+            let bodyContent = data.body || data.error; 
             
-            // Attempt to parse and pretty-print if JSON, otherwise display as is
             try {
                 const parsedBody = (typeof bodyContent === 'string') ? JSON.parse(bodyContent) : bodyContent;
                 bodyContent = JSON.stringify(parsedBody, null, 2);
             } catch (e) {
-                // Not a JSON string, or already an object that couldn't be stringified well.
-                // Or just plain text. Keep bodyContent as is.
-                if (typeof bodyContent !== 'string') { // Ensure it's a string for escapeHtml
+                if (typeof bodyContent !== 'string') { 
                    bodyContent = String(bodyContent);
                 }
             }
@@ -424,7 +393,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function escapeHtml(unsafe) {
         if (typeof unsafe !== 'string') {
             try {
-                unsafe = String(unsafe); // Convert to string if not already
+                unsafe = String(unsafe); 
             } catch (e) {
                 return ''; 
             }
@@ -437,7 +406,7 @@ document.addEventListener('DOMContentLoaded', () => {
              .replace(/'/g, "&#039;");
     }
 
-    function renderGraph(graphData) { // graphData is expected to be the object from backend (e.g., GraphOutput.model_dump())
+    function renderGraph(graphData) { 
         if (!graphContainer || !window.cytoscape) {
             console.error("Graph container or Cytoscape library not found.");
             if (!window.cytoscape) addMessageToChat('error', "Cytoscape library not loaded. Cannot render graph.", "graph_error");
@@ -447,24 +416,24 @@ document.addEventListener('DOMContentLoaded', () => {
 
         try {
             let elementsToRender;
-            if (graphData && graphData.nodes && graphData.edges) { // Common structure for Cytoscape elements
+            if (graphData && graphData.nodes && graphData.edges) { 
                 elementsToRender = { nodes: graphData.nodes, edges: graphData.edges };
-            } else if (graphData && graphData.elements) { // If backend sends it under 'elements' key
+            } else if (graphData && graphData.elements) { 
                  elementsToRender = graphData.elements;
             } else {
                 console.warn("Graph data is missing 'nodes'/'edges' or 'elements'. Attempting to use graphData directly if it's an array (legacy).", graphData);
-                // Fallback for older structures or direct element arrays, though less likely with Pydantic models
-                elementsToRender = Array.isArray(graphData) ? graphData : []; 
+                elementsToRender = Array.isArray(graphData) ? graphData : {nodes: [], edges: []}; // Ensure it's an object for cytoscape
                 if (!Array.isArray(graphData) || graphData.length === 0) {
                      addMessageToChat('status', 'Graph data is empty or in an unexpected format.', 'graph_status');
                 }
             }
             
-            if (!elementsToRender || (!elementsToRender.nodes && !elementsToRender.edges && !Array.isArray(elementsToRender)) ) {
-                logger.error("No valid elements found to render graph.");
-                addMessageToChat('status', 'No graph elements to display.', 'graph_status');
-                return;
+            // Ensure elementsToRender is always an object with nodes/edges arrays for Cytoscape
+            if (!elementsToRender || (typeof elementsToRender !== 'object')) {
+                 elementsToRender = {nodes: [], edges: []};
             }
+            if (!elementsToRender.nodes) elementsToRender.nodes = [];
+            if (!elementsToRender.edges) elementsToRender.edges = [];
 
 
             const cy = window.cytoscape({
@@ -517,12 +486,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (node.data('description')) {
                     content += `<br/><strong>Desc:</strong> ${escapeHtml(node.data('description'))}`;
                 }
-                if(node.data('status')) { // If nodes have status from backend
+                if(node.data('status')) { 
                     content += `<br/><strong>Status:</strong> ${node.data('status')}`;
                 }
                 
                 if (typeof tippy === 'function') {
-                    const tippyInstance = tippy(node.popperRef(), { // node.popperRef() is correct
+                    const tippyInstance = tippy(node.popperRef(), { 
                         content: content, trigger: 'manual', allowHTML: true,
                         placement: 'top', arrow: true, interactive: true, 
                         theme: 'light-border', 
