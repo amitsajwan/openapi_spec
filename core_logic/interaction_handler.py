@@ -245,4 +245,205 @@ class InteractionHandler:
         return state
 
     def _internal_contextualize_graph_descriptions(self, state: BotState, new_context: str) -> str:
-        tool_name = "_internal_contextual
+        tool_name = "_internal_contextualize_graph_descriptions"
+        if not state.execution_graph or not isinstance(state.execution_graph, GraphOutput):
+            return "No graph to contextualize or graph is invalid."
+        if not new_context:
+            return "No new context provided for contextualization."
+
+        logger.info(f"Attempting to contextualize graph descriptions with context: {new_context[:100]}...")
+        
+        if state.execution_graph.description:
+            prompt_overall = (
+                f"Current overall graph description: \"{state.execution_graph.description}\"\n"
+                f"New User Context/Focus: \"{new_context}\"\n\n"
+                f"Rewrite the graph description to incorporate this new context/focus, keeping it concise. Output only the new description text."
+            )
+            try:
+                state.execution_graph.description = llm_call_helper(self.worker_llm, prompt_overall)
+                logger.info(f"Overall graph description contextualized: {state.execution_graph.description[:100]}...")
+            except Exception as e:
+                logger.error(f"Error contextualizing overall graph description: {e}")
+
+        nodes_to_update = [n for n in state.execution_graph.nodes if n.operationId not in ["START_NODE", "END_NODE"]][:3] # Limit for brevity
+        for node in nodes_to_update:
+            if node.description: 
+                prompt_node = (
+                    f"Current description for node '{node.effective_id}' ({node.summary}): \"{node.description}\"\n"
+                    f"Overall User Context/Focus for the graph: \"{new_context}\"\n\n"
+                    f"Rewrite this node's description to align with the new context, focusing on its role in the workflow under this context. Output only the new description text for this node."
+                )
+                try:
+                    node.description = llm_call_helper(self.worker_llm, prompt_node)
+                    logger.info(f"Node '{node.effective_id}' description contextualized: {node.description[:100]}...")
+                except Exception as e:
+                    logger.error(f"Error contextualizing node '{node.effective_id}' description: {e}")
+        
+        if state.execution_graph:
+            state.scratchpad['graph_to_send'] = state.execution_graph.model_dump_json(indent=2) 
+        
+        state.update_scratchpad_reason(tool_name, f"Graph descriptions contextualized with context: {new_context[:70]}.")
+        return f"Graph descriptions have been updated to reflect the context: '{new_context[:70]}...'."
+
+    def interactive_query_executor(self, state: BotState) -> BotState:
+        tool_name = "interactive_query_executor"
+        plan = state.scratchpad.get('interactive_action_plan', [])
+        idx = state.scratchpad.get('current_interactive_action_idx', 0)
+        results = state.scratchpad.get('current_interactive_results', []) 
+        
+        if not plan or idx >= len(plan):
+            final_response_message = "Finished interactive processing. "
+            if results:
+                final_response_message += (str(results[-1])[:200] + "..." if len(str(results[-1])) > 200 else str(results[-1]))
+            else:
+                final_response_message += "No specific actions were taken or results to report."
+            
+            if not state.response or state.response.startswith("Executing internal step"): # Avoid overwriting a more specific response from the last action
+                state.response = final_response_message
+            
+            logger.info("Interactive plan execution completed or no plan.")
+            state.next_step = "responder"
+            state.update_scratchpad_reason(tool_name, "Interactive plan execution completed or no plan.")
+            return state
+        
+        action = plan[idx]
+        action_name = action.get("action_name")
+        action_params = action.get("action_params", {})
+        action_description = action.get("description", "No description for action.") 
+        
+        state.response = f"Executing internal step ({idx + 1}/{len(plan)}): {action_description[:70]}..."
+        state.update_scratchpad_reason(tool_name, f"Executing action ({idx + 1}/{len(plan)}): {action_name} - {action_description}")
+        action_result_message = f"Action '{action_name}' completed." # Default success message
+        
+        try:
+            if action_name == "rerun_payload_generation":
+                op_ids = action_params.get("operation_ids_to_update", [])
+                new_ctx = action_params.get("new_context", "")
+                if op_ids and new_ctx: 
+                    # Delegate to SpecProcessor instance
+                    self.spec_processor._generate_payload_descriptions(state, target_apis=op_ids, context_override=new_ctx)
+                    action_result_message = f"Payload examples update requested for {op_ids} with context '{new_ctx[:30]}...'."
+                    # state.response might be updated by _generate_payload_descriptions
+                else:
+                    action_result_message = "Skipped rerun_payload_generation: Missing operation_ids or new_context."
+                state.next_step = "interactive_query_executor" 
+            
+            elif action_name == "contextualize_graph_descriptions":
+                new_ctx_graph = action_params.get("new_context_for_graph", "")
+                if new_ctx_graph:
+                    action_result_message = self._internal_contextualize_graph_descriptions(state, new_ctx_graph)
+                else:
+                    action_result_message = "Skipped contextualize_graph_descriptions: Missing new_context_for_graph."
+                state.next_step = "interactive_query_executor"
+            
+            elif action_name == "regenerate_graph_with_new_goal":
+                new_goal = action_params.get("new_goal_string")
+                if new_goal: 
+                    state.plan_generation_goal = new_goal
+                    state.execution_graph = None # Reset graph
+                    state.graph_refinement_iterations = 0
+                    state.scratchpad['graph_gen_attempts'] = 0
+                    state.scratchpad['refinement_validation_failures'] = 0
+                    state = self.graph_generator._generate_execution_graph(state, goal=new_goal) 
+                    action_result_message = f"Graph regeneration started for new goal: {new_goal[:50]}..."
+                    # next_step is set by _generate_execution_graph (e.g., to verify_graph)
+                else: 
+                    action_result_message = "Skipped regenerate_graph_with_new_goal: Missing new_goal_string."
+                    state.next_step = "interactive_query_executor" 
+            
+            elif action_name == "refine_existing_graph_structure":
+                refinement_instr = action_params.get("refinement_instructions_for_structure")
+                if refinement_instr and state.execution_graph and isinstance(state.execution_graph, GraphOutput): 
+                    state.graph_regeneration_reason = refinement_instr
+                    state.scratchpad['refinement_validation_failures'] = 0 # Reset for this attempt
+                    state = self.graph_generator.refine_api_graph(state) 
+                    action_result_message = f"Graph refinement (structure) started with instructions: {refinement_instr[:50]}..."
+                    # next_step is set by refine_api_graph (e.g., to verify_graph)
+                elif not state.execution_graph or not isinstance(state.execution_graph, GraphOutput): 
+                    action_result_message = "Skipped refine_existing_graph_structure: No graph exists or invalid type."
+                    state.next_step = "interactive_query_executor"
+                else: 
+                    action_result_message = "Skipped refine_existing_graph_structure: Missing refinement_instructions_for_structure."
+                    state.next_step = "interactive_query_executor"
+            
+            elif action_name == "answer_query_directly":
+                query_to_answer = action_params.get("query_for_synthesizer", state.user_input or "")
+                original_user_input = state.user_input # Save original
+                state.user_input = query_to_answer # Set for answer_openapi_query
+                state = self.answer_openapi_query(state) # This will set state.response and next_step to "responder"
+                state.user_input = original_user_input # Restore original
+                action_result_message = f"Direct answer generated for: {query_to_answer[:50]}..."
+            
+            elif action_name == "setup_workflow_execution_interactive":
+                state = self.workflow_control.setup_workflow_execution(state) 
+                action_result_message = f"Workflow execution setup initiated. Status: {state.workflow_execution_status}."
+                # setup_workflow_execution sets next_step to "responder"
+                if idx + 1 < len(plan): # If there are more actions, this is unusual
+                    logger.warning("More actions planned after setup_workflow_execution_interactive. These will likely be skipped as setup routes to responder.")
+            
+            elif action_name == "resume_workflow_with_payload_interactive":
+                confirmed_payload = action_params.get("confirmed_payload")
+                if confirmed_payload and isinstance(confirmed_payload, dict): 
+                    state = self.workflow_control.resume_workflow_with_payload(state, confirmed_payload) 
+                    action_result_message = f"Workflow resumption with payload prepared. Status: {state.workflow_execution_status}."
+                else: 
+                    action_result_message = "Skipped resume_workflow: Missing or invalid confirmed_payload."
+                state.next_step = "responder" # Resume always goes to responder to finalize turn
+            
+            elif action_name == "synthesize_final_answer":
+                synthesis_instr = action_params.get("synthesis_prompt_instructions", "Summarize actions and provide a final response.")
+                all_prior_results_summary = "; ".join([str(r)[:150] for r in results]) # Include current action's default message
+                
+                final_synthesis_prompt = (
+                    f"User's original query: '{state.user_input}'.\n"
+                    f"My understanding of the query: '{state.scratchpad.get('user_query_understanding', 'N/A')}'.\n"
+                    f"Internal actions taken and their results (summary): {all_prior_results_summary if all_prior_results_summary else 'No specific actions taken or results to summarize.'}\n"
+                    f"Additional instructions for synthesis: {synthesis_instr}\n\n"
+                    f"Based on all the above, formulate a comprehensive and helpful final answer for the user in Markdown format."
+                )
+                try:
+                    state.response = llm_call_helper(self.worker_llm, final_synthesis_prompt)
+                    action_result_message = "Final answer synthesized." # This result is for logging, state.response is for user
+                except Exception as e:
+                    logger.error(f"Error synthesizing final answer: {e}")
+                    state.response = f"Sorry, I encountered an error while synthesizing the final answer: {str(e)[:100]}"
+                    action_result_message = "Error during final answer synthesis."
+                state.next_step = "responder" 
+            
+            else: 
+                action_result_message = f"Unknown or unhandled action: {action_name}."
+                logger.warning(action_result_message)
+                state.next_step = "interactive_query_executor" # Continue to next action if any
+        
+        except Exception as e_action: 
+            logger.error(f"Error executing action '{action_name}': {e_action}", exc_info=True)
+            action_result_message = f"Error during action '{action_name}': {str(e_action)[:100]}..."
+            state.response = action_result_message # Update response with error
+            state.next_step = "interactive_query_executor" # Try next action or finish
+        
+        results.append(action_result_message) # Log the outcome of the current action
+        state.scratchpad['current_interactive_action_idx'] = idx + 1
+        state.scratchpad['current_interactive_results'] = results 
+        
+        # If the current action didn't set a specific next_step (like "responder" or a graph step),
+        # and there are more actions, continue. Otherwise, go to responder.
+        if state.next_step == "interactive_query_executor": 
+            if state.scratchpad['current_interactive_action_idx'] >= len(plan): 
+                # If all actions are done and the last one wasn't a terminal one
+                if action_name not in ["synthesize_final_answer", "answer_query_directly", "setup_workflow_execution_interactive", "resume_workflow_with_payload_interactive"]:
+                    logger.info(f"Interactive plan finished after action '{action_name}'. Finalizing with synthesis.")
+                    # Construct a summary of all results for the synthesis
+                    all_results_summary_for_final_synth = "; ".join([str(r)[:100] + ('...' if len(str(r)) > 100 else '') for r in results])
+                    final_synthesis_instr = (
+                        f"The user's query was: '{state.user_input}'. My understanding was: '{state.scratchpad.get('user_query_understanding', 'N/A')}'. "
+                        f"The following internal actions were taken with these results: {all_results_summary_for_final_synth}. "
+                        f"Please formulate a comprehensive final answer to the user based on these actions and results."
+                    )
+                    try:
+                        state.response = llm_call_helper(self.worker_llm, final_synthesis_instr)
+                    except Exception as e_synth:
+                        logger.error(f"Error during final synthesis in interactive_query_executor: {e_synth}")
+                        state.response = "Processed your request. " + (str(results[-1])[:100] if results else "")
+                state.next_step = "responder"
+        return state
+
