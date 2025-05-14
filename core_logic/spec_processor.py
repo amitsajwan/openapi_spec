@@ -13,13 +13,12 @@ from utils import (
     get_cache_key,
     SCHEMA_CACHE,
 )
-# Removed openapi-spec-validator imports:
-# from openapi_spec_validator import (
-#     openapi_v2_spec_validator,
-#     openapi_v30_spec_validator,
-#     openapi_v31_spec_validator,
-# )
-# from openapi_spec_validator.validation.exceptions import OpenAPIValidationError
+# Re-add openapi-spec-validator imports for v3.x
+from openapi_spec_validator import (
+    openapi_v30_spec_validator,
+    openapi_v31_spec_validator,
+)
+from openapi_spec_validator.validation.exceptions import OpenAPIValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +33,9 @@ MAX_PAYLOAD_SAMPLES_TO_GENERATE_SINGLE_PASS = int(
 
 class SpecProcessor:
     """
-    Handles parsing and initial analysis of OpenAPI specifications,
-    including generating summaries, identifying APIs, and creating payload descriptions.
-    Schema validation via openapi-spec-validator has been removed.
+    Handles parsing, validation (for OpenAPI 3.0.x, 3.1.x), and initial analysis
+    of OpenAPI specifications, including generating summaries, identifying APIs,
+    and creating payload descriptions.
     """
 
     def __init__(self, worker_llm: Any):
@@ -67,16 +66,16 @@ class SpecProcessor:
     def parse_openapi_spec(self, state: BotState) -> BotState:
         """
         Parses the OpenAPI specification string provided in BotState.
-        Updates BotState with the parsed schema, cache key, and status.
-        Does NOT perform schema validation using openapi-spec-validator.
-        Handles caching of successfully parsed specifications.
+        Validates for OpenAPI 3.0.x and 3.1.x. Other versions are parsed but not validated by this specific logic.
+        Updates BotState with the parsed (and potentially validated) schema, cache key, and status.
+        Handles caching of successfully parsed and validated/processed specifications.
         """
         tool_name = "parse_openapi_spec"
         self._queue_intermediate_message(
-            state, "Parsing OpenAPI specification (validation step removed)..."
+            state, "Parsing OpenAPI specification (with v3.x validation)..."
         )
         state.update_scratchpad_reason(
-            tool_name, "Attempting to parse OpenAPI spec (validation removed)."
+            tool_name, "Attempting to parse and validate (v3.x) OpenAPI spec."
         )
         spec_text = state.openapi_spec_string
 
@@ -88,8 +87,8 @@ class SpecProcessor:
             return state
 
         cache_key = get_cache_key(spec_text)
-        # Adjusted cache key to reflect that this is parsed, not externally validated
-        cached_full_analysis_key = f"{cache_key}_full_analysis_parsed_only"
+        # Cache key reflects that v3.x specs are validated, others just parsed.
+        cached_full_analysis_key = f"{cache_key}_full_analysis_v3_validated_or_parsed"
 
         if SCHEMA_CACHE:
             cached_schema_artifacts = load_cached_schema(cached_full_analysis_key)
@@ -116,11 +115,11 @@ class SpecProcessor:
                     state.openapi_spec_string = None
 
                     logger.info(
-                        f"Loaded parsed OpenAPI data and analysis from cache: {cached_full_analysis_key}"
+                        f"Loaded processed OpenAPI data and analysis from cache: {cached_full_analysis_key}"
                     )
                     self._queue_intermediate_message(
                         state,
-                        "OpenAPI specification and derived analysis (parsed only) loaded from cache.",
+                        "OpenAPI specification and derived analysis (v3 validated or parsed) loaded from cache.",
                     )
                     if state.execution_graph and isinstance(state.execution_graph, GraphOutput):
                         state.scratchpad['graph_to_send'] = state.execution_graph.model_dump_json(indent=2)
@@ -129,9 +128,9 @@ class SpecProcessor:
                 except Exception as e:
                     logger.warning(
                         f"Error rehydrating state from cached full analysis (key: {cached_full_analysis_key}): {e}. "
-                        "Proceeding with fresh parsing."
+                        "Proceeding with fresh parsing and potential validation."
                     )
-                    state.openapi_schema = None
+                    state.openapi_schema = None # Reset fields
                     state.schema_summary = None
                     state.identified_apis = []
                     state.payload_descriptions = {}
@@ -180,56 +179,95 @@ class SpecProcessor:
             state.update_scratchpad_reason(tool_name, "Parsed content not a dict.")
             return state
 
-        # --- Validation Block Removed ---
-        # The openapi-spec-validator logic was here.
-        # Without it, we assume the parsed_spec_dict is usable if parsing succeeded.
-        # The primary risk is that $ref pointers are not resolved and the schema might be structurally invalid
-        # according to OpenAPI rules, which could cause issues downstream.
+        # --- OpenAPI 3.x Validation Block ---
+        spec_version_str = str(parsed_spec_dict.get("openapi", "")).strip()
+        is_swagger_v2 = "swagger" in parsed_spec_dict and str(parsed_spec_dict.get("swagger", "")).strip().startswith("2")
+        
+        validation_performed = False
+        validation_successful = False
 
-        # Check for basic OpenAPI structure heuristically
-        if not (parsed_spec_dict.get("openapi") or parsed_spec_dict.get("swagger")) or \
-           not parsed_spec_dict.get("info") or \
-           not parsed_spec_dict.get("paths"):
-            state.openapi_schema = None
-            state.openapi_spec_string = None
-            self._queue_intermediate_message(
-                state,
-                "Parsed specification appears to be missing essential OpenAPI fields (openapi/swagger, info, paths). "
-                "Proceeding with caution, but analysis might be incomplete or fail.",
-            )
-            logger.warning(
-                "Parsed spec is missing key OpenAPI fields. Downstream processing might fail."
-            )
-            # Allow proceeding to the pipeline, but the user is warned.
-            # Alternatively, could route to responder here if strictness is desired.
-            # state.next_step = "responder"
-            # For now, let's try to process it.
-            state.openapi_schema = parsed_spec_dict # Store the parsed schema
-            state.schema_cache_key = cache_key
-            state.openapi_spec_text = spec_text
-            state.openapi_spec_string = None
-            state.next_step = "process_schema_pipeline"
+        try:
+            if spec_version_str.startswith("3.0"):
+                logger.info(f"Attempting to validate as OpenAPI v3.0.x specification (Version: {spec_version_str}).")
+                # The .validate() method resolves $refs and returns the (potentially modified) spec dict on success.
+                # It raises OpenAPIValidationError on failure.
+                validated_spec_dict = openapi_v30_spec_validator.validate(parsed_spec_dict)
+                parsed_spec_dict = validated_spec_dict # Use the spec with resolved refs
+                validation_performed = True
+                validation_successful = True
+                logger.info("OpenAPI 3.0.x specification validated successfully (references resolved).")
+            elif spec_version_str.startswith("3.1"):
+                logger.info(f"Attempting to validate as OpenAPI v3.1.x specification (Version: {spec_version_str}).")
+                validated_spec_dict = openapi_v31_spec_validator.validate(parsed_spec_dict)
+                parsed_spec_dict = validated_spec_dict # Use the spec with resolved refs
+                validation_performed = True
+                validation_successful = True
+                logger.info("OpenAPI 3.1.x specification validated successfully (references resolved).")
+            elif is_swagger_v2:
+                logger.warning(
+                    "Swagger 2.0 specification detected. Specific validation for v2.0 is not currently implemented in this path. "
+                    "Proceeding with the parsed structure. $ref resolution will not occur via validator."
+                )
+                # No validation_performed, validation_successful remains False
+            elif spec_version_str: # OpenAPI key exists but not 3.0.x or 3.1.x
+                 logger.warning(
+                    f"Unsupported OpenAPI version for specific validation: '{spec_version_str}'. "
+                    "Proceeding with the parsed structure. $ref resolution will not occur via validator."
+                )
+            else: # No 'openapi' or 'swagger' key, or empty version string
+                logger.warning(
+                    "Could not determine OpenAPI version from 'openapi' or 'swagger' field for specific validation. "
+                    "Proceeding with parsed structure. $ref resolution will not occur via validator."
+                )
 
-        else:
-            # If basic fields are present, proceed.
+            # If validation was attempted and successful, or if not a targeted v3 version
             state.openapi_schema = parsed_spec_dict
             state.schema_cache_key = cache_key
             state.openapi_spec_text = spec_text
             state.openapi_spec_string = None
 
-            logger.info(
-                "Successfully parsed OpenAPI spec. Validation step has been removed. "
-                "References ($ref) within the spec may not be resolved."
+            if validation_performed and validation_successful:
+                self._queue_intermediate_message(
+                    state,
+                    "OpenAPI 3.x specification parsed and validated. Starting analysis pipeline...",
+                )
+            elif validation_performed and not validation_successful: # Should be caught by except OpenAPIValidationError
+                 pass # Error already handled by exception block
+            else: # No specific v3 validation was performed (e.g., v2 or unknown)
+                 self._queue_intermediate_message(
+                    state,
+                    "OpenAPI specification parsed (specific v3 validation not applicable/performed). Starting analysis pipeline...",
+                )
+            state.next_step = "process_schema_pipeline"
+
+        except OpenAPIValidationError as val_e:
+            state.openapi_schema = None
+            state.openapi_spec_string = None
+            error_detail = str(val_e.message if hasattr(val_e, 'message') else val_e)
+            if hasattr(val_e, 'instance') and hasattr(val_e, 'schema_path'):
+                 error_detail_path = "->".join(map(str, val_e.schema_path)) # type: ignore
+                 error_detail = f"Validation error at path '{error_detail_path}' for instance segment '{str(val_e.instance)[:100]}...': {val_e.message}"
+            self._queue_intermediate_message(
+                state, f"OpenAPI 3.x specification is invalid: {error_detail[:500]}"
             )
+            logger.error(f"OpenAPI 3.x Validation failed: {error_detail}", exc_info=False)
+            state.next_step = "responder"
+        except Exception as e_general_processing:
+            state.openapi_schema = None
+            state.openapi_spec_string = None
             self._queue_intermediate_message(
                 state,
-                "OpenAPI specification parsed (validation removed). Starting analysis pipeline...",
+                f"Error during OpenAPI parsing or validation attempt: {str(e_general_processing)[:200]}",
             )
-            state.next_step = "process_schema_pipeline"
+            logger.error(
+                f"Unexpected error during parsing/validation: {e_general_processing}",
+                exc_info=True,
+            )
+            state.next_step = "responder"
         
         state.update_scratchpad_reason(
             tool_name,
-            f"Parsing status: {'Success (basic fields check)' if state.openapi_schema else 'Failed or missing key fields'}. Response: {state.response}",
+            f"Parsing and Validation (v3.x) status: {'Success' if state.openapi_schema else 'Failed'}. Response: {state.response}",
         )
         return state
 
@@ -259,12 +297,21 @@ class SpecProcessor:
             paths_preview_list.append(f"  {p}: {methods}")
         paths_preview = "\n".join(paths_preview_list)
 
+        # Note for LLM if validation status is relevant
+        validation_note = ""
+        spec_version_str = str(state.openapi_schema.get("openapi", "")).strip()
+        if spec_version_str.startswith("3.0") or spec_version_str.startswith("3.1"):
+            validation_note = "The schema was validated for OpenAPI 3.x, so $ref pointers should be resolved."
+        else:
+            validation_note = "The schema was parsed; $ref pointers might be unresolved if not OpenAPI 3.x or if validation was skipped for other versions."
+
+
         summary_prompt = (
             f"Summarize the following API specification. Focus on its main purpose, "
             f"key resources/capabilities, and any mentioned authentication schemes. Be concise (around 100-150 words).\n\n"
             f"Title: {title}\nVersion: {version}\nDescription: {description[:500]}...\n"
             f"Number of paths: {num_paths}\nExample Paths (first 3):\n{paths_preview}\n\n"
-            f"Note: The schema was parsed but not validated by an external tool, so $ref pointers might be unresolved.\n"
+            f"Note: {validation_note}\n"
             f"Concise Summary:"
         )
         try:
@@ -316,9 +363,9 @@ class SpecProcessor:
                     "method": method.upper(),
                     "summary": operation_details.get("summary", ""),
                     "description": operation_details.get("description", ""),
-                    "parameters": operation_details.get("parameters", []), # These might contain $refs
-                    "requestBody": operation_details.get("requestBody", {}), # This might contain $refs
-                    "responses": operation_details.get("responses", {}), # These might contain $refs
+                    "parameters": operation_details.get("parameters", []), 
+                    "requestBody": operation_details.get("requestBody", {}), 
+                    "responses": operation_details.get("responses", {}), 
                 }
                 apis.append(api_info)
         state.identified_apis = apis
@@ -334,7 +381,7 @@ class SpecProcessor:
     ):
         """
         Generates example request payloads and response structure descriptions for API operations.
-        Warns that schemas might contain unresolved $refs.
+        Notes to LLM if schema was validated (meaning $refs should be resolved).
         """
         tool_name = "_generate_payload_descriptions"
         self._queue_intermediate_message(
@@ -396,43 +443,52 @@ class SpecProcessor:
                 param_name = p_detail.get("name", "N/A")
                 param_in = p_detail.get("in", "N/A")
                 param_type = "N/A"
-                # Schemas might contain $refs here
                 if 'schema' in p_detail and isinstance(p_detail['schema'], dict):
-                    param_type = p_detail['schema'].get('type', str(p_detail['schema'])) # Show $ref if type missing
+                    param_type = p_detail['schema'].get('type', str(p_detail['schema'])) 
                     if param_type == 'array' and 'items' in p_detail['schema'] and isinstance(p_detail['schema']['items'], dict):
                         param_type = f"array of {p_detail['schema']['items'].get('type', str(p_detail['schema']['items']))}"
                 params_summary_list.append(f"{param_name}({param_in}, type: {param_type})")
             params_summary_str = ", ".join(params_summary_list) if params_summary_list else "None"
             
-            request_body_schema_str = "N/A (or may contain $refs)"
+            request_body_schema_str = "N/A"
             if api_op.get('requestBody') and isinstance(api_op['requestBody'], dict):
                 content = api_op['requestBody'].get('content', {})
                 json_content = content.get('application/json', {})
-                schema = json_content.get('schema', {}) # This schema might contain $refs
+                schema = json_content.get('schema', {}) 
                 if schema:
                     request_body_schema_str = json.dumps(schema, indent=2)[:500] + "..."
 
-            success_response_schema_str = "N/A (or may contain $refs)"
+            success_response_schema_str = "N/A"
             responses = api_op.get("responses", {})
             for status_code, resp_details in responses.items():
                 if status_code.startswith("2") and isinstance(resp_details, dict):
                     content = resp_details.get("content", {})
                     json_content = content.get("application/json", {})
-                    schema = json_content.get("schema", {}) # This schema might contain $refs
+                    schema = json_content.get("schema", {}) 
                     if schema:
                         success_response_schema_str = json.dumps(schema, indent=2)[:300] + "..."
                         break
+            
+            # Note for LLM if validation status is relevant
+            validation_note_for_payload = ""
+            spec_version_str_payload = str(state.openapi_schema.get("openapi", "")).strip() if state.openapi_schema else ""
+            if spec_version_str_payload.startswith("3.0") or spec_version_str_payload.startswith("3.1"):
+                validation_note_for_payload = "The schema was validated for OpenAPI 3.x, so $ref pointers in the provided schemas below should be resolved."
+            else:
+                validation_note_for_payload = "The schema was parsed; $ref pointers in the provided schemas below might be unresolved if not OpenAPI 3.x or if validation was skipped for other versions."
+
 
             context_str = f" User Context: {context_override}." if context_override else ""
             prompt = (
                 f"API Operation: {op_id} ({api_op['method']} {api_op['path']})\n"
                 f"Summary: {api_op.get('summary', 'N/A')}\n{context_str}\n"
                 f"Parameters: {params_summary_str}\n"
-                f"Request Body Schema (if application/json; may contain unresolved $ref pointers):\n```json\n{request_body_schema_str}\n```\n"
-                f"Successful (2xx) Response Schema (sample, if application/json; may contain unresolved $ref pointers):\n```json\n{success_response_schema_str}\n```\n\n"
+                f"Note on Schemas: {validation_note_for_payload}\n"
+                f"Request Body Schema (if application/json):\n```json\n{request_body_schema_str}\n```\n"
+                f"Successful (2xx) Response Schema (sample, if application/json):\n```json\n{success_response_schema_str}\n```\n\n"
                 f"Task: Provide a concise, typical, and REALISTIC JSON example for the request payload (if applicable for this method and API design). "
-                f"Use plausible, real-world example values based on the parameter names, types, and the API schema. Be aware that the provided schemas might contain $ref pointers that are not resolved. "
-                f"If a schema is just a $ref (e.g., {{\"'$ref'\": \"#/components/schemas/User\"}}), assume a plausible structure for that referenced object based on its name. "
+                f"Use plausible, real-world example values based on the parameter names, types, and the API schema. "
+                f"If a schema was just a $ref (e.g., {{\"'$ref'\": \"#/components/schemas/User\"}}) before validation, the validator should have resolved it if it was OpenAPI 3.x. Base your example on the (potentially resolved) schema provided. "
                 f"For example, if a field is 'email', use 'user@example.com'. If 'count', use a number like 5. "
                 f"Also, provide a brief description of the expected JSON response structure for a successful call, based on the schema. "
                 f"Focus on key fields. If no request payload is typically needed (e.g., for GET with only path/query params), state 'No request payload needed.' clearly. "
@@ -488,7 +544,7 @@ class SpecProcessor:
         
         if not state.openapi_schema:
             self._queue_intermediate_message(
-                state, "Cannot run pipeline: No schema loaded (parsing may have failed)."
+                state, "Cannot run pipeline: No schema loaded (parsing or validation may have failed)."
             )
             state.next_step = "handle_unknown"
             return state
@@ -525,21 +581,20 @@ class SpecProcessor:
         if (
             state.openapi_schema and state.schema_cache_key and SCHEMA_CACHE and
             state.execution_graph and 
-            state.next_step not in ["handle_unknown", "responder_with_error_from_pipeline"]
+            state.next_step not in ["handle_unknown", "responder_with_error_from_pipeline"] # A more specific error state if needed
         ):
             full_analysis_data = {
-                "openapi_schema": state.openapi_schema,
+                "openapi_schema": state.openapi_schema, # This is the (potentially) $ref-resolved schema if validation ran
                 "schema_summary": state.schema_summary,
                 "identified_apis": state.identified_apis,
                 "payload_descriptions": state.payload_descriptions,
                 "execution_graph": state.execution_graph.model_dump() if state.execution_graph and isinstance(state.execution_graph, GraphOutput) else None,
                 "plan_generation_goal": state.plan_generation_goal,
             }
-            # Use the adjusted cache key
-            cached_full_analysis_key = f"{state.schema_cache_key}_full_analysis_parsed_only"
+            cached_full_analysis_key = f"{state.schema_cache_key}_full_analysis_v3_validated_or_parsed"
             save_schema_to_cache(cached_full_analysis_key, full_analysis_data)
             logger.info(
-                f"Saved parsed data and analysis to cache: {cached_full_analysis_key}"
+                f"Saved processed data and analysis to cache: {cached_full_analysis_key}"
             )
             
         state.update_scratchpad_reason(
