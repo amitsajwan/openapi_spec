@@ -1,8 +1,9 @@
 # llm_config.py
 import os
 import logging
-from typing import Tuple, Any, Dict
+from typing import Tuple, Any, Dict 
 import json # Added for mock graph generation
+import asyncio # For potential async operations in mock or real LLMs
 
 # Attempt to import the ChatGoogleGenerativeAI class
 try:
@@ -26,10 +27,12 @@ USE_MOCK_LLMS_ENV_VAR = "USE_MOCK_LLMS"
 # --- Model Names ---
 ROUTER_LLM_MODEL_NAME = os.getenv("ROUTER_LLM_MODEL_NAME", "gemini-1.5-flash-latest")
 WORKER_LLM_MODEL_NAME = os.getenv("WORKER_LLM_MODEL_NAME", "gemini-1.5-pro-latest")
+UTILITY_LLM_MODEL_NAME = os.getenv("UTILITY_LLM_MODEL_NAME", "gemini-1.5-flash-latest") # Smaller model for utility tasks
 
 # --- LLM Configuration Parameters ---
 ROUTER_LLM_TEMPERATURE = float(os.getenv("ROUTER_LLM_TEMPERATURE", "0.2"))
 WORKER_LLM_TEMPERATURE = float(os.getenv("WORKER_LLM_TEMPERATURE", "0.7"))
+UTILITY_LLM_TEMPERATURE = float(os.getenv("UTILITY_LLM_TEMPERATURE", "0.3")) # Temp for utility tasks
 
 # --- Mock LLM Implementation ---
 class MockLLMContent:
@@ -41,13 +44,15 @@ class MockLLM:
     """
     A mock LLM class that mimics the behavior of a LangChain LLM.
     It returns predefined responses based on simple keyword matching in the prompt.
+    Can simulate async behavior for testing asyncio.gather.
     """
-    def __init__(self, name: str = "MockLLM"):
+    def __init__(self, name: str = "MockLLM", simulate_async_delay: float = 0.01):
         self.name = name
+        self.simulate_async_delay = simulate_async_delay
         # Predefined responses for the router
         self.router_responses: Dict[str, str] = {
             "classify this intent: 'show me the user details api.'": "answer_openapi_query",
-            "classify the user's intent. choose one of the following:": "answer_openapi_query", # Default for router
+            "classify the user's intent. choose one of the following:": "answer_openapi_query",
             "run this workflow": "setup_workflow_execution",
             "execute the plan": "setup_workflow_execution",
             "focus the plan on": "interactive_query_planner",
@@ -56,13 +61,8 @@ class MockLLM:
             "what if i want to change": "interactive_query_planner",
             "here is the confirmed payload": "interactive_query_planner",
         }
-        # Predefined responses for the worker
+        # Predefined responses for the worker (more complex tasks)
         self.worker_responses: Dict[str, str] = {
-            "summarize the following api specification": "This is a mock API summary. It describes a set of endpoints for managing items and users.",
-            "provide a concise, typical json example": json.dumps({
-                "Request Payload Example": "```json\n{\"name\": \"mockItem\", \"value\": 123}\n```",
-                "Expected Response Structure": "Returns an object with id, name, and status."
-            }),
             "design an api execution graph as a json object": self._generate_mock_graph_output(),
             "refine the current graph based on the feedback": self._generate_mock_graph_output(refined=True),
             "provide a concise, user-friendly natural language description of this workflow": "This is a mock workflow description: It starts, gets some data, processes it, and then ends.",
@@ -76,18 +76,26 @@ class MockLLM:
             "rewrite the graph description to incorporate this new context/focus": "Mock contextualized graph description.",
             "rewrite this node's description to align with the new context": "Mock contextualized node description.",
             "formulate a comprehensive and helpful final answer for the user": "This is a mock synthesized final answer based on the actions taken."
-
         }
-        logger.info(f"{self.name} initialized.")
+        # Predefined responses for the utility LLM (simpler tasks)
+        self.utility_responses: Dict[str, str] = {
+            "the following text is an openapi specification, potentially in json or yaml format": "openapi: 3.0.3\ninfo:\n  title: Cleaned API by Mock Utility LLM\n  version: '1.0'\npaths:\n  /items:\n    get:\n      summary: Get items\n      responses:\n        '200':\n          description: A list of items.", # Mock cleanup response
+            "summarize the following api specification": "This is a mock API summary from Utility LLM. It describes a set of endpoints.",
+            "provide a concise, typical json example": json.dumps({ # For payload descriptions
+                "Request Payload Example": "```json\n{\"name\": \"mockItemFromUtility\", \"value\": 456}\n```",
+                "Expected Response Structure": "Utility LLM: Returns an object with id and name."
+            }),
+        }
+        logger.info(f"{self.name} initialized. Async delay: {self.simulate_async_delay}s")
 
     def _generate_mock_graph_output(self, refined: bool = False) -> str:
         """Generates a consistent mock GraphOutput JSON string."""
-        graph_desc = "Initial mock graph."
-        refinement_summary = "Initial graph with 2 steps."
+        graph_desc = "Initial mock graph by Worker LLM."
+        refinement_summary = "Initial graph with 2 steps by Worker LLM."
         if refined:
-            graph_desc = "Refined mock graph with an extra step."
-            refinement_summary = "Refined the graph to include a logging step."
-
+            graph_desc = "Refined mock graph with an extra step by Worker LLM."
+            refinement_summary = "Refined the graph to include a logging step by Worker LLM."
+        # ... (rest of the mock graph output as before)
         return json.dumps({
             "graph_id": "mock-graph-123",
             "description": graph_desc,
@@ -105,7 +113,12 @@ class MockLLM:
             "refinement_summary": refinement_summary
         })
 
-    def invoke(self, prompt: Any) -> MockLLMContent:
+    async def ainvoke(self, prompt: Any, **kwargs) -> MockLLMContent: # Langchain uses ainvoke for async
+        """ Mimics async invoke for testing asyncio.gather """
+        await asyncio.sleep(self.simulate_async_delay)
+        return self.invoke(prompt) # Delegate to synchronous logic after delay
+
+    def invoke(self, prompt: Any, **kwargs) -> MockLLMContent:
         """
         Mimics the LLM's invoke method.
         Returns a MockLLMContent object containing a predefined response.
@@ -113,38 +126,55 @@ class MockLLM:
         prompt_str = str(prompt).lower()
         logger.debug(f"{self.name} received prompt (first 200 chars): {prompt_str[:200]}...")
 
-        response_dict = self.router_responses if "classify" in prompt_str else self.worker_responses
+        response_dict = {}
+        if "Router" in self.name:
+            response_dict = self.router_responses
+        elif "Worker" in self.name: # Default to worker if not specified, or if name matches
+            response_dict = {**self.worker_responses, **self.utility_responses} # Worker can also do utility tasks if needed
+        elif "Utility" in self.name:
+            response_dict = self.utility_responses
+        
+        # More specific matching for utility tasks if this is the utility LLM
+        if "Utility" in self.name:
+            if "the following text is an openapi specification" in prompt_str: # Cleanup task
+                 return MockLLMContent(self.utility_responses["the following text is an openapi specification, potentially in json or yaml format"])
+            if "summarize the following api specification" in prompt_str: # Summary task
+                 return MockLLMContent(self.utility_responses["summarize the following api specification"])
+            if "provide a concise, typical json example" in prompt_str: # Payload desc task
+                 return MockLLMContent(self.utility_responses["provide a concise, typical json example"])
+
 
         for keyword, response in response_dict.items():
             if keyword.lower() in prompt_str:
                 logger.info(f"{self.name} matched keyword '{keyword}' and will return: {str(response)[:100]}...")
                 return MockLLMContent(response)
 
-        default_response = "I'm a mock LLM and I don't have a specific answer for that."
-        if "json" in prompt_str or "graphoutput" in prompt_str.lower():
+        default_response = f"I'm {self.name} and I don't have a specific answer for that."
+        if "json" in prompt_str or "graphoutput" in prompt_str.lower(): # Graph generation for worker
             default_response = self._generate_mock_graph_output()
-        elif "classify" in prompt_str:
+        elif "classify" in prompt_str: # Router fallback
              default_response = "handle_unknown"
 
         logger.warning(f"{self.name} did not find a keyword match. Returning default response: {default_response[:100]}...")
         return MockLLMContent(default_response)
 
-def _get_mock_llms() -> Tuple[MockLLM, MockLLM]:
+def _get_mock_llms() -> Tuple[MockLLM, MockLLM, MockLLM]:
     """Helper function to instantiate and return mock LLMs."""
-    logger.info("Instantiating Mock LLMs.")
+    logger.info("Instantiating Mock LLMs (Router, Worker, Utility).")
     mock_router_llm = MockLLM(name="MockRouterLLM")
     mock_worker_llm = MockLLM(name="MockWorkerLLM")
-    return mock_router_llm, mock_worker_llm
+    mock_utility_llm = MockLLM(name="MockUtilityLLM", simulate_async_delay=0.05) # Slightly more delay for utility
+    return mock_router_llm, mock_worker_llm, mock_utility_llm
 
-def initialize_llms() -> Tuple[Any, Any]:
+def initialize_llms() -> Tuple[Any, Any, Any]:
     """
-    Initializes and returns the router and worker LLMs.
+    Initializes and returns the router, worker, and utility LLMs.
     - If USE_MOCK_LLMS is 'true', uses mock LLMs.
-    - Otherwise, tries to use real Google LLMs if 'langchain-google-genai' is installed AND GOOGLE_API_KEY is set.
+    - Otherwise, tries to use real Google LLMs.
     - Falls back to mock LLMs if real LLM initialization fails or prerequisites are missing.
 
     Returns:
-        A tuple containing (router_llm, worker_llm).
+        A tuple containing (router_llm, worker_llm, utility_llm).
     """
     use_mocks_explicitly = os.getenv(USE_MOCK_LLMS_ENV_VAR, "false").lower() == "true"
 
@@ -152,7 +182,6 @@ def initialize_llms() -> Tuple[Any, Any]:
         logger.info("Explicitly using Mock LLMs as USE_MOCK_LLMS is set to true.")
         return _get_mock_llms()
 
-    # --- Attempt Real LLM Initialization ---
     if not LANGCHAIN_GOOGLE_GENAI_AVAILABLE:
         logger.warning(
             "Real LLMs implicitly requested (USE_MOCK_LLMS is not 'true'), but 'langchain-google-genai' is not installed. "
@@ -186,7 +215,15 @@ def initialize_llms() -> Tuple[Any, Any]:
         )
         logger.info(f"Real Worker LLM initialized successfully with model: {WORKER_LLM_MODEL_NAME}")
 
-        return router_llm, worker_llm
+        utility_llm = ChatGoogleGenerativeAI(
+            model=UTILITY_LLM_MODEL_NAME,
+            temperature=UTILITY_LLM_TEMPERATURE,
+            google_api_key=google_api_key,
+            convert_system_message_to_human=True,
+        )
+        logger.info(f"Real Utility LLM initialized successfully with model: {UTILITY_LLM_MODEL_NAME}")
+
+        return router_llm, worker_llm, utility_llm
 
     except Exception as e:
         logger.error(f"Failed to initialize real Google Generative AI models: {e}. Falling back to Mock LLMs.", exc_info=True)
@@ -194,66 +231,24 @@ def initialize_llms() -> Tuple[Any, Any]:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
-
-    # Scenario 1: Explicitly use mocks
+    # ... (Test scenarios can be updated to check for three LLMs) ...
     logger.info("\n--- Scenario 1: Testing with USE_MOCK_LLMS=true ---")
     os.environ[USE_MOCK_LLMS_ENV_VAR] = "true"
-    # Unset API key to ensure it's not accidentally used
-    if GOOGLE_API_KEY_ENV_VAR in os.environ:
-        del os.environ[GOOGLE_API_KEY_ENV_VAR]
+    if GOOGLE_API_KEY_ENV_VAR in os.environ: del os.environ[GOOGLE_API_KEY_ENV_VAR]
     try:
-        router, worker = initialize_llms()
-        logger.info(f"Initialized LLMs: Router type = {type(router).__name__}, Worker type = {type(worker).__name__}")
-        assert isinstance(router, MockLLM) and isinstance(worker, MockLLM), "Should be MockLLM instances"
+        r_llm, w_llm, u_llm = initialize_llms()
+        logger.info(f"Initialized LLMs: Router='{type(r_llm).__name__}', Worker='{type(w_llm).__name__}', Utility='{type(u_llm).__name__}'")
+        assert isinstance(r_llm, MockLLM) and isinstance(w_llm, MockLLM) and isinstance(u_llm, MockLLM)
+        # Test utility mock
+        # cleanup_resp = u_llm.invoke("the following text is an openapi specification")
+        # logger.info(f"Mock utility cleanup response: {cleanup_resp.content[:100]}...")
+        # summary_resp = u_llm.invoke("summarize the following api specification")
+        # logger.info(f"Mock utility summary response: {summary_resp.content[:100]}...")
+
         logger.info("Scenario 1 PASSED: Explicitly used mock LLMs.")
-    except Exception as e:
-        logger.error(f"Error in Scenario 1: {e}", exc_info=True)
+    except Exception as e_main:
+        logger.error(f"Error in main test block (Scenario 1): {e_main}", exc_info=True)
     finally:
-        del os.environ[USE_MOCK_LLMS_ENV_VAR]
-
-    # Scenario 2: Implicitly request real LLMs, but no API key (should fall back to mocks)
-    logger.info("\n--- Scenario 2: Testing with no API key (should fall back to mocks) ---")
-    # Ensure USE_MOCK_LLMS is not true
-    if USE_MOCK_LLMS_ENV_VAR in os.environ:
-        del os.environ[USE_MOCK_LLMS_ENV_VAR]
-    # Ensure API key is not set
-    if GOOGLE_API_KEY_ENV_VAR in os.environ:
-        del os.environ[GOOGLE_API_KEY_ENV_VAR]
-    try:
-        router, worker = initialize_llms()
-        logger.info(f"Initialized LLMs: Router type = {type(router).__name__}, Worker type = {type(worker).__name__}")
-        if LANGCHAIN_GOOGLE_GENAI_AVAILABLE: # Only assert mock if the lib is there, otherwise it's expected to be mock
-            assert isinstance(router, MockLLM) and isinstance(worker, MockLLM), "Should fall back to MockLLM instances if no API key"
-            logger.info("Scenario 2 PASSED: Fell back to mock LLMs due to missing API key.")
-        else:
-            assert isinstance(router, MockLLM) and isinstance(worker, MockLLM), "Should use MockLLM if langchain-google-genai not available"
-            logger.info("Scenario 2 PASSED: Used mock LLMs as langchain-google-genai is not available.")
-
-    except Exception as e:
-        logger.error(f"Error in Scenario 2: {e}", exc_info=True)
-
-
-    # Scenario 3: Attempt real LLMs with API key (if key is provided externally and lib is installed)
-    logger.info("\n--- Scenario 3: Testing with API key (if GOOGLE_API_KEY is set externally) ---")
-    # Ensure USE_MOCK_LLMS is not true
-    if USE_MOCK_LLMS_ENV_VAR in os.environ:
-        del os.environ[USE_MOCK_LLMS_ENV_VAR]
-    # User must set GOOGLE_API_KEY in their environment for this to run with real LLMs
-    if os.getenv(GOOGLE_API_KEY_ENV_VAR) and LANGCHAIN_GOOGLE_GENAI_AVAILABLE:
-        try:
-            router, worker = initialize_llms()
-            logger.info(f"Initialized LLMs: Router type = {type(router).__name__}, Worker type = {type(worker).__name__}")
-            assert not isinstance(router, MockLLM), "Should be a real LLM instance if API key is provided"
-            logger.info("Scenario 3 PASSED: Initialized real LLMs (GOOGLE_API_KEY was set).")
-            # Example invoke (optional, uncomment to test further)
-            # response = router.invoke("Hello")
-            # logger.info(f"Real router response: {response.content}")
-        except Exception as e:
-            logger.error(f"Error in Scenario 3: {e}", exc_info=True)
-    elif not LANGCHAIN_GOOGLE_GENAI_AVAILABLE:
-        logger.warning("Scenario 3 SKIPPED: langchain-google-genai not installed. Cannot test real LLMs.")
-    else:
-        logger.warning(f"Scenario 3 SKIPPED: {GOOGLE_API_KEY_ENV_VAR} not set in environment. Cannot test real LLMs.")
+        if USE_MOCK_LLMS_ENV_VAR in os.environ: del os.environ[USE_MOCK_LLMS_ENV_VAR]
 
     logger.info("\nDirect test of llm_config.py completed.")
-    
