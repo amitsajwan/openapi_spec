@@ -1,6 +1,6 @@
 # core_logic/interaction_handler.py
 import logging
-import json # For debug printing if needed
+import json # For preparing schema snippet
 import os
 from typing import Any, Dict, Optional
 
@@ -8,8 +8,6 @@ from models import BotState, GraphOutput
 from utils import llm_call_helper, parse_llm_json_output_with_model
 # To avoid circular imports, InteractionHandler will call methods on instances
 # of GraphGenerator and SpecProcessor passed to its constructor.
-# from .graph_generator import GraphGenerator # Not imported directly
-# from .spec_processor import SpecProcessor # Not imported directly
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +15,9 @@ logger = logging.getLogger(__name__)
 MAX_APIS_IN_PROMPT_SUMMARY_SHORT = int(
     os.getenv("MAX_APIS_IN_PROMPT_SUMMARY_SHORT", "10")
 )
+# Max characters for the schema overview snippet in the prompt
+MAX_SCHEMA_OVERVIEW_LENGTH = int(os.getenv("MAX_SCHEMA_OVERVIEW_LENGTH", "2000"))
+
 
 class InteractionHandler:
     """
@@ -29,7 +30,7 @@ class InteractionHandler:
         worker_llm: Any,
         graph_generator_instance: Any, # Instance of GraphGenerator
         spec_processor_instance: Any,   # Instance of SpecProcessor
-        api_executor_instance: Any # Instance of APIExecutor (passed for setup_workflow_execution context, not direct calls)
+        api_executor_instance: Any # Instance of APIExecutor
     ):
         """
         Initializes the InteractionHandler.
@@ -46,7 +47,7 @@ class InteractionHandler:
         self.worker_llm = worker_llm
         self.graph_generator = graph_generator_instance
         self.spec_processor = spec_processor_instance
-        self.api_executor = api_executor_instance # Stored for context, not direct execution
+        self.api_executor = api_executor_instance
         logger.info("InteractionHandler initialized.")
 
     def _queue_intermediate_message(self, state: BotState, msg: str):
@@ -85,7 +86,7 @@ class InteractionHandler:
             graph_desc = state.execution_graph.description
             final_desc_for_user = ""
 
-            if not graph_desc or len(graph_desc) < 20: # If description is too short or missing
+            if not graph_desc or len(graph_desc) < 20:
                 logger.info("Graph description is short or missing, generating a dynamic one.")
                 node_summaries = []
                 for node in state.execution_graph.nodes:
@@ -93,7 +94,7 @@ class InteractionHandler:
                         f"- {node.effective_id}: {node.summary or node.operationId[:50]}"
                     )
 
-                nodes_str = "\n".join(node_summaries[:5]) # Show first 5 nodes
+                nodes_str = "\n".join(node_summaries[:5])
                 if len(node_summaries) > 5:
                     nodes_str += f"\n- ... and {len(node_summaries) - 5} more nodes."
 
@@ -106,7 +107,7 @@ class InteractionHandler:
                 )
                 try:
                     dynamic_desc = llm_call_helper(self.worker_llm, prompt)
-                    if graph_desc and graph_desc != dynamic_desc: # If there was an old short one
+                    if graph_desc and graph_desc != dynamic_desc:
                         final_desc_for_user = (
                             f"**Overall Workflow Plan for: '{state.plan_generation_goal or 'General Use'}'**\n\n"
                             f"{dynamic_desc}\n\n"
@@ -124,7 +125,7 @@ class InteractionHandler:
                         f"**Current API Workflow for: '{state.plan_generation_goal or 'General Use'}'**\n\n"
                         f"{graph_desc or f'No detailed description available. The graph includes nodes like {default_node_preview}'}"
                     )
-            else: # Use existing sufficient description
+            else:
                 final_desc_for_user = (
                     f"**Current API Workflow for: '{state.plan_generation_goal or 'General Use'}'**\n\n"
                     f"{graph_desc}"
@@ -134,7 +135,6 @@ class InteractionHandler:
                 final_desc_for_user += f"\n\n**Last Refinement Note:** {state.execution_graph.refinement_summary}"
 
             self._queue_intermediate_message(state, final_desc_for_user)
-            # Ensure graph JSON is also sent to UI if not already
             if 'graph_to_send' not in state.scratchpad and state.execution_graph:
                  try:
                      state.scratchpad['graph_to_send'] = state.execution_graph.model_dump_json(indent=2)
@@ -165,7 +165,7 @@ class InteractionHandler:
         else:
             try:
                 graph_json_str = state.execution_graph.model_dump_json(indent=2)
-                state.scratchpad["graph_to_send"] = graph_json_str # For UI to pick up
+                state.scratchpad["graph_to_send"] = graph_json_str
                 self._queue_intermediate_message(
                     state,
                     "The current API workflow graph is available in the graph view. You can also copy the JSON from there if needed.",
@@ -180,7 +180,8 @@ class InteractionHandler:
 
     def answer_openapi_query(self, state: BotState) -> BotState:
         """
-        Answers user questions based on the loaded OpenAPI specification and generated graph.
+        Answers user questions based on the loaded OpenAPI specification, generated graph,
+        and a snippet of the processed schema.
         """
         tool_name = "answer_openapi_query"
         self._queue_intermediate_message(state, "Thinking about your question...")
@@ -203,9 +204,57 @@ class InteractionHandler:
         if state.user_input:
             context_parts.append(f"User Question: \"{state.user_input}\"")
 
+        # Add OpenAPI Schema Overview (truncated)
+        if state.openapi_schema:
+            try:
+                limited_schema_for_prompt = {
+                    "info": state.openapi_schema.get("info", {}),
+                    "servers": state.openapi_schema.get("servers", []),
+                }
+                paths_overview = {}
+                paths_count = 0
+                for path_url, path_item in state.openapi_schema.get("paths", {}).items():
+                    if paths_count >= 5:  # Limit to first 5 paths for overview
+                        paths_overview["... (more paths exist)"] = "..."
+                        break
+                    path_methods_summary = {}
+                    if isinstance(path_item, dict):
+                        for method, op_details in path_item.items():
+                            if isinstance(op_details, dict):
+                                path_methods_summary[method] = {
+                                    "summary": (op_details.get("summary", "N/A")[:70] + "...") if op_details.get("summary") else "N/A",
+                                    "operationId": op_details.get("operationId", "N/A")
+                                }
+                    paths_overview[path_url] = path_methods_summary
+                    paths_count += 1
+                if paths_overview:
+                    limited_schema_for_prompt["paths_overview"] = paths_overview
+                
+                component_schemas_overview = {}
+                schemas_count = 0
+                if "components" in state.openapi_schema and isinstance(state.openapi_schema["components"], dict):
+                    for schema_name, schema_def in state.openapi_schema["components"].get("schemas", {}).items():
+                        if schemas_count >= 5: # Limit to first 5 schema names
+                            component_schemas_overview["... (more schemas exist)"] = "..."
+                            break
+                        component_schemas_overview[schema_name] = {"type": schema_def.get("type", "object/ref")} # Indicate type or if it's a ref (though v3 refs should be resolved)
+                        schemas_count += 1
+                if component_schemas_overview:
+                     limited_schema_for_prompt["components_schemas_overview"] = component_schemas_overview
+
+                spec_detail_str = json.dumps(limited_schema_for_prompt, indent=2)
+                if len(spec_detail_str) > MAX_SCHEMA_OVERVIEW_LENGTH:
+                    spec_detail_str = spec_detail_str[:MAX_SCHEMA_OVERVIEW_LENGTH] + "\n... (specification details truncated)"
+                
+                context_parts.append(f"\n### OpenAPI Specification Structure Overview (JSON):\n```json\n{spec_detail_str}\n```")
+            except Exception as e:
+                logger.error(f"Error preparing openapi_schema detail for prompt: {e}")
+                context_parts.append("\n### OpenAPI Specification Structure Overview:\nError preparing schema details for display.")
+
+
         if state.schema_summary:
             context_parts.append(
-                f"\n### API Specification Summary (from validated schema)\n{state.schema_summary}"
+                f"\n### API Specification Summary (AI Generated):\n{state.schema_summary}"
             )
 
         identified_apis_md = "\n### Identified API Operations (Sample):\n"
@@ -245,13 +294,15 @@ class InteractionHandler:
             )
 
         payload_descriptions_md = (
-            "\n### Available Payload/Response Examples (for reference):\n"
+            "\n### Available Payload/Response Examples (AI Generated, for reference):\n"
         )
         if state.payload_descriptions:
-            for op_id, desc_text in state.payload_descriptions.items():
+            for op_id, desc_text in list(state.payload_descriptions.items())[:3]: # Show first 3 examples
                 payload_descriptions_md += (
                     f"**For Operation ID `{op_id}`:**\n```text\n{desc_text[:300]}...\n```\n\n"
                 )
+            if len(state.payload_descriptions) > 3:
+                payload_descriptions_md += "... and more examples exist for other operations.\n"
         else:
             payload_descriptions_md += (
                 "No detailed payload/response examples have been generated yet.\n"
@@ -264,7 +315,13 @@ class InteractionHandler:
                 "No specific API context available, but an OpenAPI spec might be loaded."
             )
 
-        prompt = f"""You are an expert API assistant. Your task is to answer the user's question based on the provided context. Use Markdown for formatting.
+        prompt = f"""You are an expert API assistant. Your task is to answer the user's question based on the provided context.
+        The context includes:
+        1.  An "OpenAPI Specification Structure Overview" (a truncated JSON snippet of the actual schema, potentially with resolved $refs for OpenAPI 3.x).
+        2.  An "API Specification Summary" (AI-generated high-level summary).
+        3.  A list of "Identified API Operations" with their summaries.
+        4.  A "Current Workflow Graph Description" if a plan exists.
+        5.  "Available Payload/Response Examples" (AI-generated examples for some operations).
 
         Context:
         {full_context}
@@ -272,19 +329,17 @@ class InteractionHandler:
         User Question: "{state.user_input}"
 
         **Instructions for Answering:**
-        1.  **Understand the Question:** Determine if the user is asking for general information, details about a specific API, or "how-to" perform an action (e.g., "how to create a product").
-        2.  **For "How-To" Questions (e.g., "how to create X", "how do I update Y?"):**
-            a.  Identify the most relevant API operation(s) from the "Identified API Operations" list that would achieve the user's goal (e.g., a POST to `/products` for "create product").
+        1.  **Prioritize Information:** Use the "OpenAPI Specification Structure Overview" for direct schema details (like exact field names, data types if visible, or structure of paths and components). Supplement this with information from other context sections.
+        2.  **Understand the Question:** Determine if the user is asking for general information, details about a specific API, or "how-to" perform an action.
+        3.  **For "How-To" Questions:**
+            a.  Identify relevant API operation(s) from the "Identified API Operations" or "OpenAPI Specification Structure Overview".
             b.  State the identified operation: its Operation ID, Method, and Path.
-            c.  Refer to the "Available Payload/Response Examples" for the identified Operation ID. Describe the necessary request body structure based on its example. Mention key fields and their expected data types or example values.
-            d.  List any important path or query parameters.
-            e.  Briefly describe the expected successful response.
-            f.  If multiple operations seem relevant, briefly mention them.
-        3.  **For Questions about Specific APIs (e.g., "what does 'getUser' do?"):**
-            a.  Find the API in the "Identified API Operations" list by its Operation ID or path.
-            b.  Provide its summary, method, path.
-            c.  If available, use its "Payload/Response Example" to describe its request/response.
-        4.  **For General Questions:** Use the API Specification Summary and other relevant context.
+            c.  Refer to "Payload/Response Examples" or infer from the "OpenAPI Specification Structure Overview" for request body structure and key fields.
+            d.  List important path or query parameters.
+            e.  Describe the expected successful response.
+        4.  **For Questions about Specific APIs:**
+            a.  Find the API in "Identified API Operations" or "OpenAPI Specification Structure Overview".
+            b.  Provide its summary, method, path. Use the "OpenAPI Specification Structure Overview" for more precise details if needed.
         5.  **Clarity and Conciseness:** Provide a clear, concise, and helpful answer.
         6.  **Formatting:** Use Markdown (headings, lists, bolding, code blocks for JSON examples or API paths).
         7.  **Unavailable Information:** If the information is not available in the context, state that clearly. Do not invent details.
@@ -325,7 +380,6 @@ class InteractionHandler:
             f"Entering interactive query planner for input: {state.user_input[:100] if state.user_input else 'N/A'}",
         )
 
-        # Clear previous interactive plan state
         state.scratchpad.pop("interactive_action_plan", None)
         state.scratchpad.pop("current_interactive_action_idx", None)
         state.scratchpad.pop("current_interactive_results", None)
@@ -342,9 +396,9 @@ class InteractionHandler:
         prompt = f"""User Query: "{state.user_input}"
 
 Current State Context:
-- API Spec Summary: {'Available (from validated spec)' if state.schema_summary else 'Not available.'}
+- API Spec Summary: {'Available' if state.schema_summary else 'Not available.'}
 - Identified APIs count: {len(state.identified_apis) if state.identified_apis else 0}. Example OpIDs: {", ".join([api['operationId'] for api in state.identified_apis[:3]])}...
-- Example Payload Descriptions available for OpIDs (sample, from validated spec): {payload_keys_sample}...
+- Example Payload Descriptions available for OpIDs (sample): {payload_keys_sample}...
 - Current Execution Graph Goal: {state.plan_generation_goal or 'Not set.'}
 - Current Graph Description: {graph_summary}
 - Workflow Execution Status: {state.workflow_execution_status}
@@ -358,7 +412,7 @@ Available Internal Actions (choose one or more in sequence, output as a JSON lis
     Params: {{ "new_goal_string": "User's new goal, incorporating the structural change (e.g., 'Workflow to X, then Y, and then Z as the last step')" }}
 4.  `refine_existing_graph_structure`: For minor structural adjustments to the existing graph (e.g., "add API Z after Y but before END_NODE", "remove API X"). This implies the overall goal is similar but the sequence/nodes need adjustment. The LLM will be asked to refine the current graph JSON.
     Params: {{ "refinement_instructions_for_structure": "User's specific feedback for structural refinement (e.g., 'Add operation Z after Y', 'Ensure X comes before Y')" }}
-5.  `answer_query_directly`: If the query can be answered using existing information (API summary, API list, current graph description, existing payload examples) without modifications to artifacts.
+5.  `answer_query_directly`: If the query can be answered using existing information (API summary, API list, current graph description, existing payload examples, schema overview) without modifications to artifacts.
     Params: {{ "query_for_synthesizer": "The original user query or a rephrased one for direct answering." }}
 6.  `setup_workflow_execution_interactive`: If the user asks to run/execute the current graph. This action prepares the system for execution.
     Params: {{ "initial_parameters": {{ "param1": "value1" }} }} (Optional initial parameters for the workflow, if provided by user)
@@ -402,7 +456,7 @@ If the query is ambiguous or cannot be handled by available actions, use "synthe
                     "interactive_action_plan"
                 ]
                 state.scratchpad["current_interactive_action_idx"] = 0
-                state.scratchpad["current_interactive_results"] = [] # Initialize results list
+                state.scratchpad["current_interactive_results"] = []
                 self._queue_intermediate_message(
                     state,
                     f"Understood query: {state.scratchpad['user_query_understanding']}. Starting internal actions...",
@@ -424,7 +478,7 @@ If the query is ambiguous or cannot be handled by available actions, use "synthe
                 state,
                 f"Sorry, I encountered an error while planning how to address your request: {str(e)[:100]}...",
             )
-            state.next_step = "answer_openapi_query" # Fallback
+            state.next_step = "answer_openapi_query"
 
         state.update_scratchpad_reason(
             tool_name,
@@ -435,11 +489,8 @@ If the query is ambiguous or cannot be handled by available actions, use "synthe
     def _internal_contextualize_graph_descriptions(
         self, state: BotState, new_context: str
     ) -> str:
-        """
-        Internal helper to rewrite graph descriptions based on new context.
-        Called by interactive_query_executor.
-        """
-        tool_name = "_internal_contextualize_graph_descriptions" # For scratchpad logging
+        """Internal helper to rewrite graph descriptions based on new context."""
+        tool_name = "_internal_contextualize_graph_descriptions"
         if not state.execution_graph or not isinstance(
             state.execution_graph, GraphOutput
         ):
@@ -467,17 +518,16 @@ If the query is ambiguous or cannot be handled by available actions, use "synthe
                 )
             except Exception as e:
                 logger.error(f"Error contextualizing overall graph description: {e}")
-                state.execution_graph.description = original_graph_desc # Revert on error
+                state.execution_graph.description = original_graph_desc
 
-        # Contextualize a few node descriptions as well (limit to avoid too many LLM calls)
         nodes_to_update = [
             n
             for n in state.execution_graph.nodes
             if n.operationId not in ["START_NODE", "END_NODE"]
-        ][:3] # Limit to first 3 API nodes
+        ][:3]
         for node in nodes_to_update:
             original_node_desc = node.description
-            if node.description: # Only update if a description exists
+            if node.description:
                 prompt_node = (
                     f"Current description for node '{node.effective_id}' ({node.summary}): \"{node.description}\"\n"
                     f"Overall User Context/Focus for the graph: \"{new_context}\"\n\n"
@@ -492,9 +542,7 @@ If the query is ambiguous or cannot be handled by available actions, use "synthe
                     logger.error(
                         f"Error contextualizing node '{node.effective_id}' description: {e}"
                     )
-                    node.description = original_node_desc # Revert on error
-
-        # Mark graph for UI update
+                    node.description = original_node_desc
         if state.execution_graph:
             state.scratchpad["graph_to_send"] = state.execution_graph.model_dump_json(
                 indent=2
@@ -506,16 +554,13 @@ If the query is ambiguous or cannot be handled by available actions, use "synthe
         return f"Graph descriptions have been updated to reflect the context: '{new_context[:70]}...'."
 
     def interactive_query_executor(self, state: BotState) -> BotState:
-        """
-        Executes the planned sequence of internal actions from interactive_query_planner.
-        """
+        """Executes the planned sequence of internal actions."""
         tool_name = "interactive_query_executor"
         plan = state.scratchpad.get("interactive_action_plan", [])
         idx = state.scratchpad.get("current_interactive_action_idx", 0)
         results = state.scratchpad.get("current_interactive_results", [])
 
         if not plan or idx >= len(plan):
-            # All actions in the plan are completed
             final_response_message = "Finished interactive processing. "
             if results:
                 last_result_str = str(results[-1])
@@ -527,7 +572,6 @@ If the query is ambiguous or cannot be handled by available actions, use "synthe
             else:
                 final_response_message += "No specific actions were taken or results to report."
             
-            # Only set state.response if it wasn't meaningfully set by the last action
             if not state.response or state.response.startswith("Executing internal step"):
                  self._queue_intermediate_message(state, final_response_message)
 
@@ -550,24 +594,22 @@ If the query is ambiguous or cannot be handled by available actions, use "synthe
             tool_name,
             f"Executing action ({idx + 1}/{len(plan)}): {action_name} - {action_description}",
         )
-        action_result_message = f"Action '{action_name}' completed." # Default success
+        action_result_message = f"Action '{action_name}' completed."
 
         try:
             if action_name == "rerun_payload_generation":
                 op_ids = action_params.get("operation_ids_to_update", [])
                 new_ctx = action_params.get("new_context", "")
                 if op_ids and isinstance(op_ids, list) and new_ctx:
-                    # Delegate to SpecProcessor instance
                     self.spec_processor._generate_payload_descriptions(
                         state, target_apis=op_ids, context_override=new_ctx
                     )
                     action_result_message = (
                         f"Payload examples update requested for {op_ids} with context '{new_ctx[:30]}...'."
                     )
-                    # state.response might be updated by _generate_payload_descriptions
                 else:
                     action_result_message = "Skipped rerun_payload_generation: Missing operation_ids or new_context, or invalid format."
-                state.next_step = "interactive_query_executor" # Continue to next action in plan
+                state.next_step = "interactive_query_executor"
 
             elif action_name == "contextualize_graph_descriptions":
                 new_ctx_graph = action_params.get("new_context_for_graph", "")
@@ -583,14 +625,13 @@ If the query is ambiguous or cannot be handled by available actions, use "synthe
                 new_goal = action_params.get("new_goal_string")
                 if new_goal:
                     state.plan_generation_goal = new_goal
-                    state.execution_graph = None # Reset graph for regeneration
+                    state.execution_graph = None
                     state.graph_refinement_iterations = 0
                     state.scratchpad['graph_gen_attempts'] = 0
                     state.scratchpad['refinement_validation_failures'] = 0
-                    # Delegate to GraphGenerator instance
                     state = self.graph_generator._generate_execution_graph(
                         state, goal=new_goal
-                    ) # This sets its own next_step (e.g., to verify_graph)
+                    )
                     action_result_message = (
                         f"Graph regeneration started for new goal: {new_goal[:50]}..."
                     )
@@ -608,9 +649,8 @@ If the query is ambiguous or cannot be handled by available actions, use "synthe
                     and isinstance(state.execution_graph, GraphOutput)
                 ):
                     state.graph_regeneration_reason = refinement_instr
-                    state.scratchpad['refinement_validation_failures'] = 0 # Reset for this attempt
-                    # Delegate to GraphGenerator instance
-                    state = self.graph_generator.refine_api_graph(state) # This sets its own next_step
+                    state.scratchpad['refinement_validation_failures'] = 0
+                    state = self.graph_generator.refine_api_graph(state)
                     action_result_message = (
                         f"Graph refinement (structure) started with instructions: {refinement_instr[:50]}..."
                     )
@@ -625,50 +665,42 @@ If the query is ambiguous or cannot be handled by available actions, use "synthe
                 query_to_answer = action_params.get(
                     "query_for_synthesizer", state.user_input or ""
                 )
-                original_user_input = state.user_input # Save original
-                state.user_input = query_to_answer # Set for answer_openapi_query
-                state = self.answer_openapi_query(state) # This will set state.response and next_step to "responder"
-                state.user_input = original_user_input # Restore original
+                original_user_input = state.user_input
+                state.user_input = query_to_answer
+                state = self.answer_openapi_query(state)
+                state.user_input = original_user_input
                 action_result_message = (
                     f"Direct answer generated for: {query_to_answer[:50]}..."
                 )
-                # next_step is already "responder"
 
             elif action_name == "setup_workflow_execution_interactive":
-                state = self.setup_workflow_execution(state) # Call method within this class
+                state = self.setup_workflow_execution(state)
                 action_result_message = (
                     f"Workflow execution setup initiated. Status: {state.workflow_execution_status}."
                 )
-                # setup_workflow_execution sets next_step to "responder"
                 if idx + 1 < len(plan):
                      logger.warning("More actions planned after setup_workflow_execution_interactive. These will likely be skipped as setup routes to responder.")
 
-
             elif action_name == "resume_workflow_with_payload_interactive":
-                # This action implies the user's input (which triggered the planner) contained the payload.
-                # The router/planner should have extracted this payload into action_params.
                 confirmed_payload = action_params.get("confirmed_payload")
                 if confirmed_payload and isinstance(confirmed_payload, dict):
-                    state = self.resume_workflow_with_payload(state, confirmed_payload) # Call method in this class
+                    state = self.resume_workflow_with_payload(state, confirmed_payload)
                     action_result_message = (
                         f"Workflow resumption with payload prepared. Status: {state.workflow_execution_status}."
                     )
                 else:
                     action_result_message = "Skipped resume_workflow: Missing or invalid confirmed_payload in action_params."
-                state.next_step = "responder" # Resume always goes to responder
+                state.next_step = "responder"
 
             elif action_name == "synthesize_final_answer":
                 synthesis_instr = action_params.get(
                     "synthesis_prompt_instructions",
                     "Summarize actions and provide a final response.",
                 )
-                # Include the current action's default message if it wasn't overridden by an error
                 current_action_summary = results[-1] if results and results[-1] != f"Action '{action_name}' completed." else action_result_message
-                
                 all_prior_results_summary = "; ".join(
-                    [str(r)[:150] for r in results[:-1]] + [str(current_action_summary)[:150]] # Add current action's outcome
+                    [str(r)[:150] for r in results[:-1]] + [str(current_action_summary)[:150]]
                 )
-
                 final_synthesis_prompt = (
                     f"User's original query: '{state.user_input}'.\n"
                     f"My understanding of the query: '{state.scratchpad.get('user_query_understanding', 'N/A')}'.\n"
@@ -687,13 +719,11 @@ If the query is ambiguous or cannot be handled by available actions, use "synthe
                         f"Sorry, I encountered an error while synthesizing the final answer: {str(e)[:100]}",
                     )
                     action_result_message = "Error during final answer synthesis."
-                state.next_step = "responder" # Synthesis is the final step in the plan
-
+                state.next_step = "responder"
             else:
                 action_result_message = f"Unknown or unhandled action: {action_name}."
                 logger.warning(action_result_message)
-                state.next_step = "interactive_query_executor" # Continue to next action if any
-
+                state.next_step = "interactive_query_executor"
         except Exception as e_action:
             logger.error(
                 f"Error executing action '{action_name}': {e_action}", exc_info=True
@@ -701,18 +731,15 @@ If the query is ambiguous or cannot be handled by available actions, use "synthe
             action_result_message = (
                 f"Error during action '{action_name}': {str(e_action)[:100]}..."
             )
-            self._queue_intermediate_message(state, action_result_message) # Update response with error
-            state.next_step = "interactive_query_executor" # Try next action or finish
+            self._queue_intermediate_message(state, action_result_message)
+            state.next_step = "interactive_query_executor"
 
-        results.append(action_result_message) # Log the outcome of the current action
+        results.append(action_result_message)
         state.scratchpad["current_interactive_action_idx"] = idx + 1
         state.scratchpad["current_interactive_results"] = results
 
-        # If the current action didn't set a specific next_step (like "responder" or a graph step),
-        # and there are more actions, continue. Otherwise, go to responder.
-        if state.next_step == "interactive_query_executor": # If still set to executor
-            if state.scratchpad.get("current_interactive_action_idx", 0) >= len(plan): # And all actions are done
-                # If all actions are done and the last one wasn't a terminal one, synthesize.
+        if state.next_step == "interactive_query_executor":
+            if state.scratchpad.get("current_interactive_action_idx", 0) >= len(plan):
                 if action_name not in [
                     "synthesize_final_answer",
                     "answer_query_directly",
@@ -738,11 +765,7 @@ If the query is ambiguous or cannot be handled by available actions, use "synthe
         return state
 
     def setup_workflow_execution(self, state: BotState) -> BotState:
-        """
-        Prepares the system to execute the current workflow graph.
-        Sets the workflow_execution_status to 'pending_start'.
-        The actual execution is triggered by the main WebSocket handler based on this status.
-        """
+        """Prepares the system to execute the current workflow graph."""
         tool_name = "setup_workflow_execution"
         logger.info(f"[{state.session_id}] Setting up workflow execution based on current graph.")
         state.update_scratchpad_reason(tool_name, "Preparing for workflow execution.")
@@ -798,11 +821,7 @@ If the query is ambiguous or cannot be handled by available actions, use "synthe
     def resume_workflow_with_payload(
         self, state: BotState, confirmed_payload: Dict[str, Any]
     ) -> BotState:
-        """
-        Handles the data provided by the user to resume a paused workflow.
-        This method primarily updates the state; the actual resume mechanism
-        is handled by the ExecutionManager via WebSocket communication.
-        """
+        """Handles data provided by the user to resume a paused workflow."""
         tool_name = "resume_workflow_with_payload"
         logger.info(
             f"[{state.session_id}] Preparing to resume workflow with confirmed_payload."
@@ -822,18 +841,9 @@ If the query is ambiguous or cannot be handled by available actions, use "synthe
             )
             state.next_step = "responder"
             return state
-
-        # The confirmed_payload is what the user sent via the modal.
-        # This needs to be communicated to the ExecutionManager for the specific Graph 2 thread.
-        # For Graph 1's state, we just note that a resume is happening.
-        # The actual data for Graph 2 is sent via WebSocket command "resume_exec <graph2_thread_id> <json_payload>"
-        # which is constructed by script.js and processed by websocket_helpers.py,
-        # eventually calling GraphExecutionManager.submit_resume_data().
-
-        # This BotState field 'pending_resume_payload' is more for Graph 1's awareness
-        # or if Graph 1 needed to log it. It's not directly consumed by Graph 2's resume mechanism from here.
+        
         state.scratchpad["pending_resume_payload_from_interactive_action"] = confirmed_payload
-        state.workflow_execution_status = "running" # Tentatively set to running, actual resume confirmation comes from G2
+        state.workflow_execution_status = "running"
         self._queue_intermediate_message(
             state,
             "Confirmation payload received. System will attempt to resume workflow execution.",
