@@ -232,9 +232,6 @@ class SpecProcessor:
         )
         return state
 
-    # ... (other methods: _generate_llm_schema_summary, _identify_apis_from_schema, etc. remain the same as in spec_processor_with_validator_v3) ...
-    # Ensure they are present in your actual file. For brevity, I'm not repeating them here if unchanged from the previous version.
-
     def _generate_llm_schema_summary(self, state: BotState):
         tool_name = "_generate_llm_schema_summary"
         self._queue_intermediate_message(state, "Generating API summary...")
@@ -334,7 +331,7 @@ class SpecProcessor:
         self,
         state: BotState,
         target_apis: Optional[List[str]] = None,
-        context_override: Optional[str]] = None,
+        context_override: Optional[str] = None, # Corrected: removed extra ']'
     ):
         tool_name = "_generate_payload_descriptions"
         self._queue_intermediate_message(
