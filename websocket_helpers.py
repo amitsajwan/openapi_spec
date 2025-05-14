@@ -9,8 +9,12 @@ from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 from models import BotState, GraphOutput as PlanSchema, ExecutionGraphState
-from execution_graph_definition import ExecutionGraphDefinition
-from execution_manager import GraphExecutionManager
+# Assuming these are correctly importable from their new locations if refactored
+# from core_logic.spec_processor import SpecProcessor # Example, if needed directly
+# from core_logic.graph_generator import GraphGenerator # Example
+
+from execution_graph_definition import ExecutionGraphDefinition # Keep if used
+from execution_manager import GraphExecutionManager # Keep if used
 from api_executor import APIExecutor # For type hinting
 
 logger = logging.getLogger(__name__)
@@ -20,7 +24,7 @@ async def send_websocket_message_helper(
     websocket: WebSocket,
     msg_type: str,
     content: Any,
-    session_id: str, # Graph 1 session ID
+    session_id: str, 
     source_graph: str = "graph1_planning",
     graph2_thread_id: Optional[str] = None
 ):
@@ -30,7 +34,7 @@ async def send_websocket_message_helper(
 
     try:
         try:
-            json.dumps(content) # Test serializability
+            json.dumps(content) 
             payload_to_send = content
         except TypeError as te:
             logger.warning(f"Content for WS type {msg_type} not directly JSON serializable, attempting str(): {te}. Content snippet: {str(content)[:200]}")
@@ -52,12 +56,12 @@ async def handle_websocket_connection(
     websocket: WebSocket,
     session_id: str, 
     langgraph_planning_app: Any,
-    api_executor_instance: APIExecutor,
+    api_executor_instance: APIExecutor, # Assuming this is for Graph 2
     active_graph2_executors: Dict[str, GraphExecutionManager],
     active_graph2_definitions: Dict[str, ExecutionGraphDefinition]
 ):
     await send_websocket_message_helper(
-        websocket, "info", {"message": "Connection established."}, # Simplified initial message
+        websocket, "info", {"message": "Connection established."}, 
         session_id, "system"
     )
 
@@ -69,11 +73,12 @@ async def handle_websocket_connection(
         data: Dict[str, Any],
         graph2_thread_id_param: Optional[str] 
     ):
+        # ... (graph2_ws_callback_for_this_session implementation remains the same)
         await send_websocket_message_helper(
             websocket, event_type, data, session_id, "graph2_execution", graph2_thread_id_param
         )
 
-        if event_type not in ["tool_start", "tool_end"]: # Avoid high-level status change for every tool event
+        if event_type not in ["tool_start", "tool_end"]: 
             logger.info(f"[{session_id}] G2 Callback (G2_Thread: {graph2_thread_id_param}). Event: {event_type}. Store status before: {_session_bot_state_store.get('workflow_execution_status')}")
             new_status = _session_bot_state_store.get("workflow_execution_status", "idle")
 
@@ -92,6 +97,7 @@ async def handle_websocket_connection(
             
             _session_bot_state_store["workflow_execution_status"] = new_status
             logger.info(f"[{session_id}] G2 Callback. Store status after: {new_status}")
+
 
     try:
         while True:
@@ -158,6 +164,7 @@ async def handle_websocket_connection(
 def _initialize_bot_state_for_turn(
     session_id: str, user_input: str, session_store: Dict[str, Any]
 ) -> BotState:
+    # ... (_initialize_bot_state_for_turn implementation remains the same)
     exec_graph_data = session_store.get("execution_graph")
     execution_graph_model = None
     if isinstance(exec_graph_data, dict):
@@ -185,14 +192,16 @@ def _initialize_bot_state_for_turn(
         workflow_execution_results=session_store.get("workflow_execution_results", {}),
         workflow_extracted_data=session_store.get("workflow_extracted_data", {})
     )
-    state.scratchpad = {}
+    state.scratchpad = session_store.get("scratchpad", {}) # Preserve scratchpad across turns if needed, or clear it
     return state
+
 
 async def _process_resume_command(
     websocket: WebSocket, session_id: str, user_input_text: str,
     session_store: Dict[str, Any],
     active_graph2_executors: Dict[str, GraphExecutionManager]
 ):
+    # ... (_process_resume_command implementation remains the same)
     try:
         parts = user_input_text.split(" ", 2)
         if len(parts) < 3:
@@ -252,6 +261,7 @@ async def _process_resume_command(
             session_id, "system_error"
         )
 
+
 async def _run_planning_graph(
     websocket: WebSocket, session_id: str, bot_state: BotState, langgraph_planning_app: Any
 ) -> BotState:
@@ -261,15 +271,19 @@ async def _run_planning_graph(
     )
     planning_config = {"configurable": {"thread_id": session_id}} 
     current_bot_state_after_planning = bot_state 
-    last_intermediate_message_sent: Optional[str] = None # MODIFIED: Track last intermediate message
+    last_intermediate_message_sent: Optional[str] = None 
 
     try:
         graph1_input_dict = current_bot_state_after_planning.model_dump(exclude_none=True)
+        # Ensure scratchpad is part of the input if it's used by nodes and needs to be checkpointed by LangGraph
+        if 'scratchpad' not in graph1_input_dict:
+             graph1_input_dict['scratchpad'] = current_bot_state_after_planning.scratchpad
+
+
         async for event in langgraph_planning_app.astream_events(graph1_input_dict, config=planning_config, version="v2"): 
             event_name = event["event"]
             event_data = event.get("data", {})
-            # node_name = event.get("name", "") # Not directly used for G1 message sending logic
-
+            
             if event_name == "on_tool_end" or event_name == "on_chat_model_end" or event_name == "on_chain_end": 
                 node_output_any = event_data.get("output")
 
@@ -277,19 +291,49 @@ async def _run_planning_graph(
                     current_bot_state_after_planning = node_output_any
                 elif isinstance(node_output_any, dict):
                     try:
-                        updated_fields = {k: v for k, v in node_output_any.items() if hasattr(BotState, k)} 
-                        current_bot_state_after_planning = current_bot_state_after_planning.model_copy(update=updated_fields)
-                    except Exception as e_val:
-                        logger.error(f"[{session_id}] Error updating BotState from G1 node output dict: {e_val}, dict: {node_output_any}")
+                        # Update only fields present in BotState to avoid Pydantic errors if output has extra keys
+                        valid_fields_to_update = {k: v for k, v in node_output_any.items() if hasattr(BotState, k)}
+                        current_bot_state_after_planning = current_bot_state_after_planning.model_copy(update=valid_fields_to_update)
+                        # Ensure scratchpad is preserved/updated if it was in node_output_any
+                        if 'scratchpad' in node_output_any and isinstance(node_output_any['scratchpad'], dict):
+                            current_bot_state_after_planning.scratchpad.update(node_output_any['scratchpad'])
 
+                    except Exception as e_val:
+                        logger.error(f"[{session_id}] Error updating BotState from G1 node output dict: {e_val}, dict: {str(node_output_any)[:500]}")
+                
+                # --- MODIFIED SECTION for intermediate messages ---
+                # Send queued intermediate messages first
+                if current_bot_state_after_planning.scratchpad and 'intermediate_messages' in current_bot_state_after_planning.scratchpad:
+                    message_queue = current_bot_state_after_planning.scratchpad.pop('intermediate_messages', [])
+                    for queued_msg_content in message_queue:
+                        if isinstance(queued_msg_content, str) and queued_msg_content and queued_msg_content != last_intermediate_message_sent:
+                            await send_websocket_message_helper(
+                                websocket, "intermediate", {"message": queued_msg_content},
+                                session_id, "graph1_planning"
+                            )
+                            last_intermediate_message_sent = queued_msg_content
+                        elif isinstance(queued_msg_content, dict) and queued_msg_content.get("message"): # If message is an object
+                             msg_to_send = queued_msg_content.get("message")
+                             if msg_to_send and msg_to_send != last_intermediate_message_sent:
+                                await send_websocket_message_helper(
+                                    websocket, "intermediate", {"message": msg_to_send},
+                                    session_id, "graph1_planning"
+                                )
+                                last_intermediate_message_sent = msg_to_send
+
+
+                # Send the primary response if it's different from the last queued one
                 if current_bot_state_after_planning.response:
                     msg_to_send = current_bot_state_after_planning.response
-                    await send_websocket_message_helper(
-                        websocket, "intermediate", {"message": msg_to_send},
-                        session_id, "graph1_planning"
-                    )
-                    last_intermediate_message_sent = msg_to_send # MODIFIED: Track it
-                    current_bot_state_after_planning.response = None 
+                    if msg_to_send != last_intermediate_message_sent: 
+                        await send_websocket_message_helper(
+                            websocket, "intermediate", {"message": msg_to_send},
+                            session_id, "graph1_planning"
+                        )
+                        last_intermediate_message_sent = msg_to_send
+                    current_bot_state_after_planning.response = None # Clear after sending or if duplicate
+                # --- END OF MODIFIED SECTION ---
+
 
                 if current_bot_state_after_planning.scratchpad and 'graph_to_send' in current_bot_state_after_planning.scratchpad:
                     graph_json_str = current_bot_state_after_planning.scratchpad.pop('graph_to_send', None)
@@ -311,31 +355,26 @@ async def _run_planning_graph(
                     try:
                         current_bot_state_after_planning = BotState.model_validate(final_graph_output)
                     except Exception as e_val:
-                         logger.error(f"[{session_id}] Error validating final BotState from G1 output: {e_val}, dict: {final_graph_output}")
+                         logger.error(f"[{session_id}] Error validating final BotState from G1 output: {e_val}, dict: {str(final_graph_output)[:500]}")
                 elif isinstance(final_graph_output, BotState): 
                     current_bot_state_after_planning = final_graph_output
                 else:
                     logger.error(f"[{session_id}] G1: on_graph_end output was not a dict or BotState: {type(final_graph_output)}")
                 break 
 
-        # MODIFIED: Send final response from Graph 1, checking against last intermediate
         final_msg_content = current_bot_state_after_planning.final_response
-        # Fallback to .response only if .final_response is empty AND .response somehow survived (unlikely with current logic)
-        if not final_msg_content and current_bot_state_after_planning.response:
+        if not final_msg_content and current_bot_state_after_planning.response: # Should be rare
             final_msg_content = current_bot_state_after_planning.response
-            logger.warning(f"[{session_id}] G1: final_response was empty, using lingering .response for final message: '{str(final_msg_content)[:50]}...'. This is unusual.")
+            logger.warning(f"[{session_id}] G1: final_response was empty, using lingering .response for final message: '{str(final_msg_content)[:50]}...'.")
 
         if final_msg_content:
-            if final_msg_content == last_intermediate_message_sent:
-                logger.info(f"[{session_id}] G1: Final message ('{str(final_msg_content)[:50]}...') is identical to last intermediate. Suppressing duplicate final message.")
-                # If suppressed, and you still want a "final" event type for UI state,
-                # you might send a generic "processing complete" or a special "final_ack" type.
-                # For now, just suppressing.
-            else:
+            if final_msg_content != last_intermediate_message_sent:
                 await send_websocket_message_helper(
                     websocket, "final", {"message": final_msg_content},
                     session_id, "graph1_planning"
                 )
+            else: # Suppress duplicate final message
+                 logger.info(f"[{session_id}] G1: Final message ('{str(final_msg_content)[:50]}...') is identical to last intermediate. Suppressing duplicate final message.")
         
         current_bot_state_after_planning.final_response = "" 
         current_bot_state_after_planning.response = None
@@ -352,6 +391,7 @@ async def _run_planning_graph(
 
 
 def _persist_bot_state_after_planning(session_store: Dict[str, Any], bot_state: BotState):
+    # ... (_persist_bot_state_after_planning implementation remains the same)
     session_store["openapi_spec_text"] = bot_state.openapi_spec_text
     session_store["openapi_schema"] = bot_state.openapi_schema
     session_store["schema_cache_key"] = bot_state.schema_cache_key
@@ -367,6 +407,8 @@ def _persist_bot_state_after_planning(session_store: Dict[str, Any], bot_state: 
     session_store["workflow_execution_status"] = bot_state.workflow_execution_status
     session_store["workflow_execution_results"] = bot_state.workflow_execution_results
     session_store["workflow_extracted_data"] = bot_state.workflow_extracted_data
+    session_store["scratchpad"] = bot_state.scratchpad # Persist scratchpad
+
 
 async def _initiate_execution_graph(
     websocket: WebSocket,
@@ -377,6 +419,7 @@ async def _initiate_execution_graph(
     active_graph2_definitions: Dict[str, ExecutionGraphDefinition],
     graph2_ws_callback: Callable[[str, Dict[str, Any], Optional[str]], Awaitable[None]]
 ) -> Optional[str]: 
+    # ... (_initiate_execution_graph implementation remains the same)
     logger.info(f"[{session_id}] Checking if Graph 2 initiation is pending...")
     exec_plan_dict = session_store.get("execution_graph")
     exec_plan_model = PlanSchema.model_validate(exec_plan_dict) if exec_plan_dict else None
@@ -440,3 +483,4 @@ async def _initiate_execution_graph(
         active_graph2_executors.pop(graph2_thread_id, None)
         active_graph2_definitions.pop(graph2_thread_id, None)
         return None
+
