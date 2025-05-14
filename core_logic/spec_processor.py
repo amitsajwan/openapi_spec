@@ -1,11 +1,11 @@
 # core_logic/spec_processor.py
 import json
 import logging
-from typing import Any, Dict, List, Optional, Callable # Added Callable
+from typing import Any, Dict, List, Optional, Callable
 import yaml
 import os
 
-from models import BotState, GraphOutput
+from models import BotState, GraphOutput # GraphOutput for type hints
 from utils import (
     llm_call_helper,
     load_cached_schema,
@@ -13,15 +13,13 @@ from utils import (
     get_cache_key,
     SCHEMA_CACHE,
 )
-
-# Import specific validators for different OpenAPI versions
-from openapi_spec_validator import (
-    openapi_v2_spec_validator,
-    openapi_v30_spec_validator,
-    openapi_v31_spec_validator,
-)
-# Import the specific exception class from its module path
-from openapi_spec_validator.validation.exceptions import OpenAPIValidationError
+# Removed openapi-spec-validator imports:
+# from openapi_spec_validator import (
+#     openapi_v2_spec_validator,
+#     openapi_v30_spec_validator,
+#     openapi_v31_spec_validator,
+# )
+# from openapi_spec_validator.validation.exceptions import OpenAPIValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +34,9 @@ MAX_PAYLOAD_SAMPLES_TO_GENERATE_SINGLE_PASS = int(
 
 class SpecProcessor:
     """
-    Handles parsing, validation, and initial analysis of OpenAPI specifications,
+    Handles parsing and initial analysis of OpenAPI specifications,
     including generating summaries, identifying APIs, and creating payload descriptions.
+    Schema validation via openapi-spec-validator has been removed.
     """
 
     def __init__(self, worker_llm: Any):
@@ -58,26 +57,26 @@ class SpecProcessor:
         """
         if "intermediate_messages" not in state.scratchpad:
             state.scratchpad["intermediate_messages"] = []
-        # Avoid queuing exact same consecutive message if state.response was already it
         if (
             not state.scratchpad["intermediate_messages"]
             or state.scratchpad["intermediate_messages"][-1] != msg
         ):
             state.scratchpad["intermediate_messages"].append(msg)
-        state.response = msg # Update current response for logging or if it's the last one
+        state.response = msg
 
     def parse_openapi_spec(self, state: BotState) -> BotState:
         """
-        Parses and validates the OpenAPI specification string provided in BotState.
+        Parses the OpenAPI specification string provided in BotState.
         Updates BotState with the parsed schema, cache key, and status.
-        Handles caching of successfully parsed and validated specifications.
+        Does NOT perform schema validation using openapi-spec-validator.
+        Handles caching of successfully parsed specifications.
         """
         tool_name = "parse_openapi_spec"
         self._queue_intermediate_message(
-            state, "Parsing and validating OpenAPI specification..."
+            state, "Parsing OpenAPI specification (validation step removed)..."
         )
         state.update_scratchpad_reason(
-            tool_name, "Attempting to parse and validate OpenAPI spec."
+            tool_name, "Attempting to parse OpenAPI spec (validation removed)."
         )
         spec_text = state.openapi_spec_string
 
@@ -85,20 +84,17 @@ class SpecProcessor:
             self._queue_intermediate_message(state, "No OpenAPI specification text provided.")
             state.update_scratchpad_reason(tool_name, "No spec text in state.")
             state.next_step = "responder"
-            state.openapi_spec_string = None # Clear the raw string
+            state.openapi_spec_string = None
             return state
 
         cache_key = get_cache_key(spec_text)
-        # Use a more descriptive cache key for the fully processed (validated) schema
-        # This key indicates that the cached data includes not just the schema,
-        # but also derived artifacts like summary, identified APIs, etc.
-        cached_full_analysis_key = f"{cache_key}_full_analysis_validated"
-        
-        if SCHEMA_CACHE: # Only attempt to load from cache if SCHEMA_CACHE is available
+        # Adjusted cache key to reflect that this is parsed, not externally validated
+        cached_full_analysis_key = f"{cache_key}_full_analysis_parsed_only"
+
+        if SCHEMA_CACHE:
             cached_schema_artifacts = load_cached_schema(cached_full_analysis_key)
             if cached_schema_artifacts and isinstance(cached_schema_artifacts, dict):
                 try:
-                    # Populate state from the cached fully analyzed data
                     state.openapi_schema = cached_schema_artifacts.get("openapi_schema")
                     state.schema_summary = cached_schema_artifacts.get("schema_summary")
                     state.identified_apis = cached_schema_artifacts.get(
@@ -112,40 +108,38 @@ class SpecProcessor:
                         state.execution_graph = (
                             GraphOutput.model_validate(graph_dict)
                             if isinstance(graph_dict, dict)
-                            else graph_dict # Or assign as is if already GraphOutput
+                            else graph_dict
                         )
                     
                     state.schema_cache_key = cache_key
-                    state.openapi_spec_text = spec_text # Store the original spec text
-                    state.openapi_spec_string = None # Clear the temporary raw string
+                    state.openapi_spec_text = spec_text
+                    state.openapi_spec_string = None
 
                     logger.info(
-                        f"Loaded fully analyzed and validated OpenAPI data from cache: {cached_full_analysis_key}"
+                        f"Loaded parsed OpenAPI data and analysis from cache: {cached_full_analysis_key}"
                     )
                     self._queue_intermediate_message(
                         state,
-                        "OpenAPI specification and derived analysis (validated) loaded from cache.",
+                        "OpenAPI specification and derived analysis (parsed only) loaded from cache.",
                     )
                     if state.execution_graph and isinstance(state.execution_graph, GraphOutput):
                         state.scratchpad['graph_to_send'] = state.execution_graph.model_dump_json(indent=2)
-                    state.next_step = "responder" # Successfully loaded, go to responder
+                    state.next_step = "responder"
                     return state
                 except Exception as e:
                     logger.warning(
                         f"Error rehydrating state from cached full analysis (key: {cached_full_analysis_key}): {e}. "
-                        "Proceeding with fresh parsing and validation."
+                        "Proceeding with fresh parsing."
                     )
-                    # Reset fields to ensure a clean slate if cache loading fails partially
                     state.openapi_schema = None
                     state.schema_summary = None
                     state.identified_apis = []
                     state.payload_descriptions = {}
                     state.execution_graph = None
-
+        
         parsed_spec_dict: Optional[Dict[str, Any]] = None
         error_message: Optional[str] = None
 
-        # Attempt to parse JSON first, then YAML
         try:
             parsed_spec_dict = json.loads(spec_text)
         except json.JSONDecodeError:
@@ -153,15 +147,14 @@ class SpecProcessor:
                 parsed_spec_dict = yaml.safe_load(spec_text)
             except yaml.YAMLError as yaml_e:
                 error_message = f"YAML parsing failed: {yaml_e}"
-            except Exception as e_yaml_other: # Catch other potential errors during YAML parsing
+            except Exception as e_yaml_other:
                  error_message = f"Unexpected error during YAML parsing: {e_yaml_other}"
-        except Exception as e_json_other: # Catch other potential errors during JSON parsing
+        except Exception as e_json_other:
             error_message = f"Unexpected error during JSON parsing: {e_json_other}"
-
 
         if error_message:
             state.openapi_schema = None
-            state.openapi_spec_string = None # Clear the raw string
+            state.openapi_spec_string = None
             self._queue_intermediate_message(
                 state, f"Failed to parse specification: {error_message}"
             )
@@ -187,73 +180,56 @@ class SpecProcessor:
             state.update_scratchpad_reason(tool_name, "Parsed content not a dict.")
             return state
 
-        # Validate the parsed specification
-        try:
-            spec_version_str = parsed_spec_dict.get(
-                "openapi", parsed_spec_dict.get("swagger")
-            ) # Handles both 'openapi' and 'swagger' version keys
+        # --- Validation Block Removed ---
+        # The openapi-spec-validator logic was here.
+        # Without it, we assume the parsed_spec_dict is usable if parsing succeeded.
+        # The primary risk is that $ref pointers are not resolved and the schema might be structurally invalid
+        # according to OpenAPI rules, which could cause issues downstream.
 
-            if spec_version_str and spec_version_str.startswith("2."):
-                logger.info(f"Attempting to validate as OpenAPI v2 (Swagger) specification (Version: {spec_version_str}).")
-                openapi_v2_spec_validator.validate(parsed_spec_dict)
-            elif spec_version_str and spec_version_str.startswith("3.0"):
-                logger.info(f"Attempting to validate as OpenAPI v3.0.x specification (Version: {spec_version_str}).")
-                openapi_v30_spec_validator.validate(parsed_spec_dict)
-            elif spec_version_str and spec_version_str.startswith("3.1"):
-                logger.info(f"Attempting to validate as OpenAPI v3.1.x specification (Version: {spec_version_str}).")
-                openapi_v31_spec_validator.validate(parsed_spec_dict)
-            else:
-                # Default to v3.0 validator if version is unknown or unsupported by specific validators
-                logger.warning(
-                    f"Unknown or unsupported OpenAPI version string: '{spec_version_str}'. "
-                    "Attempting with v3.0 validator as a default."
-                )
-                openapi_v30_spec_validator.validate(parsed_spec_dict)
-            
-            # If validation is successful (no exception raised)
-            state.openapi_schema = parsed_spec_dict # Store the validated, parsed schema
-            state.schema_cache_key = cache_key # Store cache key for potential future use
-            state.openapi_spec_text = spec_text # Store the original spec text
-            state.openapi_spec_string = None # Clear the temporary raw string
-
-            logger.info(
-                "Successfully parsed and validated OpenAPI spec (references resolved for validation)."
-            )
+        # Check for basic OpenAPI structure heuristically
+        if not (parsed_spec_dict.get("openapi") or parsed_spec_dict.get("swagger")) or \
+           not parsed_spec_dict.get("info") or \
+           not parsed_spec_dict.get("paths"):
+            state.openapi_schema = None
+            state.openapi_spec_string = None
             self._queue_intermediate_message(
                 state,
-                "OpenAPI specification parsed and validated. Starting analysis pipeline...",
+                "Parsed specification appears to be missing essential OpenAPI fields (openapi/swagger, info, paths). "
+                "Proceeding with caution, but analysis might be incomplete or fail.",
             )
+            logger.warning(
+                "Parsed spec is missing key OpenAPI fields. Downstream processing might fail."
+            )
+            # Allow proceeding to the pipeline, but the user is warned.
+            # Alternatively, could route to responder here if strictness is desired.
+            # state.next_step = "responder"
+            # For now, let's try to process it.
+            state.openapi_schema = parsed_spec_dict # Store the parsed schema
+            state.schema_cache_key = cache_key
+            state.openapi_spec_text = spec_text
+            state.openapi_spec_string = None
             state.next_step = "process_schema_pipeline"
 
-        except OpenAPIValidationError as val_e: # Catch the specific validation error
-            state.openapi_schema = None
+        else:
+            # If basic fields are present, proceed.
+            state.openapi_schema = parsed_spec_dict
+            state.schema_cache_key = cache_key
+            state.openapi_spec_text = spec_text
             state.openapi_spec_string = None
-            error_detail = str(val_e.message if hasattr(val_e, 'message') else val_e)
-            if hasattr(val_e, 'instance') and hasattr(val_e, 'schema_path'):
-                 error_detail_path = "->".join(map(str, val_e.schema_path)) # type: ignore
-                 error_detail = f"Validation error at path '{error_detail_path}' for instance segment '{str(val_e.instance)[:100]}...': {val_e.message}"
 
-            self._queue_intermediate_message(
-                state, f"OpenAPI specification is invalid: {error_detail[:500]}"
+            logger.info(
+                "Successfully parsed OpenAPI spec. Validation step has been removed. "
+                "References ($ref) within the spec may not be resolved."
             )
-            logger.error(f"OpenAPI Validation failed: {error_detail}", exc_info=False) # No need for full traceback for validation errors
-            state.next_step = "responder"
-        except Exception as e_general_processing: # Catch any other unexpected errors
-            state.openapi_schema = None
-            state.openapi_spec_string = None
             self._queue_intermediate_message(
                 state,
-                f"Error during OpenAPI validation/processing: {str(e_general_processing)[:200]}",
+                "OpenAPI specification parsed (validation removed). Starting analysis pipeline...",
             )
-            logger.error(
-                f"Unexpected error during validation/processing: {e_general_processing}",
-                exc_info=True,
-            )
-            state.next_step = "responder"
+            state.next_step = "process_schema_pipeline"
         
         state.update_scratchpad_reason(
             tool_name,
-            f"Parsing & Validation status: {'Success' if state.openapi_schema else 'Failed'}. Response: {state.response}",
+            f"Parsing status: {'Success (basic fields check)' if state.openapi_schema else 'Failed or missing key fields'}. Response: {state.response}",
         )
         return state
 
@@ -278,7 +254,7 @@ class SpecProcessor:
         num_paths = len(state.openapi_schema.get("paths", {}))
 
         paths_preview_list = []
-        for p, m_dict in list(state.openapi_schema.get("paths", {}).items())[:3]: # Preview first 3 paths
+        for p, m_dict in list(state.openapi_schema.get("paths", {}).items())[:3]:
             methods = list(m_dict.keys()) if isinstance(m_dict, dict) else '[methods not parsable]'
             paths_preview_list.append(f"  {p}: {methods}")
         paths_preview = "\n".join(paths_preview_list)
@@ -286,8 +262,9 @@ class SpecProcessor:
         summary_prompt = (
             f"Summarize the following API specification. Focus on its main purpose, "
             f"key resources/capabilities, and any mentioned authentication schemes. Be concise (around 100-150 words).\n\n"
-            f"Title: {title}\nVersion: {version}\nDescription: {description[:500]}...\n" # Limit description length in prompt
+            f"Title: {title}\nVersion: {version}\nDescription: {description[:500]}...\n"
             f"Number of paths: {num_paths}\nExample Paths (first 3):\n{paths_preview}\n\n"
+            f"Note: The schema was parsed but not validated by an external tool, so $ref pointers might be unresolved.\n"
             f"Concise Summary:"
         )
         try:
@@ -325,15 +302,13 @@ class SpecProcessor:
                 logger.warning(f"Skipping non-dictionary path item at '{path_url}'")
                 continue
             for method, operation_details in path_item.items():
-                # Consider only valid HTTP methods and ensure operation_details is a dict
                 if method.lower() not in {
                     "get", "post", "put", "delete", "patch", "options", "head", "trace"
                 } or not isinstance(operation_details, dict):
                     continue
                 
-                # Generate a default operationId if not present, for robustness
                 op_id_suffix = path_url.replace('/', '_').replace('{', '').replace('}', '').strip('_')
-                default_op_id = f"{method.lower()}_{op_id_suffix or 'root'}" # Ensure suffix is not empty
+                default_op_id = f"{method.lower()}_{op_id_suffix or 'root'}"
 
                 api_info = {
                     "operationId": operation_details.get("operationId", default_op_id),
@@ -341,9 +316,9 @@ class SpecProcessor:
                     "method": method.upper(),
                     "summary": operation_details.get("summary", ""),
                     "description": operation_details.get("description", ""),
-                    "parameters": operation_details.get("parameters", []),
-                    "requestBody": operation_details.get("requestBody", {}),
-                    "responses": operation_details.get("responses", {}),
+                    "parameters": operation_details.get("parameters", []), # These might contain $refs
+                    "requestBody": operation_details.get("requestBody", {}), # This might contain $refs
+                    "responses": operation_details.get("responses", {}), # These might contain $refs
                 }
                 apis.append(api_info)
         state.identified_apis = apis
@@ -359,7 +334,7 @@ class SpecProcessor:
     ):
         """
         Generates example request payloads and response structure descriptions for API operations.
-        Can target specific APIs or a subset based on available information.
+        Warns that schemas might contain unresolved $refs.
         """
         tool_name = "_generate_payload_descriptions"
         self._queue_intermediate_message(
@@ -377,16 +352,13 @@ class SpecProcessor:
             )
             return
 
-        payload_descs = state.payload_descriptions or {} # Start with existing descriptions
-
-        # Determine which APIs to process
+        payload_descs = state.payload_descriptions or {}
         apis_to_process = []
-        if target_apis: # If specific APIs are targeted
+        if target_apis:
             apis_to_process = [
                 api for api in state.identified_apis if api["operationId"] in target_apis
             ]
-        else: # Default behavior: process a subset of APIs
-            # Prioritize APIs with requestBody or body/formData parameters
+        else:
             apis_with_payload_info = [
                 api
                 for api in state.identified_apis
@@ -396,7 +368,6 @@ class SpecProcessor:
                     for p in api.get("parameters", [])
                 )
             ]
-            # Further prioritize those not yet processed
             unprocessed_apis = [
                 api
                 for api in apis_with_payload_info
@@ -404,7 +375,7 @@ class SpecProcessor:
             ]
             if unprocessed_apis:
                 apis_to_process = unprocessed_apis[:MAX_PAYLOAD_SAMPLES_TO_GENERATE_INITIAL]
-            else: # If all relevant are processed, pick a few to potentially refresh
+            else:
                 apis_to_process = apis_with_payload_info[:MAX_PAYLOAD_SAMPLES_TO_GENERATE_SINGLE_PASS]
 
         logger.info(
@@ -413,61 +384,60 @@ class SpecProcessor:
         processed_count = 0
         for api_op in apis_to_process:
             op_id = api_op["operationId"]
-            # Skip if already processed and not explicitly targeted or forced by context_override
-            # (and ensure at least one is processed if it's the first time through for non-targeted)
-            if op_id in payload_descs and not context_override and not target_apis and processed_count > 0 :
+            if op_id in payload_descs and not context_override and not target_apis and processed_count > 0:
                 continue
 
             self._queue_intermediate_message(state, f"Generating payload example for '{op_id}'...")
-
-            # Prepare context for the LLM prompt
             params_summary_list = []
             for p_idx, p_detail in enumerate(api_op.get("parameters", [])):
-                if p_idx >= 5: # Limit params in prompt for brevity
+                if p_idx >= 5:
                     params_summary_list.append("...")
                     break
                 param_name = p_detail.get("name", "N/A")
                 param_in = p_detail.get("in", "N/A")
                 param_type = "N/A"
+                # Schemas might contain $refs here
                 if 'schema' in p_detail and isinstance(p_detail['schema'], dict):
-                    param_type = p_detail['schema'].get('type', 'object')
+                    param_type = p_detail['schema'].get('type', str(p_detail['schema'])) # Show $ref if type missing
                     if param_type == 'array' and 'items' in p_detail['schema'] and isinstance(p_detail['schema']['items'], dict):
-                        param_type = f"array of {p_detail['schema']['items'].get('type', 'object')}"
+                        param_type = f"array of {p_detail['schema']['items'].get('type', str(p_detail['schema']['items']))}"
                 params_summary_list.append(f"{param_name}({param_in}, type: {param_type})")
             params_summary_str = ", ".join(params_summary_list) if params_summary_list else "None"
             
-            request_body_schema_str = "N/A"
+            request_body_schema_str = "N/A (or may contain $refs)"
             if api_op.get('requestBody') and isinstance(api_op['requestBody'], dict):
                 content = api_op['requestBody'].get('content', {})
                 json_content = content.get('application/json', {})
-                schema = json_content.get('schema', {})
-                if schema: # Schema references should be resolved by the validator
-                    request_body_schema_str = json.dumps(schema, indent=2)[:500] + "..." # Limit length
+                schema = json_content.get('schema', {}) # This schema might contain $refs
+                if schema:
+                    request_body_schema_str = json.dumps(schema, indent=2)[:500] + "..."
 
-            success_response_schema_str = "N/A"
+            success_response_schema_str = "N/A (or may contain $refs)"
             responses = api_op.get("responses", {})
             for status_code, resp_details in responses.items():
-                if status_code.startswith("2") and isinstance(resp_details, dict): # Look for 2xx success
+                if status_code.startswith("2") and isinstance(resp_details, dict):
                     content = resp_details.get("content", {})
                     json_content = content.get("application/json", {})
-                    schema = json_content.get("schema", {})
-                    if schema: # Schema references should be resolved
-                        success_response_schema_str = json.dumps(schema, indent=2)[:300] + "..." # Limit length
-                        break # Take first 2xx response with schema
+                    schema = json_content.get("schema", {}) # This schema might contain $refs
+                    if schema:
+                        success_response_schema_str = json.dumps(schema, indent=2)[:300] + "..."
+                        break
 
             context_str = f" User Context: {context_override}." if context_override else ""
             prompt = (
                 f"API Operation: {op_id} ({api_op['method']} {api_op['path']})\n"
                 f"Summary: {api_op.get('summary', 'N/A')}\n{context_str}\n"
                 f"Parameters: {params_summary_str}\n"
-                f"Request Body Schema (if application/json, effectively resolved for validation):\n```json\n{request_body_schema_str}\n```\n"
-                f"Successful (2xx) Response Schema (sample, if application/json, effectively resolved for validation):\n```json\n{success_response_schema_str}\n```\n\n"
+                f"Request Body Schema (if application/json; may contain unresolved $ref pointers):\n```json\n{request_body_schema_str}\n```\n"
+                f"Successful (2xx) Response Schema (sample, if application/json; may contain unresolved $ref pointers):\n```json\n{success_response_schema_str}\n```\n\n"
                 f"Task: Provide a concise, typical, and REALISTIC JSON example for the request payload (if applicable for this method and API design). "
-                f"Use plausible, real-world example values based on the parameter names, types, and the API schema (which has had its references resolved for validation purposes). For example, if a field is 'email', use 'user@example.com'. If 'count', use a number like 5. "
+                f"Use plausible, real-world example values based on the parameter names, types, and the API schema. Be aware that the provided schemas might contain $ref pointers that are not resolved. "
+                f"If a schema is just a $ref (e.g., {{\"'$ref'\": \"#/components/schemas/User\"}}), assume a plausible structure for that referenced object based on its name. "
+                f"For example, if a field is 'email', use 'user@example.com'. If 'count', use a number like 5. "
                 f"Also, provide a brief description of the expected JSON response structure for a successful call, based on the schema. "
                 f"Focus on key fields. If no request payload is typically needed (e.g., for GET with only path/query params), state 'No request payload needed.' clearly. "
                 f"Format clearly:\n"
-                f"Request Payload Example:\n```json\n{{\"key\": \"realistic_value\", \"another_key\": 123}}\n```\n" # Example format
+                f"Request Payload Example:\n```json\n{{\"key\": \"realistic_value\", \"another_key\": 123}}\n```\n"
                 f"Expected Response Structure:\nBrief description of response fields (e.g., 'Returns an object with id, name, and status. The 'status' field indicates processing outcome.')."
             )
 
@@ -484,22 +454,21 @@ class SpecProcessor:
                 self._queue_intermediate_message(
                     state, f"Error creating payload example for '{op_id}': {str(e)[:100]}..."
                 )
-                # If quota error, stop further generation for this turn
                 if "quota" in str(e).lower() or "429" in str(e):
                     logger.warning(f"Quota error during payload description for {op_id}. Stopping further payload generation for this turn.")
                     self._queue_intermediate_message(state, state.response + " Hit API limits during generation.")
-                    break # Exit loop
+                    break
         state.payload_descriptions = payload_descs
         
         final_payload_msg = ""
         if processed_count > 0:
             final_payload_msg = f"Generated payload examples for {processed_count} API operation(s)."
-        elif not apis_to_process and not target_apis : # No relevant APIs needed processing
+        elif not apis_to_process and not target_apis:
             final_payload_msg = "No relevant APIs found requiring new payload examples at this time."
-        elif target_apis and not apis_to_process: # Targeted APIs were not found
+        elif target_apis and not apis_to_process:
              final_payload_msg = f"Could not find the specified API(s) ({target_apis}) to generate payload examples."
         
-        if final_payload_msg: # Only queue if there's a meaningful summary
+        if final_payload_msg:
             self._queue_intermediate_message(state, final_payload_msg)
         
         state.update_scratchpad_reason(
@@ -511,73 +480,52 @@ class SpecProcessor:
         self, state: BotState, graph_generator_func: Callable[[BotState, Optional[str]], BotState]
     ) -> BotState:
         """
-        Orchestrates the full pipeline for processing an OpenAPI schema:
-        summary generation, API identification, payload description generation,
-        and finally, execution graph generation.
-
-        Args:
-            state: The current BotState.
-            graph_generator_func: A callable (e.g., a method from GraphGenerator)
-                                  that takes BotState and an optional goal string,
-                                  and returns updated BotState with a generated graph.
+        Orchestrates the full pipeline for processing an OpenAPI schema.
         """
         tool_name = "process_schema_pipeline"
         self._queue_intermediate_message(state, "Starting API analysis pipeline...")
         state.update_scratchpad_reason(tool_name, "Starting schema pipeline.")
         
-        if not state.openapi_schema: # Should have been validated by parse_openapi_spec
+        if not state.openapi_schema:
             self._queue_intermediate_message(
-                state, "Cannot run pipeline: No valid (or validated) schema loaded."
+                state, "Cannot run pipeline: No schema loaded (parsing may have failed)."
             )
-            state.next_step = "handle_unknown" # Or responder, depending on desired flow
+            state.next_step = "handle_unknown"
             return state
         
-        # Reset relevant fields for a fresh pipeline run
         state.schema_summary = None
         state.identified_apis = []
-        state.payload_descriptions = {} # Clear old ones if any
+        state.payload_descriptions = {}
         state.execution_graph = None
         state.graph_refinement_iterations = 0
-        state.plan_generation_goal = state.plan_generation_goal or "Provide a general overview workflow." # Default goal
-        state.scratchpad['graph_gen_attempts'] = 0 # Reset graph generation attempts
-        state.scratchpad['refinement_validation_failures'] = 0 # Reset refinement failures
+        state.plan_generation_goal = state.plan_generation_goal or "Provide a general overview workflow."
+        state.scratchpad['graph_gen_attempts'] = 0
+        state.scratchpad['refinement_validation_failures'] = 0
 
-        # Step 1: Generate Schema Summary
-        self._generate_llm_schema_summary(state) # This will queue its own messages
-        # Check for critical errors like quota issues from summary generation
+        self._generate_llm_schema_summary(state)
         if state.schema_summary and ("Error generating summary: 429" in state.schema_summary or "quota" in state.schema_summary.lower()):
             logger.warning("API limit hit during schema summary. Stopping pipeline.")
-            # The error message is already queued by _generate_llm_schema_summary
             state.next_step = "responder"
             return state
             
-        # Step 2: Identify APIs
-        self._identify_apis_from_schema(state) # This will queue its own messages
+        self._identify_apis_from_schema(state)
         if not state.identified_apis:
             msg = (state.response or "") + " No API operations were identified from the schema. Cannot generate payload examples or an execution graph."
             self._queue_intermediate_message(state, msg)
             state.next_step = "responder"
             return state
             
-        # Step 3: Generate Payload Descriptions
-        self._generate_payload_descriptions(state) # This will queue its own messages
-        # Check for critical errors like quota issues from payload description generation
+        self._generate_payload_descriptions(state)
         if any("Error generating description: 429" in desc for desc in state.payload_descriptions.values()) or \
            any("quota" in desc.lower() for desc in state.payload_descriptions.values()):
             logger.warning("API limit hit during payload description generation.")
-            # Message about hitting limits is already queued by _generate_payload_descriptions
-            # Allow pipeline to continue to graph generation if some descriptions were made,
-            # but the user has been informed of the limit.
 
-        # Step 4: Generate Execution Graph (using the passed function)
-        state = graph_generator_func(state, state.plan_generation_goal) # This will also queue its messages
+        state = graph_generator_func(state, state.plan_generation_goal)
         
-        # After the pipeline (including graph generation and verification if part of graph_generator_func),
-        # cache the fully analyzed data if successful and cache is enabled.
         if (
             state.openapi_schema and state.schema_cache_key and SCHEMA_CACHE and
             state.execution_graph and 
-            state.next_step not in ["handle_unknown", "responder_with_error_from_pipeline"] # Ensure pipeline didn't fail critically
+            state.next_step not in ["handle_unknown", "responder_with_error_from_pipeline"]
         ):
             full_analysis_data = {
                 "openapi_schema": state.openapi_schema,
@@ -587,10 +535,11 @@ class SpecProcessor:
                 "execution_graph": state.execution_graph.model_dump() if state.execution_graph and isinstance(state.execution_graph, GraphOutput) else None,
                 "plan_generation_goal": state.plan_generation_goal,
             }
-            cached_full_analysis_key = f"{state.schema_cache_key}_full_analysis_validated"
+            # Use the adjusted cache key
+            cached_full_analysis_key = f"{state.schema_cache_key}_full_analysis_parsed_only"
             save_schema_to_cache(cached_full_analysis_key, full_analysis_data)
             logger.info(
-                f"Saved fully analyzed and validated data to cache: {cached_full_analysis_key}"
+                f"Saved parsed data and analysis to cache: {cached_full_analysis_key}"
             )
             
         state.update_scratchpad_reason(
