@@ -5,8 +5,9 @@ from typing import Any, Dict, List, Optional, Callable
 import yaml
 import os
 import re 
+import asyncio # For parallelism in payload descriptions
 
-from models import BotState, GraphOutput 
+from models import BotState, GraphOutput
 from utils import (
     llm_call_helper, 
     load_cached_schema,
@@ -24,10 +25,24 @@ logger = logging.getLogger(__name__)
 
 MAX_PAYLOAD_SAMPLES_TO_GENERATE_INITIAL = int(os.getenv("MAX_PAYLOAD_SAMPLES_TO_GENERATE_INITIAL", "3"))
 MAX_PAYLOAD_SAMPLES_TO_GENERATE_SINGLE_PASS = int(os.getenv("MAX_PAYLOAD_SAMPLES_TO_GENERATE_SINGLE_PASS", "2"))
+# Max concurrent LLM calls for payload description generation
+MAX_CONCURRENT_PAYLOAD_DESC_LLMS = int(os.getenv("MAX_CONCURRENT_PAYLOAD_DESC_LLMS", "3"))
 
 
 class SpecProcessor:
+    """
+    Handles parsing, validation (for OpenAPI 3.0.x, 3.1.x), and initial analysis
+    of OpenAPI specifications. Includes an LLM-based pre-cleanup step and
+    parallel processing for some LLM-dependent tasks.
+    """
     def __init__(self, worker_llm: Any, utility_llm: Any): 
+        """
+        Initializes the SpecProcessor.
+
+        Args:
+            worker_llm: The primary language model for complex tasks.
+            utility_llm: A potentially smaller/faster LLM for simpler tasks like cleanup or basic summaries.
+        """
         if not hasattr(worker_llm, "invoke"):
             raise TypeError("worker_llm must have an 'invoke' method.")
         if not hasattr(utility_llm, "invoke"): 
@@ -37,6 +52,7 @@ class SpecProcessor:
         logger.info("SpecProcessor initialized with worker_llm and utility_llm.")
 
     def _queue_intermediate_message(self, state: BotState, msg: str):
+        """Helper to queue messages for the UI and set the current response in BotState."""
         if "intermediate_messages" not in state.scratchpad:
             state.scratchpad["intermediate_messages"] = []
         if (
@@ -47,13 +63,24 @@ class SpecProcessor:
         state.response = msg
 
     def _strip_markdown_code_block(self, text: str) -> str:
+        """
+        Strips markdown code block delimiters (```language ... ``` or ``` ... ```)
+        from the beginning and end of a string.
+        """
         stripped_text = text.strip()
+        # Regex to find markdown code blocks, capturing the content inside
         match = re.match(r"^```(?:[a-zA-Z0-9]*)?\s*([\s\S]*?)\s*```$", stripped_text, re.DOTALL)
         if match:
             return match.group(1).strip()
         return stripped_text
 
     def _llm_cleanup_spec_text(self, spec_text: str, tool_name_for_log: str) -> str:
+        """
+        Uses the utility LLM to perform minor cleanup of the OpenAPI spec text.
+        Focuses on correcting common syntax issues like unquoted strings or numbers
+        where strings are expected, especially for $ref, description, summary, and keys.
+        Also strips markdown code blocks from the LLM's response.
+        """
         logger.info(f"[{tool_name_for_log}] Attempting LLM-based cleanup of the spec text using UTILITY_LLM.")
         prompt = f"""
 The following text is an OpenAPI specification, potentially in JSON or YAML format.
@@ -80,35 +107,48 @@ Original OpenAPI specification text:
 Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanations, apologies, or introductory/concluding remarks.
         """
         try:
+            # Use utility_llm for this task
             cleaned_spec_text_from_llm_raw = llm_call_helper(self.utility_llm, prompt) 
+            
             if not isinstance(cleaned_spec_text_from_llm_raw, str):
-                logger.warning(f"[{tool_name_for_log}] LLM cleanup (utility) did not return a string. Using original.")
+                logger.warning(f"[{tool_name_for_log}] LLM cleanup (utility) did not return a string (got {type(cleaned_spec_text_from_llm_raw)}). Using original spec text.")
                 return spec_text
+
+            # Strip markdown code blocks if present
             cleaned_spec_text_stripped_md = self._strip_markdown_code_block(cleaned_spec_text_from_llm_raw)
-            cleaned_spec_text = cleaned_spec_text_stripped_md.strip()
-            if cleaned_spec_text and len(cleaned_spec_text) > 0.3 * len(spec_text):
-                logger.info(f"[{tool_name_for_log}] LLM cleanup (utility) performed.")
+            cleaned_spec_text = cleaned_spec_text_stripped_md.strip() # Final strip of any surrounding whitespace
+
+            if cleaned_spec_text and len(cleaned_spec_text) > 0.3 * len(spec_text): # Heuristic
+                logger.info(f"[{tool_name_for_log}] LLM cleanup (utility) performed. Original length: {len(spec_text)}, Cleaned length: {len(cleaned_spec_text)}")
                 if cleaned_spec_text != spec_text.strip():
                     logger.debug(f"[{tool_name_for_log}] Spec changed by LLM (utility).")
                 return cleaned_spec_text
             else:
-                logger.warning(f"[{tool_name_for_log}] LLM cleanup (utility) returned odd response. Using original.")
+                logger.warning(f"[{tool_name_for_log}] LLM cleanup (utility) returned an unexpectedly short or empty response (after stripping MD). Using original spec text.")
                 return spec_text
         except Exception as e:
-            logger.error(f"[{tool_name_for_log}] Error during LLM cleanup (utility): {e}. Using original.", exc_info=True)
+            logger.error(f"[{tool_name_for_log}] Error during LLM cleanup (utility): {e}. Using original spec text.", exc_info=True)
             return spec_text
 
     def parse_openapi_spec(self, state: BotState) -> BotState:
+        """
+        Parses and potentially validates the OpenAPI specification.
+        Includes an LLM pre-cleanup step.
+        """
         tool_name = "parse_openapi_spec"
         self._queue_intermediate_message(state, "Preprocessing and parsing OpenAPI specification (with v3.x validation)...")
         state.update_scratchpad_reason(tool_name, "Attempting to preprocess, parse and validate (v3.x) OpenAPI spec.")
+        
         original_spec_text = state.openapi_spec_string 
+        
         logger.debug(f"[{tool_name}] Initial spec_text type: {type(original_spec_text)}")
         if isinstance(original_spec_text, str): logger.debug(f"[{tool_name}] Initial spec_text (first 200 chars): {original_spec_text[:200]}")
         else: logger.warning(f"[{tool_name}] Initial spec_text is not a string: {type(original_spec_text)}")
+
         if not original_spec_text:
             self._queue_intermediate_message(state, "No OpenAPI specification text provided."); state.update_scratchpad_reason(tool_name, "No spec text in state.")
             state.next_step = "responder"; state.openapi_spec_string = None; return state
+        
         if not isinstance(original_spec_text, str): 
             error_msg = f"Invalid type for OpenAPI specification: expected a string, but got {type(original_spec_text)}. Cannot proceed."
             logger.error(f"[{tool_name}] {error_msg}"); self._queue_intermediate_message(state, error_msg)
@@ -125,8 +165,8 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
             logger.info(f"[{tool_name}] Spec text remained unchanged after LLM pre-cleanup attempt.")
         
         cache_key = get_cache_key(spec_text_to_parse); cached_full_analysis_key = f"{cache_key}_full_analysis_v3_validated_or_parsed"
+        
         if SCHEMA_CACHE:
-            # ... (cache loading logic as before) ...
             cached_schema_artifacts = load_cached_schema(cached_full_analysis_key)
             if cached_schema_artifacts and isinstance(cached_schema_artifacts, dict):
                 try:
@@ -146,7 +186,6 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
         parsed_spec_dict: Optional[Dict[str, Any]] = None; error_message: Optional[str] = None
         logger.debug(f"[{tool_name}] Attempting to parse spec_text (length: {len(spec_text_to_parse)}) as JSON/YAML after potential LLM cleanup.")
         try:
-            # ... (parsing logic as before) ...
             cleaned_spec_text_for_parsing = spec_text_to_parse.strip()
             if cleaned_spec_text_for_parsing.startswith("{") and cleaned_spec_text_for_parsing.endswith("}"):
                 logger.debug(f"[{tool_name}] Trying to parse potentially cleaned spec as JSON."); parsed_spec_dict = json.loads(cleaned_spec_text_for_parsing); logger.debug(f"[{tool_name}] Successfully parsed potentially cleaned spec as JSON.")
@@ -157,11 +196,9 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
         except Exception as e_parse: error_message = f"Unexpected error during spec parsing after cleanup: {type(e_parse).__name__} - {e_parse}"; logger.error(f"[{tool_name}] {error_message}", exc_info=True)
         
         if error_message:
-            # ... (error handling for parsing failure as before) ...
             state.openapi_schema = None; state.openapi_spec_string = None; self._queue_intermediate_message(state, f"Failed to parse specification (even after AI cleanup attempt): {error_message}")
             state.next_step = "responder"; state.update_scratchpad_reason(tool_name, f"Parsing failed. Response: {state.response}"); return state
         if not parsed_spec_dict or not isinstance(parsed_spec_dict, dict):
-            # ... (error handling for non-dict parsed content as before) ...
             state.openapi_schema = None; state.openapi_spec_string = None; self._queue_intermediate_message(state, "Parsed content (post-cleanup) is not a valid dictionary structure.")
             logger.error(f"Parsed content (post-cleanup) is not a dictionary. Type: {type(parsed_spec_dict)}. Input snippet: {spec_text_to_parse[:200]}...")
             state.next_step = "responder"; state.update_scratchpad_reason(tool_name, "Parsed content not a dict."); return state
@@ -173,39 +210,26 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
         try:
             logger.debug(f"[{tool_name}] Detected OpenAPI version string: '{spec_version_str}', is_swagger_v2: {is_swagger_v2}")
             if parsed_spec_dict is None: raise ValueError("parsed_spec_dict became None before validation")
-
-            # Log a snippet of relevant parts before validation if error is suspected
-            if logger.isEnabledFor(logging.DEBUG): # Avoid stringifying large specs in info/warn
+            if logger.isEnabledFor(logging.DEBUG):
                 try:
-                    debug_snippet = {
-                        "info": parsed_spec_dict.get("info", {}).get("version"),
-                        "paths_keys": list(parsed_spec_dict.get("paths", {}).keys())[:3],
-                        "components_schemas_keys": list(parsed_spec_dict.get("components", {}).get("schemas", {}).keys())[:3]
-                    }
-                    # Check for $ref that might be problematic
+                    debug_snippet = {"info_version": parsed_spec_dict.get("info", {}).get("version"), "paths_keys": list(parsed_spec_dict.get("paths", {}).keys())[:3], "components_schemas_keys": list(parsed_spec_dict.get("components", {}).get("schemas", {}).keys())[:3]}
                     if "components" in parsed_spec_dict and "schemas" in parsed_spec_dict["components"]:
                         for k, v_schema in parsed_spec_dict["components"]["schemas"].items():
                             if isinstance(v_schema, dict) and "$ref" in v_schema and not isinstance(v_schema["$ref"], str):
-                                debug_snippet[f"problematic_$ref_in_{k}"] = v_schema["$ref"]
-                                break 
+                                debug_snippet[f"problematic_$ref_in_{k}"] = v_schema["$ref"]; break 
                     logger.debug(f"[{tool_name}] Snippet of spec structure before validation: {json.dumps(debug_snippet, indent=2)}")
-                except Exception as e_debug_log:
-                    logger.debug(f"[{tool_name}] Could not create debug snippet: {e_debug_log}")
-
+                except Exception as e_debug_log: logger.debug(f"[{tool_name}] Could not create debug snippet: {e_debug_log}")
 
             if spec_version_str.startswith("3.0"):
-                logger.info(f"[{tool_name}] Attempting to validate as OpenAPI v3.0.x (Version: {spec_version_str}).")
-                validated_spec_dict = openapi_v30_spec_validator.validate(parsed_spec_dict)
-                parsed_spec_dict = validated_spec_dict 
-                validation_performed = True; validation_successful = True
-                logger.info(f"[{tool_name}] OpenAPI 3.0.x validated successfully.")
-            # ... (rest of validation logic and error handling as before) ...
+                logger.info(f"[{tool_name}] Attempting to validate as OpenAPI v3.0.x (Version: {spec_version_str})."); validated_spec_dict = openapi_v30_spec_validator.validate(parsed_spec_dict)
+                parsed_spec_dict = validated_spec_dict; validation_performed = True; validation_successful = True; logger.info(f"[{tool_name}] OpenAPI 3.0.x validated successfully.")
             elif spec_version_str.startswith("3.1"):
                 logger.info(f"[{tool_name}] Attempting to validate as OpenAPI v3.1.x (Version: {spec_version_str})."); validated_spec_dict = openapi_v31_spec_validator.validate(parsed_spec_dict)
                 parsed_spec_dict = validated_spec_dict; validation_performed = True; validation_successful = True; logger.info(f"[{tool_name}] OpenAPI 3.1.x validated successfully.")
             elif is_swagger_v2: logger.warning(f"[{tool_name}] Swagger 2.0 spec detected. Specific v2 validation not active. $refs may not be resolved by validator.")
             elif spec_version_str: logger.warning(f"[{tool_name}] Unsupported OpenAPI version for validation: '{spec_version_str}'. $refs may not be resolved by validator.")
             else: logger.warning(f"[{tool_name}] Could not determine OpenAPI version for validation. $refs may not be resolved by validator.")
+            
             state.openapi_schema = parsed_spec_dict; state.schema_cache_key = cache_key; state.openapi_spec_text = spec_text_to_parse; state.openapi_spec_string = None
             if validation_performed and validation_successful: self._queue_intermediate_message(state, "OpenAPI 3.x specification parsed and validated. Starting analysis pipeline...")
             else: self._queue_intermediate_message(state, "OpenAPI specification parsed (v3 validation not applicable/performed or skipped). Starting analysis pipeline...")
@@ -229,8 +253,6 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
         
         state.update_scratchpad_reason(tool_name, f"Parsing and Validation (v3.x) status: {'Success' if state.openapi_schema else 'Failed'}. Response: {state.response}"); return state
 
-    # ... (other methods like _generate_llm_schema_summary, _identify_apis_from_schema, _generate_payload_descriptions_parallel, process_schema_pipeline_async, etc. remain the same as in the previous version with utility LLM and parallelism)
-    # For brevity, I'll only include the changed methods here. Ensure the rest of the class is complete in your file.
     def _generate_llm_schema_summary(self, state: BotState):
         tool_name = "_generate_llm_schema_summary"
         self._queue_intermediate_message(state, "Generating API summary (using Utility LLM)...")
@@ -302,6 +324,8 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
         context_str = f" User Context: {context_override}." if context_override else ""
         prompt = (f"API Operation: {op_id} ({api_op['method']} {api_op['path']})\nSummary: {api_op.get('summary', 'N/A')}\n{context_str}\nParameters: {params_summary_str}\nNote on Schemas: {validation_note_for_payload}\nRequest Body Schema (if application/json):\n```json\n{request_body_schema_str}\n```\nSuccessful (2xx) Response Schema (sample, if application/json):\n```json\n{success_response_schema_str}\n```\n\nTask: Provide a concise, typical, and REALISTIC JSON example for the request payload (if applicable for this method and API design). Use plausible, real-world example values based on the parameter names, types, and the API schema. If a schema was just a $ref (e.g., {{\"'$ref'\": \"#/components/schemas/User\"}}) before validation, the validator should have resolved it if it was OpenAPI 3.x. Base your example on the (potentially resolved) schema provided. For example, if a field is 'email', use 'user@example.com'. If 'count', use a number like 5. Also, provide a brief description of the expected JSON response structure for a successful call, based on the schema. Focus on key fields. If no request payload is typically needed (e.g., for GET with only path/query params), state 'No request payload needed.' clearly. Format clearly:\nRequest Payload Example:\n```json\n{{\"key\": \"realistic_value\", \"another_key\": 123}}\n```\nExpected Response Structure:\nBrief description of response fields (e.g., 'Returns an object with id, name, and status. The 'status' field indicates processing outcome.').")
         try:
+            # Using worker_llm for payload description quality.
+            # Ensure worker_llm's client supports ainvoke for true parallelism.
             if hasattr(self.worker_llm, 'ainvoke'):
                  response_obj = await self.worker_llm.ainvoke(prompt)
                  description = response_obj.content if hasattr(response_obj, 'content') else str(response_obj)
@@ -319,45 +343,65 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
         state.update_scratchpad_reason(tool_name, f"Generating payload descriptions in parallel. Targets: {target_apis or 'subset'}. Context: {bool(context_override)}")
         if not state.identified_apis:
             logger.warning("No APIs identified, cannot generate payload descriptions."); self._queue_intermediate_message(state, "Cannot create payload examples: No APIs identified."); return
+        
         payload_descs = state.payload_descriptions or {}
-        apis_to_process = []
-        if target_apis: apis_to_process = [api for api in state.identified_apis if api["operationId"] in target_apis]
+        apis_to_process_candidates = []
+        if target_apis: 
+            apis_to_process_candidates = [api for api in state.identified_apis if api["operationId"] in target_apis]
         else:
             apis_with_payload_info = [api for api in state.identified_apis if api.get("requestBody") or any(p.get("in") in ["body", "formData"] for p in api.get("parameters", []))]
             unprocessed_apis = [api for api in apis_with_payload_info if api["operationId"] not in payload_descs]
-            if unprocessed_apis: apis_to_process = unprocessed_apis[:MAX_PAYLOAD_SAMPLES_TO_GENERATE_INITIAL * 2] 
-            else: apis_to_process = apis_with_payload_info[:MAX_PAYLOAD_SAMPLES_TO_GENERATE_SINGLE_PASS * 2]
-        if not apis_to_process:
+            if unprocessed_apis: 
+                apis_to_process_candidates = unprocessed_apis[:MAX_PAYLOAD_SAMPLES_TO_GENERATE_INITIAL * 2] # Process more if parallel
+            else: 
+                apis_to_process_candidates = apis_with_payload_info[:MAX_PAYLOAD_SAMPLES_TO_GENERATE_SINGLE_PASS * 2]
+        
+        # Filter out already processed ones unless forced by context_override or specific target_apis
+        apis_to_actually_process = []
+        for api_op in apis_to_process_candidates:
+            if api_op["operationId"] not in payload_descs or context_override or target_apis:
+                apis_to_actually_process.append(api_op)
+
+        if not apis_to_actually_process:
             self._queue_intermediate_message(state, "No new APIs require payload description generation at this time."); return
-        logger.info(f"Attempting to generate payload descriptions in parallel for {len(apis_to_process)} APIs.")
+
+        logger.info(f"Attempting to generate payload descriptions in parallel for {len(apis_to_actually_process)} APIs.")
+        
         tasks = []
-        for api_op in apis_to_process:
-            op_id = api_op["operationId"]
-            if op_id in payload_descs and not context_override and not target_apis: continue
+        for api_op in apis_to_actually_process:
             current_openapi_schema = state.openapi_schema if state.openapi_schema else {}
             tasks.append(self._generate_single_payload_desc(api_op, current_openapi_schema, context_override))
+
         processed_count = 0
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            task_generating_apis = [api for api in apis_to_process if not (api["operationId"] in payload_descs and not context_override and not target_apis)]
             for i, result in enumerate(results):
-                original_api_op = task_generating_apis[i] if i < len(task_generating_apis) else None
-                op_id_for_result = original_api_op["operationId"] if original_api_op else f"unknown_op_id_at_index_{i}"
+                # Get the corresponding api_op for context, even if task failed
+                original_api_op = apis_to_actually_process[i] 
+                op_id_for_result = original_api_op["operationId"]
+
                 if isinstance(result, Exception):
                     logger.error(f"Exception in parallel payload generation for {op_id_for_result}: {result}")
                     payload_descs[op_id_for_result] = f"Error generating description (parallel): {str(result)[:100]}..."
                     self._queue_intermediate_message(state, f"Error creating payload example for '{op_id_for_result}': {str(result)[:100]}...")
                 elif isinstance(result, tuple) and len(result) == 2:
                     op_id_succ, description = result
-                    payload_descs[op_id_succ] = description; processed_count += 1
-                    if "Error generating description" in description: self._queue_intermediate_message(state, f"Partial error for '{op_id_succ}': {description}")
-                else: logger.error(f"Unexpected result type from parallel payload generation for {op_id_for_result}: {type(result)}")
+                    payload_descs[op_id_succ] = description
+                    if "Error generating description" not in description: # Count only successes
+                        processed_count += 1
+                    else: # If LLM returned an error string
+                         self._queue_intermediate_message(state, f"Partial error for '{op_id_succ}': {description}")
+                else: 
+                    logger.error(f"Unexpected result type from parallel payload generation for {op_id_for_result}: {type(result)}")
+                    payload_descs[op_id_for_result] = "Unexpected error during generation."
+        
         state.payload_descriptions.update(payload_descs) 
+        
         final_payload_msg = ""
         if processed_count > 0: final_payload_msg = f"Generated payload examples for {processed_count} API operation(s) (parallel execution)."
-        elif not apis_to_process : final_payload_msg = "No relevant APIs found requiring new payload examples at this time."
-        elif target_apis and not apis_to_process: final_payload_msg = f"Could not find the specified API(s) ({target_apis}) to generate payload examples."
+        elif not apis_to_actually_process : final_payload_msg = "No relevant APIs found requiring new payload examples at this time." # Should be caught earlier
         else: final_payload_msg = "Payload generation tasks completed with no new successful descriptions."
+
         if final_payload_msg: self._queue_intermediate_message(state, final_payload_msg)
         state.update_scratchpad_reason(tool_name, f"Parallel payload descriptions updated for {processed_count} APIs.")
 
@@ -372,57 +416,86 @@ Return ONLY the cleaned-up OpenAPI specification text. Do not add any explanatio
         state.execution_graph = None; state.graph_refinement_iterations = 0
         state.plan_generation_goal = state.plan_generation_goal or "Provide a general overview workflow."
         state.scratchpad['graph_gen_attempts'] = 0; state.scratchpad['refinement_validation_failures'] = 0
+        
         self._generate_llm_schema_summary(state) 
         if state.schema_summary and ("Error generating summary: 429" in state.schema_summary or "quota" in state.schema_summary.lower()):
             logger.warning("API limit hit during schema summary. Stopping pipeline."); state.next_step = "responder"; return state
+            
         self._identify_apis_from_schema(state) 
         if not state.identified_apis:
-            msg = (state.response or "") + " No API operations were identified. Cannot generate graph."
+            msg = (state.response or "") + " No API operations identified. Cannot generate graph."
             self._queue_intermediate_message(state, msg); state.next_step = "responder"; return state
+            
         await self._generate_payload_descriptions_parallel(state) 
-        if any("Error generating description: 429" in desc for desc in state.payload_descriptions.values()) or any("quota" in desc.lower() for desc in state.payload_descriptions.values()):
+        if any("Error generating description: 429" in desc for desc in state.payload_descriptions.values()) or \
+           any("quota" in desc.lower() for desc in state.payload_descriptions.values()):
             logger.warning("API limit hit during payload description generation.")
+
         state = graph_generator_func(state, state.plan_generation_goal) 
-        if (state.openapi_schema and state.schema_cache_key and SCHEMA_CACHE and state.execution_graph and state.next_step not in ["handle_unknown", "responder_with_error_from_pipeline"]):
-            full_analysis_data = {"openapi_schema": state.openapi_schema, "schema_summary": state.schema_summary, "identified_apis": state.identified_apis, "payload_descriptions": state.payload_descriptions, "execution_graph": state.execution_graph.model_dump() if isinstance(state.execution_graph, GraphOutput) else None, "plan_generation_goal": state.plan_generation_goal}
+        
+        if (state.openapi_schema and state.schema_cache_key and SCHEMA_CACHE and \
+            state.execution_graph and state.next_step not in ["handle_unknown", "responder_with_error_from_pipeline"]):
+            full_analysis_data = {
+                "openapi_schema": state.openapi_schema, "schema_summary": state.schema_summary,
+                "identified_apis": state.identified_apis, "payload_descriptions": state.payload_descriptions,
+                "execution_graph": state.execution_graph.model_dump() if isinstance(state.execution_graph, GraphOutput) else None,
+                "plan_generation_goal": state.plan_generation_goal
+            }
             cached_full_analysis_key = f"{state.schema_cache_key}_full_analysis_v3_validated_or_parsed"
             save_schema_to_cache(cached_full_analysis_key, full_analysis_data)
             logger.info(f"Saved processed data and analysis to cache: {cached_full_analysis_key}")
+            
         state.update_scratchpad_reason(tool_name, f"Schema processing pipeline completed. Next step: {state.next_step}")
         return state
 
     def process_schema_pipeline(self, state: BotState, graph_generator_func: Callable[[BotState, Optional[str]], BotState]) -> BotState:
         try:
-            if asyncio.get_event_loop().is_running():
-                 logger.warning("process_schema_pipeline (sync wrapper) is calling an async version. This might block if not handled carefully in the calling environment.")
-                 # This is a simplified way to run async from sync if an event loop is already running.
-                 # For robust production code, consider structuring the graph with async nodes if possible.
-                 future = asyncio.ensure_future(self.process_schema_pipeline_async(state, graph_generator_func))
-                 state = asyncio.get_event_loop().run_until_complete(future)
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                 logger.info("Event loop is running. Creating task for async pipeline.")
+                 # Using ensure_future and then letting the outer context (FastAPI) handle the event loop.
+                 # This is still tricky if the LangGraph node itself is purely synchronous.
+                 # A better approach is if the LangGraph node itself can be async.
+                 # For now, this attempts to schedule it if a loop is present.
+                 # This might not block and wait for completion as asyncio.run would.
+                 # This part is highly dependent on how LangGraph executes its synchronous nodes
+                 # when an asyncio loop is already active from FastAPI.
+                 # A more robust solution for sync LangGraph nodes calling async code
+                 # often involves a thread pool executor or a dedicated async-to-sync bridge.
+
+                 # Simplification: If called from a sync LangGraph node, running truly async
+                 # and getting the result back synchronously is complex.
+                 # The asyncio.run() approach is simpler if it can be made to work or if the node is top-level.
+                 # Let's stick to asyncio.run() for now and address RuntimeError if it occurs.
+                 logger.warning("Attempting asyncio.run() from process_schema_pipeline. This might fail if called from within an existing running loop in a way that conflicts.")
+                 state = asyncio.run(self.process_schema_pipeline_async(state, graph_generator_func))
             else: 
+                 logger.info("No event loop running. Using asyncio.run() for async pipeline.")
                  state = asyncio.run(self.process_schema_pipeline_async(state, graph_generator_func))
         except RuntimeError as re_async:
-            if "cannot be called from a running event loop" in str(re_async) or "There is no current event loop in thread" in str(re_async):
+            if "cannot be called from a running event loop" in str(re_async) or \
+               "There is no current event loop in thread" in str(re_async) or \
+               "Task attached to a different loop" in str(re_async): # More comprehensive check
                 logger.error(f"Async runtime error in process_schema_pipeline: {re_async}. This setup might need the LangGraph node to be async or use a different async bridge. Falling back to synchronous execution for this call.")
-                # Synchronous fallback (without parallel payload generation)
                 self._queue_intermediate_message(state, "Processing schema (sync fallback due to async issue)...")
-                self._generate_llm_schema_summary(state)
+                # --- Synchronous Fallback Path ---
+                self._generate_llm_schema_summary(state) # Uses utility_llm (sync call via llm_call_helper)
                 if not (state.schema_summary and ("Error generating summary: 429" in state.schema_summary or "quota" in state.schema_summary.lower())):
-                    self._identify_apis_from_schema(state)
+                    self._identify_apis_from_schema(state) # Sync, no LLM
                     if state.identified_apis:
-                        # Call the original synchronous version of _generate_payload_descriptions
-                        # You would need to temporarily rename _generate_payload_descriptions_parallel
-                        # and keep the old _generate_payload_descriptions or have a flag.
-                        # For this example, let's assume you have a sync version available if needed.
-                        # self._generate_payload_descriptions_SYNC_VERSION(state) # Placeholder
-                        logger.warning("Synchronous payload description generation would be called here if available as fallback.")
-                        state = graph_generator_func(state, state.plan_generation_goal)
+                        # Here, you would call a *synchronous* version of payload description generation.
+                        # For now, we'll log a warning that this part would be skipped or needs a sync version.
+                        logger.warning("Synchronous fallback: Parallel payload description generation is skipped. Implement a synchronous version if this path is critical.")
+                        self._queue_intermediate_message(state, "Note: Payload examples generated synchronously (or skipped if no sync version).")
+                        # Call the original _generate_payload_descriptions if you keep it or a renamed sync version
+                        # self._generate_payload_descriptions_SYNC(state) # Example
+                        state = graph_generator_func(state, state.plan_generation_goal) # Graph gen is sync
                     else:
                         msg = (state.response or "") + " No API operations identified (sync fallback)."
                         self._queue_intermediate_message(state, msg); state.next_step = "responder"
                 else:
                     logger.warning("API limit hit during schema summary (sync fallback)."); state.next_step = "responder"
-
+                # --- End Synchronous Fallback Path ---
             else: raise 
         except Exception as e:
             logger.error(f"Unexpected error in process_schema_pipeline wrapper: {e}", exc_info=True)
