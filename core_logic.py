@@ -15,10 +15,13 @@ from utils import (
 from pydantic import ValidationError as PydanticValidationError # Alias to avoid confusion
 from api_executor import APIExecutor
 
-# Import specific validators
-from openapi_spec_validator import openapi_v2_spec_validator, openapi_v30_spec_validator, openapi_v31_spec_validator
-
-# Import the specific exception class from its module path as seen in the traceback
+# Import specific validators for different OpenAPI versions
+from openapi_spec_validator import (
+    openapi_v2_spec_validator, 
+    openapi_v30_spec_validator, 
+    openapi_v31_spec_validator
+)
+# Import the specific exception class from its module path
 from openapi_spec_validator.validation.exceptions import OpenAPIValidationError 
 
 logger = logging.getLogger(__name__)
@@ -118,25 +121,25 @@ class OpenAPICoreLogic:
             return state
 
         try:
-            spec_version = parsed_spec_dict.get('openapi', parsed_spec_dict.get('swagger'))
+            spec_version_str = parsed_spec_dict.get('openapi', parsed_spec_dict.get('swagger'))
             
             # The .validate() methods raise an error on failure and return None on success.
             # They operate on the parsed_spec_dict, resolving references internally for validation.
-            if spec_version and spec_version.startswith('2.'):
-                logger.info("Attempting to validate as OpenAPI v2 (Swagger) specification.")
+            if spec_version_str and spec_version_str.startswith('2.'):
+                logger.info(f"Attempting to validate as OpenAPI v2 (Swagger) specification (Version: {spec_version_str}).")
                 openapi_v2_spec_validator.validate(parsed_spec_dict)
-            elif spec_version and spec_version.startswith('3.0'): # Explicitly handle 3.0.x
-                logger.info("Attempting to validate as OpenAPI v3.0.x specification.")
+            elif spec_version_str and spec_version_str.startswith('3.0'):
+                logger.info(f"Attempting to validate as OpenAPI v3.0.x specification (Version: {spec_version_str}).")
                 openapi_v30_spec_validator.validate(parsed_spec_dict)
-            elif spec_version and spec_version.startswith('3.1'): # Explicitly handle 3.1.x
-                logger.info("Attempting to validate as OpenAPI v3.1.x specification.")
+            elif spec_version_str and spec_version_str.startswith('3.1'):
+                logger.info(f"Attempting to validate as OpenAPI v3.1.x specification (Version: {spec_version_str}).")
                 openapi_v31_spec_validator.validate(parsed_spec_dict)
             else:
-                logger.warning(f"Unknown or unsupported OpenAPI version: '{spec_version}'. Attempting with v3.0 validator as a default.")
+                logger.warning(f"Unknown or unsupported OpenAPI version string: '{spec_version_str}'. Attempting with v3.0 validator as a default.")
                 openapi_v30_spec_validator.validate(parsed_spec_dict) 
             
-            # If validation passed (no exception raised), the parsed_spec_dict is considered validated.
-            # References within it were resolvable by the validator.
+            # If validation passed, parsed_spec_dict is the (effectively) dereferenced schema for our purposes.
+            # The validator resolves refs to perform validation.
             state.openapi_schema = parsed_spec_dict 
             state.schema_cache_key = cache_key 
             state.openapi_spec_text = spec_text 
@@ -146,19 +149,17 @@ class OpenAPICoreLogic:
             state.response = "OpenAPI specification parsed and validated. Starting analysis pipeline..."
             state.next_step = "process_schema_pipeline"
 
-        except OpenAPIValidationError as val_e: # Catch the specific, correctly imported exception
+        except OpenAPIValidationError as val_e: 
             state.openapi_schema = None 
             state.openapi_spec_string = None
-            error_detail = str(val_e)
-            # Attempt to provide more context from the validation error
-            if hasattr(val_e, 'message'): # Basic message
-                error_detail = val_e.message
-            if hasattr(val_e, 'instance') and hasattr(val_e, 'schema_path'): # More detailed error
+            error_detail = str(val_e.message if hasattr(val_e, 'message') else val_e)
+            # Provide more context if available from the error object
+            if hasattr(val_e, 'instance') and hasattr(val_e, 'schema_path'):
                  error_detail_path = "->".join(map(str, val_e.schema_path))
                  error_detail = f"Validation error at path '{error_detail_path}' for instance segment '{str(val_e.instance)[:100]}...': {val_e.message}"
             
             state.response = f"OpenAPI specification is invalid: {error_detail[:500]}"
-            logger.error(f"OpenAPI Validation failed: {error_detail}", exc_info=False) # Log full error if needed, but keep user message concise
+            logger.error(f"OpenAPI Validation failed: {error_detail}", exc_info=False) 
             state.next_step = "responder"
         except Exception as e_general_processing: 
             state.openapi_schema = None
