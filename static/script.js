@@ -1,542 +1,422 @@
-// OpenAPI Agent script.js
+// static/script.js
 
+// Ensure this runs after the DOM is fully loaded
 document.addEventListener('DOMContentLoaded', () => {
-    // DOM Elements
-    const chatMessagesDiv = document.getElementById('chatMessages');
+    const specInput = document.getElementById('specInput');
+    const specUrlInput = document.getElementById('specUrl');
+    const specFileInput = document.getElementById('specFile');
+    const submitSpecButton = document.getElementById('submitSpecButton');
+    const chatMessages = document.getElementById('chatMessages');
+    const graphContainer = document.getElementById('graphContainer');
     const userInput = document.getElementById('userInput');
-    const sendButton = document.getElementById('sendButton');
-    // Spinner is now part of sendButton's dynamic HTML
-    const runWorkflowButton = document.getElementById('runWorkflowButton');
-
-    const graphJsonViewPre = document.getElementById('graphJsonViewPre');
-    const mermaidDagContainer = document.getElementById('mermaidDagDiagram');
-    const jsonTabButton = document.getElementById('jsonTabButton');
-    const dagTabButton = document.getElementById('dagTabButton');
-    const graphJsonViewContent = document.getElementById('graphJsonViewContent');
-    const graphDagViewContent = document.getElementById('graphDagViewContent');
-
-    // Modal Elements
-    const confirmationModal = document.getElementById('confirmationModal');
-    const modalTitle = document.getElementById('modalTitle');
-    const modalOperationId = document.getElementById('modalOperationId');
-    const modalEffectiveNodeId = document.getElementById('modalEffectiveNodeId'); 
-    const modalMethod = document.getElementById('modalMethod');
-    const modalPath = document.getElementById('modalPath');
-    const modalGraph2ThreadId = document.getElementById('modalGraph2ThreadId'); 
-    const modalPayload = document.getElementById('modalPayload');
-    const modalConfirmButton = document.getElementById('modalConfirmButton');
-    const modalCancelButton = document.getElementById('modalCancelButton');
+    const sendMessageButton = document.getElementById('sendMessageButton');
+    const clearChatButton = document.getElementById('clearChatButton');
+    const thinkingIndicatorContainer = document.getElementById('thinkingIndicatorContainer');
+    const thinkingIndicatorText = document.getElementById('thinkingIndicatorText');
+    const apiResponseContainer = document.getElementById('apiResponseContainer');
+    const apiResponseContent = document.getElementById('apiResponseContent');
+    const closeApiResponseButton = document.getElementById('closeApiResponse');
 
     let ws;
-    let currentGraphData = null;
-    const initialSendButtonHTML = sendButton.innerHTML; 
+    let isThinking = false; // Global state for thinking indicator
+    let currentGraph = null; // To store the current graph data for re-rendering
 
-    let currentConfirmationContext = {
-        graph2ThreadId: null,
-        confirmationKey: null,
-        operationId: null, 
-        effectiveNodeId: null 
-    };
-
-    function updateSendButtonState(isThinking) {
-        if (isThinking) {
-            sendButton.classList.add('thinking');
-            sendButton.innerHTML = `<div class="spinner" style="display: inline-block;"></div> Thinking...`; 
-            sendButton.disabled = true;
-            userInput.disabled = true;
-        } else {
-            sendButton.classList.remove('thinking');
-            sendButton.innerHTML = initialSendButtonHTML; 
-            sendButton.disabled = false;
-            userInput.disabled = false;
+    // Function to show the thinking indicator
+    function startThinking(message = "Processing...") {
+        isThinking = true;
+        if (thinkingIndicatorText) thinkingIndicatorText.textContent = message;
+        if (thinkingIndicatorContainer) {
+            thinkingIndicatorContainer.classList.remove('opacity-0', 'pointer-events-none');
+            thinkingIndicatorContainer.classList.add('opacity-100');
         }
-        runWorkflowButton.disabled = isThinking || !currentGraphData;
+        if (submitSpecButton) submitSpecButton.disabled = true;
+        if (sendMessageButton) sendMessageButton.disabled = true;
+        // Optionally add a message to chat, but the indicator itself is primary
+        // addMessageToChat('status', message); 
+        console.log("UI: Thinking started - ", message);
     }
 
+    // Function to hide the thinking indicator
+    function stopThinking(message = "Done.") {
+        isThinking = false;
+        if (thinkingIndicatorContainer) {
+            thinkingIndicatorContainer.classList.add('opacity-0', 'pointer-events-none');
+            thinkingIndicatorContainer.classList.remove('opacity-100');
+        }
+        if (submitSpecButton) submitSpecButton.disabled = false;
+        if (sendMessageButton) sendMessageButton.disabled = false;
+        // Optionally add a status message to chat
+        // addMessageToChat('status', message);
+        console.log("UI: Thinking stopped - ", message);
+    }
+    
+    function connectWebSocket() {
+        // Determine WebSocket protocol (ws or wss)
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${wsProtocol}//${window.location.host}/ws/openai_spec_agent`;
+        
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = function(event) {
+            console.log("WebSocket connection established.");
+            addMessageToChat('status', "Connected to the agent.");
+            stopThinking("Connected."); // Ensure UI is reset on new connection
+        };
+
+        ws.onmessage = function(event) {
+            try {
+                const parsed_event_data = JSON.parse(event.data);
+                console.log("WebSocket message received:", parsed_event_data);
+                
+                const messageType = parsed_event_data.type;
+                const data = parsed_event_data.data || {}; // Ensure data object exists
+
+                switch (messageType) {
+                    case 'status_update':
+                        if (data.event === 'thinking_started') {
+                            startThinking(data.message || "Processing...");
+                        } else if (data.event === 'thinking_finished') {
+                            stopThinking(data.message || "Processing finished.");
+                        } else {
+                             addMessageToChat('status', `Status: ${data.event} - ${data.message || ''}`);
+                        }
+                        break;
+                    case 'intermediate_message':
+                        addMessageToChat(data.source || 'assistant', data.message);
+                        if (isThinking && data.message && thinkingIndicatorText) {
+                            // Update thinking indicator text with the latest intermediate message
+                            thinkingIndicatorText.textContent = data.message.length > 50 ? data.message.substring(0, 47) + "..." : data.message;
+                        }
+                        break;
+                    case 'graph_update':
+                        if (data.graph) {
+                            currentGraph = data.graph; // Store the graph data
+                            renderGraph(currentGraph);
+                            addMessageToChat('status', "Workflow graph updated.");
+                        }
+                        break;
+                    case 'api_response':
+                        displayApiResponse(data);
+                        // Typically, an api_response might come after "thinking" has finished for that specific call.
+                        // If it's part of a larger flow, the overall "thinking" might still be active.
+                        break;
+                    case 'final_response':
+                        addMessageToChat('assistant', data.message);
+                        if (data.result) { // Example: if final response has structured result
+                            // You might want to display this structured result differently
+                            console.log("Final result data:", data.result);
+                        }
+                        stopThinking(data.message || "Task complete."); // Ensure thinking stops
+                        break;
+                    case 'error':
+                        addMessageToChat('error', `Error: ${data.message}`);
+                        stopThinking("An error occurred."); // Stop thinking on error
+                        break;
+                    default:
+                        addMessageToChat('unknown', `Received: ${event.data}`);
+                }
+            } catch (e) {
+                console.error("Error processing WebSocket message:", e);
+                addMessageToChat('error', "Received an unparseable message from server.");
+            }
+        };
+
+        ws.onclose = function(event) {
+            console.log("WebSocket connection closed.", event.reason);
+            addMessageToChat('status', "Connection closed. Attempting to reconnect in 5 seconds...");
+            stopThinking("Connection lost."); // Reset UI
+            setTimeout(connectWebSocket, 5000); // Attempt to reconnect
+        };
+
+        ws.onerror = function(error) {
+            console.error("WebSocket error:", error);
+            addMessageToChat('error', "WebSocket connection error.");
+            // onclose will usually be called after onerror, so reconnection logic is there.
+            // stopThinking() will also be called by onclose.
+        };
+    }
+
+    function addMessageToChat(source, message, type = 'text') {
+        if (!chatMessages) return;
+        const messageElement = document.createElement('div');
+        messageElement.classList.add('mb-2', 'p-3', 'rounded-lg', 'max-w-2xl', 'break-words', 'text-sm');
+
+        let sourcePrefix = "";
+        if (source === 'user') {
+            messageElement.classList.add('bg-blue-500', 'text-white', 'self-end', 'ml-auto');
+            sourcePrefix = '<strong class="font-semibold">You:</strong> ';
+        } else if (source === 'assistant') {
+            messageElement.classList.add('bg-gray-200', 'text-gray-800', 'self-start', 'mr-auto');
+            sourcePrefix = '<strong class="font-semibold">Agent:</strong> ';
+        } else if (source === 'status') {
+            messageElement.classList.add('bg-yellow-100', 'text-yellow-700', 'self-center', 'text-xs', 'italic');
+        } else if (source === 'error') {
+            messageElement.classList.add('bg-red-100', 'text-red-700', 'self-start', 'mr-auto', 'font-semibold');
+            sourcePrefix = '<strong class="font-semibold">Error:</strong> ';
+        } else { // unknown or system
+            messageElement.classList.add('bg-gray-50', 'text-gray-500', 'self-center', 'text-xs');
+        }
+        
+        // Sanitize message before setting innerHTML if it can contain user-generated HTML
+        // For now, assuming messages are text or controlled HTML from backend
+        messageElement.innerHTML = sourcePrefix + message; 
+        chatMessages.appendChild(messageElement);
+        chatMessages.scrollTop = chatMessages.scrollHeight; // Auto-scroll
+    }
+
+    function sendWebSocketMessage(type, payload) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            const message = JSON.stringify({ type: type, ...payload });
+            ws.send(message);
+            console.log("Sent to WS:", message);
+        } else {
+            addMessageToChat('error', "WebSocket is not connected. Cannot send message.");
+            console.error("WebSocket is not connected.");
+        }
+    }
+
+    if (submitSpecButton) {
+        submitSpecButton.addEventListener('click', () => {
+            let specData = specInput.value.trim();
+            const url = specUrlInput.value.trim();
+            const file = specFileInput.files[0];
+            let source = 'text';
+
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    specData = e.target.result;
+                    source = 'file';
+                    addMessageToChat('user', `Submitted OpenAPI Spec from file: ${file.name}`);
+                    sendWebSocketMessage('process_openapi_spec', { openapi_spec_string: specData, source: source, file_name: file.name });
+                };
+                reader.onerror = function(e) {
+                    addMessageToChat('error', 'Error reading file.');
+                    console.error("File reading error:", e);
+                };
+                reader.readAsText(file);
+            } else if (url) {
+                specData = url; // The backend will fetch the URL
+                source = 'url';
+                addMessageToChat('user', `Submitted OpenAPI Spec from URL: ${url}`);
+                sendWebSocketMessage('process_openapi_spec', { openapi_spec_url: specData, source: source });
+            } else if (specData) {
+                source = 'text';
+                addMessageToChat('user', `Submitted OpenAPI Spec (text input)`);
+                sendWebSocketMessage('process_openapi_spec', { openapi_spec_string: specData, source: source });
+            } else {
+                addMessageToChat('error', 'Please provide an OpenAPI spec (text, URL, or file).');
+                return;
+            }
+            // "Thinking" will be started by the backend's response.
+        });
+    }
+
+    if (sendMessageButton) {
+        sendMessageButton.addEventListener('click', () => {
+            const messageText = userInput.value.trim();
+            if (messageText) {
+                addMessageToChat('user', messageText);
+                sendWebSocketMessage('user_interaction', { text: messageText, current_graph: currentGraph });
+                userInput.value = '';
+            }
+        });
+    }
+    
+    if (userInput) {
+        userInput.addEventListener('keypress', function(event) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault(); // Prevent new line
+                sendMessageButton.click();
+            }
+        });
+    }
+
+    if (clearChatButton) {
+        clearChatButton.addEventListener('click', () => {
+            if (chatMessages) chatMessages.innerHTML = '';
+            if (graphContainer) graphContainer.innerHTML = ''; // Also clear graph
+            currentGraph = null;
+            if (apiResponseContainer) apiResponseContainer.classList.add('hidden');
+            addMessageToChat('status', 'Chat and graph cleared.');
+        });
+    }
+    
+    if (closeApiResponseButton) {
+        closeApiResponseButton.addEventListener('click', () => {
+            if (apiResponseContainer) apiResponseContainer.classList.add('hidden');
+        });
+    }
+
+    function displayApiResponse(data) {
+        if (!apiResponseContainer || !apiResponseContent) return;
+        
+        let contentHtml = `<h3 class="text-lg font-semibold mb-2">${data.operation_id || 'API Response'}</h3>`;
+        contentHtml += `<p class="text-sm mb-1"><span class="font-semibold">Status:</span> ${data.status_code || 'N/A'}</p>`;
+        
+        if (data.headers) {
+            contentHtml += '<p class="text-sm mb-1"><span class="font-semibold">Headers:</span></p>';
+            contentHtml += `<pre class="bg-gray-100 p-2 rounded text-xs overflow-x-auto max-h-32"><code>${JSON.stringify(data.headers, null, 2)}</code></pre>`;
+        }
+        if (data.body) {
+            contentHtml += '<p class="text-sm mt-2 mb-1"><span class="font-semibold">Body:</span></p>';
+            let bodyContent = data.body;
+            try {
+                // Try to parse if it's a JSON string, then re-stringify for pretty print
+                const parsedBody = JSON.parse(bodyContent);
+                bodyContent = JSON.stringify(parsedBody, null, 2);
+            } catch (e) {
+                // Not a JSON string, or already an object. Or just plain text.
+                if (typeof bodyContent === 'object') {
+                    bodyContent = JSON.stringify(bodyContent, null, 2);
+                }
+            }
+            contentHtml += `<pre class="bg-gray-100 p-2 rounded text-xs overflow-x-auto max-h-60"><code>${escapeHtml(bodyContent)}</code></pre>`;
+        }
+        
+        apiResponseContent.innerHTML = contentHtml;
+        apiResponseContainer.classList.remove('hidden');
+    }
 
     function escapeHtml(unsafe) {
         if (typeof unsafe !== 'string') {
-            if (unsafe === null || unsafe === undefined) return '';
-            try { 
-                return JSON.stringify(unsafe, null, 2); 
-            } catch (e) { 
-                return String(unsafe); 
+            // If it's not a string (e.g., already an object from JSON.parse), stringify it
+            try {
+                unsafe = JSON.stringify(unsafe, null, 2);
+            } catch (e) {
+                return ''; // Or some error placeholder
             }
         }
         return unsafe
-            .replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;")
-            .replace(/"/g, "&quot;")
-            .replace(/'/g, "&#039;");
+             .replace(/&/g, "&amp;")
+             .replace(/</g, "&lt;")
+             .replace(/>/g, "&gt;")
+             .replace(/"/g, "&quot;")
+             .replace(/'/g, "&#039;");
     }
 
-    function addMessageToChat(sender, content, type, sourceGraph = "graph1_planning") {
-        const messageElement = document.createElement('div');
-        let senderClass = 'agent-message'; 
-        let senderName = sender;
-
-        if (sender === 'You') {
-            senderClass = 'user-message';
-        } else if (sourceGraph === "graph2_execution") {
-            senderClass = 'workflow-message'; 
-            senderName = `Workflow (${type})`; 
-        } else if (sourceGraph === "system" || sender === "System") {
-            senderClass = 'system-message';
-            senderName = 'System';
-        } else if (sender === 'Planner' || sourceGraph === 'graph1_planning') { // Catch all planner messages
-            senderClass = 'planner-message';
-            senderName = 'Planner'; // Standardize sender name for planner
+    function renderGraph(graphData) {
+        if (!graphContainer || !cytoscape) {
+            console.error("Graph container or Cytoscape library not found.");
+            if (!cytoscape) addMessageToChat('error', "Cytoscape library not loaded. Cannot render graph.");
+            return;
         }
-        
-        messageElement.classList.add('message', senderClass);
-        if (chatMessagesDiv.children.length > 1) { 
-             setTimeout(() => messageElement.classList.add('new-message-animation'), 50);
-        }
+        graphContainer.innerHTML = ''; // Clear previous graph
 
-        const senderElement = document.createElement('div');
-        senderElement.classList.add('message-sender');
-        senderElement.textContent = senderName;
-
-        const contentElement = document.createElement('div');
-        contentElement.classList.add('message-content');
-
-        // Original content formatting logic (before error handling)
-        if (typeof content === 'string') {
-            let formattedContent = content.replace(/```([\s\S]*?)```/g, (match, code) => {
-                return `<pre><code>${escapeHtml(code.trim())}</code></pre>`;
-            });
-            formattedContent = formattedContent.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
-            formattedContent = formattedContent.replace(/\*(.*?)\*/g, '<em>$1</em>');
-            formattedContent = formattedContent.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
-            contentElement.innerHTML = formattedContent.split('\n').map(line => `<p>${line}</p>`).join('');
-        } else if (typeof content === 'object' && content !== null) {
-            if (sourceGraph === "graph2_execution") {
-                 let detailsHtml = "";
-                 if (content.node_name) detailsHtml += `<strong>Node:</strong> ${escapeHtml(content.node_name)}<br>`;
-                 if (content.input_preview) detailsHtml += `Input Preview: <pre>${escapeHtml(content.input_preview)}</pre>`;
-                 if (content.status_code) detailsHtml += `Status: <span class="status-code status-${String(content.status_code).charAt(0)}xx">${escapeHtml(content.status_code)}</span> `;
-                 if (content.execution_time) detailsHtml += `(Took: ${escapeHtml(content.execution_time)}s)<br>`;
-                 if (content.response_preview) detailsHtml += `Response Preview: <pre>${escapeHtml(content.response_preview)}</pre>`;
-                 if (content.raw_output_from_node && type === "tool_end") { 
-                    detailsHtml += `Raw Output (State Update): <pre>${escapeHtml(content.raw_output_from_node)}</pre>`;
-                 }
-                 if (content.error) detailsHtml += `<strong style="color: var(--error-color);">Error:</strong> <pre>${escapeHtml(content.error)}</pre>`;
-                 
-                 if (content.message && (type === "execution_completed" || type === "execution_failed" || type === "workflow_timeout" || type === "info" || type === "error" )) {
-                    detailsHtml += `<p>${escapeHtml(content.message)}</p>`;
-                 }
-                 if (content.final_state && (type === "execution_completed" || type === "execution_failed")) {
-                    detailsHtml += `Final State (details): <pre>${escapeHtml(content.final_state)}</pre>`;
-                 }
-                 contentElement.innerHTML = detailsHtml || `<pre>${escapeHtml(content)}</pre>`; 
-            } else if (content.message) { // For planner or other object messages with a 'message' field
-                contentElement.innerHTML = `<p>${escapeHtml(content.message)}</p>`;
-                 if (content.details) { 
-                    contentElement.innerHTML += `<pre>${escapeHtml(content.details)}</pre>`;
-                 }
-            } else { // Fallback for other objects
-                contentElement.innerHTML = `<pre>${escapeHtml(content)}</pre>`;
-            }
-        } else {
-             contentElement.innerHTML = `<p>${escapeHtml(String(content))}</p>`;
-        }
-        
-        // Apply error styling based on type and source
-        if (type === 'error' || (typeof content === 'object' && content && content.error)) {
-            if (sourceGraph === 'graph1_planning') { // Planner-specific error handling
-                let errorPrefix = `<strong style="color: var(--error-color); font-weight: bold;">Planner Alert:</strong> `;
-                let currentContent = contentElement.innerHTML; // Get already formatted content
-
-                if (typeof content === 'object' && content.error) {
-                    // If error is in a sub-field, ensure it's displayed prominently
-                    contentElement.innerHTML = errorPrefix + `<pre>${escapeHtml(content.error)}</pre>`;
-                     if (content.message && content.message !== content.error) { // Add original message if different
-                        contentElement.innerHTML += `<p><em>Original message: ${escapeHtml(content.message)}</em></p>`;
-                    }
-                } else { // Error message is the main content (already formatted)
-                     contentElement.innerHTML = errorPrefix + currentContent;
-                }
-                // No 'error-message' class for background, relies on planner-message style
-            } else {
-                // For other sources (system, workflow), apply the full error styling (red background)
-                messageElement.classList.add('error-message');
-            }
-        }
-        
-        messageElement.appendChild(senderElement);
-        messageElement.appendChild(contentElement);
-        chatMessagesDiv.appendChild(messageElement);
-        chatMessagesDiv.scrollTop = chatMessagesDiv.scrollHeight;
-    }
-
-    function connectWebSocket() {
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws/openapi_agent`;
-        
-        addMessageToChat('System', `Attempting to connect to ${wsUrl}...`, 'system', 'system');
-        ws = new WebSocket(wsUrl);
-
-        ws.onopen = () => {
-            addMessageToChat('System', 'Successfully connected to the agent.', 'system', 'system');
-            updateSendButtonState(false);
-            runWorkflowButton.disabled = true; 
-            updateGraphViewEmptyState(true); 
-        };
-
-        ws.onmessage = (event) => {
-            try {
-                const data = JSON.parse(event.data);
-                console.log("WS RX:", data); 
-                updateSendButtonState(false); 
-
-                let sender = 'Agent'; 
-                let messageContent = data.content;
-                let messageType = data.type; 
-                let sourceGraph = data.source || "unknown_source";
-
-                if (sourceGraph === 'graph1_planning') {
-                    sender = 'Planner'; // This will be used by addMessageToChat
-                    if (data.type === "graph_update") {
-                        currentGraphData = data.content;
-                        graphJsonViewPre.textContent = JSON.stringify(currentGraphData, null, 2);
-                        addMessageToChat('System', 'Execution graph has been updated.', 'system', 'system');
-                        updateGraphViewEmptyState(false); 
-                        if (graphDagViewContent.classList.contains('active')) {
-                            renderMermaidGraphUI(currentGraphData);
+        try {
+            const cy = cytoscape({
+                container: graphContainer,
+                elements: graphData.elements,
+                style: [
+                    {
+                        selector: 'node',
+                        style: {
+                            'background-color': (ele) => ele.data('type') === 'llm_call' ? '#FF69B4' : (ele.data('type') === 'api_call' ? '#1E90FF' : (ele.data('type') === 'user_input' ? '#FFD700' : (ele.data('type') === 'knowledge_base' ? '#32CD32' : '#666'))),
+                            'label': 'data(label)',
+                            'width': 'label',
+                            'height': 'label',
+                            'padding': '12px', // Increased padding
+                            'text-valign': 'center',
+                            'text-halign': 'center',
+                            'shape': 'round-rectangle', // More modern shape
+                            'font-size': '10px', // Smaller font for fitting more text
+                            'color': '#fff', // White text for better contrast on dark backgrounds
+                            'text-outline-width': 1, // Thin outline for text
+                            'text-outline-color': '#333', // Dark outline
+                            'border-width': 2,
+                            'border-color': '#4A5568' // Darker border
                         }
-                        runWorkflowButton.disabled = !currentGraphData; 
-                        return; 
+                    },
+                    {
+                        selector: 'edge',
+                        style: {
+                            'width': 2,
+                            'line-color': '#9CA3AF', // Softer edge color
+                            'target-arrow-color': '#9CA3AF',
+                            'target-arrow-shape': 'triangle',
+                            'curve-style': 'bezier', // Smoother curves
+                            'label': 'data(label)', // Edge labels if provided
+                            'font-size': '8px',
+                            'color': '#4A5568',
+                            'text-rotation': 'autorotate',
+                            'text-margin-y': -10
+                        }
+                    },
+                    { // Style for selected nodes
+                        selector: 'node:selected',
+                        style: {
+                            'border-width': 3,
+                            'border-color': '#F59E0B' // Amber color for selection
+                        }
                     }
-                    // For graph1, content can be {message: "..."} or a direct string if error
-                    messageContent = (typeof data.content === 'object' && data.content !== null && data.content.message) ? data.content.message : data.content;
-                     if (typeof data.content === 'object' && data.content !== null && data.content.error && !messageContent){
-                        messageContent = data.content.error; // If error is the primary content
-                    }
-
-                } else if (sourceGraph === 'graph2_execution') {
-                    // Sender name will be derived from type in addMessageToChat
-                    // messageContent is already data.content
-                    if (data.type === "execution_completed" || data.type === "execution_failed" || data.type === "workflow_timeout") {
-                        runWorkflowButton.disabled = !currentGraphData; 
-                    }
-                     if (data.type === "human_intervention_required") {
-                        showConfirmationModal(data.content.details_for_ui, data.graph2_thread_id);
-                        addMessageToChat(
-                            `Workflow (${data.content.node_name || 'N/A'})`, 
-                            `Paused. Requires confirmation for operation: ${data.content.details_for_ui.operationId}. Please use the modal.`,
-                            'human_intervention_required', 
-                            sourceGraph 
-                        );
-                        return; 
-                    }
-                } else if (sourceGraph === 'system' || sourceGraph === 'system_error' || sourceGraph === 'system_warning') {
-                    sender = 'System';
-                    messageContent = data.content.error || data.content.message || data.content;
+                ],
+                layout: {
+                    name: 'dagre', // Directed graph layout
+                    rankDir: 'TB', // Top-to-Bottom
+                    spacingFactor: 1.2,
+                    padding: 20
                 }
-                addMessageToChat(sender, messageContent, messageType, sourceGraph);
+            });
 
-            } catch (error) {
-                console.error("Error processing WebSocket message:", error, "Raw data:", event.data);
-                addMessageToChat('System', 'Error processing message from server. Check console.', 'error', 'system');
-                updateSendButtonState(false);
-            }
-        };
+            // Pan and zoom controls (optional, if you want to add cytoscape.js-panzoom)
+            // cy.panzoom({}); 
 
-        ws.onerror = (error) => {
-            console.error('WebSocket Error:', error);
-            addMessageToChat('System', 'WebSocket connection error. Check console.', 'error', 'system');
-            updateSendButtonState(false);
-            runWorkflowButton.disabled = true;
-        };
-
-        ws.onclose = (event) => {
-            addMessageToChat('System', `WebSocket disconnected. Code: ${event.code}. Attempting to reconnect in 5 seconds...`, 'system', 'system');
-            updateSendButtonState(false);
-            runWorkflowButton.disabled = true;
-            setTimeout(connectWebSocket, 5000);
-        };
-    }
-
-    window.sendMessage = () => {
-        const messageText = userInput.value.trim();
-        if (!messageText) return;
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-            addMessageToChat('System', 'Not connected. Please wait or try refreshing.', 'error', 'system');
-            return;
-        }
-        addMessageToChat('You', messageText, 'user', 'user_input'); 
-        ws.send(messageText);
-        userInput.value = '';
-        userInput.style.height = 'auto'; 
-        updateSendButtonState(true); 
-    };
-
-    window.runCurrentWorkflow = () => {
-        if (!currentGraphData) {
-            addMessageToChat('System', 'No workflow graph loaded to run.', 'error', 'system');
-            return;
-        }
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-            addMessageToChat('System', 'Not connected. Cannot run workflow.', 'error', 'system');
-            return;
-        }
-        const command = "run workflow"; 
-        addMessageToChat('You', command, 'user', 'user_input');
-        ws.send(command);
-        addMessageToChat('System', "Requesting to run the current workflow...", 'status', 'system');
-        updateSendButtonState(true); 
-        runWorkflowButton.disabled = true; 
-    };
-
-    function updateGraphViewEmptyState(isEmpty) {
-        const dagTabPane = graphDagViewContent; 
-        const jsonTabPane = graphJsonViewContent;
-
-        if (isEmpty) {
-            dagTabPane.classList.add('is-empty');
-            jsonTabPane.classList.add('is-empty');
-            graphJsonViewPre.textContent = "JSON representation of the graph will appear here once a plan is generated.";
-            renderMermaidGraphUI(null); 
-        } else {
-            dagTabPane.classList.remove('is-empty');
-            jsonTabPane.classList.remove('is-empty');
-        }
-    }
-
-
-    window.showGraphTab = (tabName) => {
-        graphJsonViewContent.style.display = 'none';
-        graphDagViewContent.style.display = 'none';
-        graphJsonViewContent.classList.remove('active');
-        graphDagViewContent.classList.remove('active');
-        jsonTabButton.classList.remove('active');
-        dagTabButton.classList.remove('active');
-
-        if (tabName === 'json') {
-            graphJsonViewContent.style.display = 'flex'; 
-            graphJsonViewContent.classList.add('active');
-            jsonTabButton.classList.add('active');
-        } else if (tabName === 'dag') {
-            graphDagViewContent.style.display = 'flex'; 
-            graphDagViewContent.classList.add('active');
-            dagTabButton.classList.add('active');
-            renderMermaidGraphUI(currentGraphData); 
-        }
-        updateGraphViewEmptyState(!currentGraphData);
-    };
-
-    function generateMermaidDefinition(graph) {
-        const emptyFill = '#fcfcfc'; 
-        const emptyStroke = '#e0e0e0'; 
-        const emptyColor = '#7f8c8d'; 
-
-        const defaultNodeFill = '#ECEFF1'; 
-        const defaultNodeStroke = '#90A4AE'; 
-        const defaultNodeTextColor = '#37474F'; 
-        
-        const startEndFill = '#546E7A';
-        const startEndStroke = '#37474F';
-        const apiNodeFill = '#007AFF'; 
-        const apiNodeStroke = '#0056b3'; 
-        const confirmedNodeFill = '#28a745'; 
-        const confirmedNodeStroke = '#1E8E3E';
-        const skippedNodeFill = '#ffc107'; 
-        const skippedNodeStroke = '#F57F17';
-        const skippedNodeTextColor = '#212121';
-        const errorNodeFill = '#dc3545'; 
-        const errorNodeStroke = '#B71C1C';
-        const interruptNodeFill = '#17a2b8'; 
-        const interruptNodeStroke = '#0D8A9F';
-
-        if (!graph || !graph.nodes || !graph.edges) {
-            return `graph TD\n    empty[<i class='fas fa-drafting-compass icon-placeholder'></i><br/>No Workflow Graph Available<br/><small>Please provide an OpenAPI specification and define a goal to generate a visual workflow.</small>];\n    classDef empty fill:${emptyFill},stroke:${emptyStroke},color:${emptyColor},padding:30px,font-style:italic,text-align:center,rx:12px,ry:12px,font-size:14px,border-width:1px,border-style:dashed;`;
-        }
-        
-        let def = "graph TD;\n";
-        def += `    classDef default fill:${defaultNodeFill},stroke:${defaultNodeStroke},stroke-width:1.5px,color:${defaultNodeTextColor},rx:6px,ry:6px,padding:10px 15px,font-size:13px,font-family:'Inter';\n`; 
-        def += `    classDef startEnd fill:${startEndFill},stroke:${startEndStroke},color:white,font-weight:bold;\n`;
-        def += `    classDef apiNode fill:${apiNodeFill},stroke:${apiNodeStroke},color:white;\n`;
-        def += `    classDef confirmedNode fill:${confirmedNodeFill},stroke:${confirmedNodeStroke},color:white;\n`; 
-        def += `    classDef skippedNode fill:${skippedNodeFill},stroke:${skippedNodeStroke},color:${skippedNodeTextColor};\n`;
-        def += `    classDef errorNode fill:${errorNodeFill},stroke:${errorNodeStroke},color:white;\n`; 
-        def += `    classDef interruptNode fill:${interruptNodeFill},stroke:${interruptNodeStroke},color:white;\n`; 
-
-        const sanitizeId = (id) => String(id).replace(/[^a-zA-Z0-9_]/g, '_');
-
-        graph.nodes.forEach(node => {
-            const id = sanitizeId(node.effective_id || node.operationId);
-            let labelText = node.summary || node.operationId;
-            if (node.summary && node.summary !== node.operationId && node.operationId !== "START_NODE" && node.operationId !== "END_NODE") {
-                labelText = `${escapeHtml(node.summary)}<br/><small>(${escapeHtml(node.operationId)} / ${escapeHtml(node.effective_id)})</small>`;
-            } else {
-                labelText = `<b>${escapeHtml(node.operationId)}</b><br/><small>(${escapeHtml(node.effective_id)})</small>`;
-            }
-            
-            def += `    ${id}("${labelText.replace(/"/g, '#quot;')}");\n`; 
-             
-            let nodeClass = 'apiNode'; 
-            if (node.operationId === "START_NODE" || node.operationId === "END_NODE") {
-                nodeClass = 'startEnd';
-            } else if (node.requires_confirmation) { 
-                 nodeClass = 'interruptNode';
-            }
-            def += `    class ${id} ${nodeClass};\n`; 
-        });
-
-        graph.edges.forEach(edge => {
-            const from = sanitizeId(edge.from_node);
-            const to = sanitizeId(edge.to_node);
-            const label = edge.description ? `|"${escapeHtml(edge.description.substring(0, 50)).replace(/"/g, '#quot;')}"|` : "";
-            def += `    ${from} -->${label} ${to};\n`;
-        });
-        return def;
-    }
-
-    async function renderMermaidGraphUI(graphData) {
-        if (typeof mermaid === 'undefined') {
-            mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder error'><i class='fas fa-exclamation-triangle'></i><p>Mermaid.js library not loaded.</p><p>Cannot render graph visualization.</p></div>";
-            return;
-        }
-        
-        const definition = generateMermaidDefinition(graphData);
-
-        if (!graphData) {
-            try {
-                mermaidDagContainer.classList.add('rendering-placeholder');
-                const { svg } = await mermaid.render('mermaidGeneratedSvgPlaceholder', definition);
-                mermaidDagContainer.innerHTML = svg;
-                mermaidDagContainer.classList.remove('rendering-placeholder');
-                const placeholderSvg = mermaidDagContainer.querySelector('svg');
-                if(placeholderSvg) {
-                    placeholderSvg.style.maxWidth = '350px'; 
-                    placeholderSvg.style.maxHeight = '250px';
-                    placeholderSvg.style.margin = 'auto'; 
+            // Tooltip for nodes
+            cy.nodes().forEach(node => {
+                let content = `<strong>ID:</strong> ${node.id()}<br/><strong>Type:</strong> ${node.data('type') || 'N/A'}`;
+                if (node.data('description')) {
+                    content += `<br/><strong>Desc:</strong> ${escapeHtml(node.data('description'))}`;
                 }
-            } catch (error) {
-                 console.error("Mermaid rendering error for placeholder:", error, "\nDefinition:", definition);
-                 mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder error'><i class='fas fa-exclamation-triangle'></i><p>Error rendering placeholder.</p><p>Check console for details.</p></div>";
-            }
-            return;
-        }
+                if(node.data('status')) {
+                    content += `<br/><strong>Status:</strong> ${node.data('status')}`;
+                }
+                // Create a tippy instance for each node
+                // Ensure Tippy.js is loaded for this to work
+                if (typeof tippy === 'function') {
+                    tippy(node.popperRef(), {
+                        content: content,
+                        trigger: 'manual', // We'll show/hide manually or on hover
+                        allowHTML: true,
+                        placement: 'top',
+                        arrow: true,
+                        interactive: true, // Allows clicking links in tooltip
+                        theme: 'light-border', // Or your custom theme
+                        onShow(instance) {
+                            // You can add custom logic when tooltip shows
+                        },
+                    }).show(); // Show by default, or use mouseover/mouseout
+                    
+                    // Example: Show on mouseover, hide on mouseout
+                    let tip = node.scratch().tippy; // Get the tippy instance if stored
+                    if (!tip && typeof tippy === 'function') {
+                         tip = tippy(node.popperRef(), { /* ... options ... */ });
+                         node.scratch().tippy = tip; // Store it
+                    }
+                    
+                    node.on('mouseover', (event) => event.target.scratch().tippy && event.target.scratch().tippy.show());
+                    node.on('mouseout', (event) => event.target.scratch().tippy && event.target.scratch().tippy.hide());
+                    node.on('tap', function(event) {
+                        // Handle node click, e.g., show details in a side panel
+                        console.log('Clicked node:', event.target.data());
+                        addMessageToChat('status', `Node clicked: ${event.target.data('label') || event.target.id()}`);
+                        // You could also send this node's data to the backend for more actions
+                        // sendWebSocketMessage('node_interaction', { node_id: event.target.id(), node_data: event.target.data() });
+                    });
 
-        mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder loading'><i class='fas fa-spinner fa-spin'></i><p>Rendering graph...</p></div>"; 
-        try {
-            if (graphDagViewContent.offsetParent === null) { 
-                console.warn("Mermaid container is hidden, rendering might be suboptimal. Ensure tab is active.");
-            }
-            const { svg } = await mermaid.render('mermaidGeneratedSvg', definition);
-            mermaidDagContainer.innerHTML = svg;
-            const svgElement = mermaidDagContainer.querySelector('svg');
-            if (svgElement) {
-                svgElement.style.cursor = 'grab';
-            }
+                } else {
+                    console.warn("Tippy.js not loaded, tooltips will not be available for graph nodes.");
+                }
+            });
+             // Fit graph to view with padding
+            cy.fit(null, 30); // 30px padding
 
-        } catch (error) {
-            console.error("Mermaid rendering error:", error, "\nDefinition:", definition);
-            mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder error'><i class='fas fa-exclamation-triangle'></i><p>Error rendering DAG.</p><p>Check console for details.</p></div>";
-        }
-    }
-    
-    window.hideConfirmationModal = () => { 
-        confirmationModal.style.display = 'none';
-        currentConfirmationContext.graph2ThreadId = null;
-        currentConfirmationContext.confirmationKey = null;
-        currentConfirmationContext.operationId = null;
-        currentConfirmationContext.effectiveNodeId = null;
-        modalPayload.value = ''; 
-    };
-
-    function showConfirmationModal(details, graph2ThreadId) { 
-        if (!details) {
-            console.error("No details provided for confirmation modal.");
-            addMessageToChat('System', 'Error: Missing details for confirmation modal.', 'error', 'system');
-            return;
-        }
-        
-        currentConfirmationContext.graph2ThreadId = graph2ThreadId;
-        currentConfirmationContext.confirmationKey = details.confirmation_key;
-        currentConfirmationContext.operationId = details.operationId;
-        currentConfirmationContext.effectiveNodeId = details.effective_node_id;
-
-        modalTitle.textContent = details.prompt || `Confirm API Call: ${details.operationId}`;
-        modalOperationId.textContent = details.operationId || 'N/A';
-        modalEffectiveNodeId.textContent = details.effective_node_id || 'N/A';
-        modalMethod.textContent = details.method || 'N/A';
-        modalPath.textContent = details.path || 'N/A'; 
-        modalGraph2ThreadId.textContent = graph2ThreadId || 'N/A';
-
-        let payloadToDisplay = "";
-        if (details.payload_to_confirm !== undefined && details.payload_to_confirm !== null) {
-            try {
-                payloadToDisplay = JSON.stringify(details.payload_to_confirm, null, 2);
-            } catch (e) {
-                payloadToDisplay = "Error: Could not format payload.";
-                console.error("Error stringifying payload_to_confirm:", details.payload_to_confirm, e);
-            }
-        }
-        modalPayload.value = payloadToDisplay;
-        confirmationModal.style.display = 'flex';
-    }
-
-    modalConfirmButton.onclick = () => {
-        if (!currentConfirmationContext.graph2ThreadId || !currentConfirmationContext.confirmationKey) {
-            addMessageToChat('System', 'Error: Missing context for confirmation. Cannot send resume command.', 'error', 'system');
-            hideConfirmationModal();
-            return;
-        }
-        let parsedPayload;
-        try {
-            parsedPayload = modalPayload.value.trim() === "" ? {} : JSON.parse(modalPayload.value);
         } catch (e) {
-            alert('Invalid JSON in payload textarea: ' + e.message);
-            return;
+            console.error("Error rendering graph:", e);
+            addMessageToChat('error', "Failed to render workflow graph.");
+            if (graphContainer) graphContainer.innerHTML = '<p class="text-red-500">Error rendering graph. Check console.</p>';
         }
-        const resumeData = {
-            confirmation_key: currentConfirmationContext.confirmationKey,
-            decision: true,
-            modified_payload: parsedPayload,
-            operationId: currentConfirmationContext.operationId, 
-            effectiveNodeId: currentConfirmationContext.effectiveNodeId
-        };
-        const wsMessage = `resume_exec ${currentConfirmationContext.graph2ThreadId} ${JSON.stringify(resumeData)}`;
-        addMessageToChat(`You (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Confirming: ${currentConfirmationContext.operationId || 'action'}`, 'user', 'user_input');
-        ws.send(wsMessage);
-        addMessageToChat(`System (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Confirmation sent for ${currentConfirmationContext.effectiveNodeId}. Resuming...`, 'status', 'system');
-        hideConfirmationModal();
-        updateSendButtonState(true); 
-    };
-
-    modalCancelButton.onclick = () => {
-        if (!currentConfirmationContext.graph2ThreadId || !currentConfirmationContext.confirmationKey) {
-            addMessageToChat('System', 'Error: Missing context for cancellation.', 'error', 'system');
-            hideConfirmationModal();
-            return;
-        }
-        const resumeData = {
-            confirmation_key: currentConfirmationContext.confirmationKey,
-            decision: false, 
-            operationId: currentConfirmationContext.operationId,
-            effectiveNodeId: currentConfirmationContext.effectiveNodeId
-        };
-        const wsMessage = `resume_exec ${currentConfirmationContext.graph2ThreadId} ${JSON.stringify(resumeData)}`;
-        addMessageToChat(`You (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Cancelling confirmation for: ${currentConfirmationContext.operationId || 'action'}.`, 'user', 'user_input');
-        ws.send(wsMessage);
-        addMessageToChat(`System (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Cancellation sent for ${currentConfirmationContext.effectiveNodeId}.`, 'status', 'system');
-        hideConfirmationModal();
-    };
-
-    userInput.addEventListener('input', () => { 
-        userInput.style.height = 'auto';
-        userInput.style.height = (userInput.scrollHeight) + 'px';
-    });
-    userInput.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            sendMessage();
-        }
-    });
+    }
     
-    showGraphTab('dag'); 
-    connectWebSocket(); 
+    // Initial connection
+    connectWebSocket();
 });
