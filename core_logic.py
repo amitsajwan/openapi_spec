@@ -15,6 +15,11 @@ from utils import (
 from pydantic import ValidationError
 from api_executor import APIExecutor
 
+# Import for dereferencing
+from openapi_spec_validator import validate_spec_url, openapi_v3_spec_validator
+from openapi_spec_validator.readers import read_from_filename, read_from_url, read_from_stdin
+from openapi_spec_validator.exceptions import OpenAPIValidationError
+
 logger = logging.getLogger(__name__)
 
 # --- Configurable Limits ---
@@ -37,64 +42,135 @@ class OpenAPICoreLogic:
         logger.info("OpenAPICoreLogic initialized with worker_llm and api_executor.")
 
     def parse_openapi_spec(self, state: BotState) -> BotState:
-        # (This method remains the same as in core_logic_py_v3_extraction_fix)
         tool_name = "parse_openapi_spec"
-        state.response = "Parsing OpenAPI specification..."
-        state.update_scratchpad_reason(tool_name, "Attempting to parse OpenAPI spec.")
+        state.response = "Parsing and dereferencing OpenAPI specification..." # Updated message
+        state.update_scratchpad_reason(tool_name, "Attempting to parse and dereference OpenAPI spec.")
         spec_text = state.openapi_spec_string
+        
         if not spec_text:
             state.response = "No OpenAPI specification text provided."
             state.update_scratchpad_reason(tool_name, "No spec text in state.")
             state.next_step = "responder"
             state.openapi_spec_string = None 
             return state
+
+        # Cache key is based on the raw spec text
         cache_key = get_cache_key(spec_text)
-        cached_schema_artifacts = load_cached_schema(f"{cache_key}_full_analysis")
+        
+        # Try to load fully analyzed (including dereferenced schema) data from cache
+        # The key for fully analyzed data now implies it's dereferenced.
+        cached_full_analysis_key = f"{cache_key}_full_analysis_dereferenced"
+        cached_schema_artifacts = load_cached_schema(cached_full_analysis_key)
+
         if cached_schema_artifacts and isinstance(cached_schema_artifacts, dict):
             try:
-                state.openapi_schema = cached_schema_artifacts.get('openapi_schema')
+                # Rehydrate state from cached fully analyzed (and dereferenced) data
+                state.openapi_schema = cached_schema_artifacts.get('openapi_schema') # This is the dereferenced schema
                 state.schema_summary = cached_schema_artifacts.get('schema_summary')
                 state.identified_apis = cached_schema_artifacts.get('identified_apis', [])
                 state.payload_descriptions = cached_schema_artifacts.get('payload_descriptions', {})
                 graph_dict = cached_schema_artifacts.get('execution_graph')
                 if graph_dict:
                     state.execution_graph = GraphOutput.model_validate(graph_dict) if isinstance(graph_dict, dict) else graph_dict
-                state.schema_cache_key = cache_key 
-                state.openapi_spec_text = spec_text 
-                state.openapi_spec_string = None 
-                logger.info(f"Loaded full analysis from cache for key: {cache_key}")
-                state.response = "OpenAPI specification and derived analysis loaded from cache."
+                
+                state.schema_cache_key = cache_key # Original cache key for the raw spec
+                state.openapi_spec_text = spec_text # Store original raw spec text
+                state.openapi_spec_string = None # Clear the temporary storage
+
+                logger.info(f"Loaded fully analyzed and dereferenced OpenAPI data from cache: {cached_full_analysis_key}")
+                state.response = "OpenAPI specification and derived analysis (dereferenced) loaded from cache."
                 if state.execution_graph and isinstance(state.execution_graph, GraphOutput):
                      state.scratchpad['graph_to_send'] = state.execution_graph.model_dump_json(indent=2)
                 state.next_step = "responder" 
                 return state
             except Exception as e:
-                logger.warning(f"Error rehydrating state from cached full analysis: {e}. Proceeding with parsing.")
+                logger.warning(f"Error rehydrating state from cached full analysis (key: {cached_full_analysis_key}): {e}. Proceeding with fresh parsing and dereferencing.")
+                # Reset potentially partially loaded state fields
                 state.openapi_schema = None; state.schema_summary = None; state.identified_apis = []; state.payload_descriptions = {}; state.execution_graph = None
-        cached_schema = load_cached_schema(cache_key)
-        if cached_schema:
-            logger.info(f"Loaded schema (only) from cache for key: {cache_key}")
-            state.openapi_schema = cached_schema; state.schema_cache_key = cache_key; state.openapi_spec_text = spec_text; state.openapi_spec_string = None
-            state.response = "OpenAPI specification (schema only) loaded from cache. Starting analysis pipeline..."
-            state.next_step = "process_schema_pipeline" 
-            return state
-        parsed_schema = None; error_message = None
-        try: parsed_schema = json.loads(spec_text)
+
+        # If full analysis not in cache, proceed with parsing and dereferencing
+        parsed_spec_dict: Optional[Dict[str, Any]] = None
+        error_message: Optional[str] = None
+
+        try:
+            # Attempt to parse JSON first
+            parsed_spec_dict = json.loads(spec_text)
         except json.JSONDecodeError:
-            try: parsed_schema = yaml.safe_load(spec_text)
-            except yaml.YAMLError as yaml_e: error_message = f"YAML parsing failed: {yaml_e}"
-            except Exception as e_yaml:  error_message = f"Unexpected error during YAML parsing: {e_yaml}"
-        except Exception as e_json: error_message = f"Unexpected error during JSON parsing: {e_json}"
-        if parsed_schema and isinstance(parsed_schema, dict) and ('openapi' in parsed_schema or 'swagger' in parsed_schema) and 'info' in parsed_schema:
-            state.openapi_schema = parsed_schema; state.schema_cache_key = cache_key; state.openapi_spec_text = spec_text; state.openapi_spec_string = None
-            if SCHEMA_CACHE: save_schema_to_cache(cache_key, parsed_schema) 
-            else: logger.warning("SCHEMA_CACHE is None, schema not saved to disk cache.")
-            logger.info("Successfully parsed OpenAPI spec."); state.response = "OpenAPI specification parsed. Starting analysis pipeline..."; state.next_step = "process_schema_pipeline"
-        else:
-            state.openapi_schema = None; state.openapi_spec_string = None 
-            final_error = error_message or "Parsed content is not a valid OpenAPI/Swagger spec (missing 'openapi'/'swagger' and 'info' fields, or not a dictionary)."
-            state.response = f"Failed to parse specification: {final_error}"; logger.error(f"Parsing failed: {final_error}. Input snippet: {spec_text[:200]}..."); state.next_step = "responder"
-        state.update_scratchpad_reason(tool_name, f"Parsing status: {'Success' if state.openapi_schema else 'Failed'}. Response: {state.response}")
+            try:
+                # Attempt to parse YAML if JSON fails
+                parsed_spec_dict = yaml.safe_load(spec_text)
+            except yaml.YAMLError as yaml_e:
+                error_message = f"YAML parsing failed: {yaml_e}"
+            except Exception as e_yaml_other:
+                 error_message = f"Unexpected error during YAML parsing: {e_yaml_other}"
+        except Exception as e_json_other:
+            error_message = f"Unexpected error during JSON parsing: {e_json_other}"
+
+        if error_message:
+            state.openapi_schema = None
+            state.openapi_spec_string = None 
+            state.response = f"Failed to parse specification: {error_message}"
+            logger.error(f"Parsing failed: {error_message}. Input snippet: {spec_text[:200]}...")
+            state.next_step = "responder"
+            state.update_scratchpad_reason(tool_name, f"Parsing failed. Response: {state.response}")
+            return state
+
+        if not parsed_spec_dict or not isinstance(parsed_spec_dict, dict):
+            state.openapi_schema = None
+            state.openapi_spec_string = None
+            state.response = "Parsed content is not a valid dictionary structure."
+            logger.error(f"Parsed content is not a dictionary. Type: {type(parsed_spec_dict)}. Input snippet: {spec_text[:200]}...")
+            state.next_step = "responder"
+            state.update_scratchpad_reason(tool_name, "Parsed content not a dict.")
+            return state
+
+        # At this point, parsed_spec_dict is a Python dictionary from JSON or YAML
+        # Now, validate and dereference it
+        try:
+            # openapi-spec-validator's validate_spec_url can take a spec_dict directly
+            # It will perform validation and dereferencing.
+            # The result of `validate_spec_url` when given `spec_dict` is the dereferenced spec.
+            # We pass a dummy URL as it's required, but content comes from spec_dict.
+            dereferenced_schema = openapi_v3_spec_validator.validate(parsed_spec_dict) # For v3
+            # For v2 (Swagger), you might need a different validator or handle it:
+            # if 'swagger' in parsed_spec_dict:
+            #     from openapi_spec_validator import openapi_v2_spec_validator
+            #     dereferenced_schema = openapi_v2_spec_validator.validate(parsed_spec_dict)
+
+
+            state.openapi_schema = dereferenced_schema # Store the DEREFERENCED schema
+            state.schema_cache_key = cache_key # Still use original text for base cache key
+            state.openapi_spec_text = spec_text # Store original raw spec text
+            state.openapi_spec_string = None # Clear the temporary storage
+
+            # Note: The caching for the raw parsed_spec_dict (non-dereferenced) is removed
+            # as we now prioritize caching the full_analysis_dereferenced.
+            # If you still want to cache the raw parsed (but not dereferenced) schema,
+            # you could do so here, but it might be less useful.
+
+            logger.info("Successfully parsed, validated, and dereferenced OpenAPI spec.")
+            state.response = "OpenAPI specification parsed and dereferenced. Starting analysis pipeline..."
+            state.next_step = "process_schema_pipeline"
+
+        except OpenAPIValidationError as val_e:
+            state.openapi_schema = None # Ensure schema is None on validation error
+            state.openapi_spec_string = None
+            error_detail = str(val_e)
+            # Try to get more specific error context if available
+            if hasattr(val_e, 'instance') and hasattr(val_e, 'schema_path'):
+                error_detail = f"Validation error at path '{list(val_e.schema_path)}' for instance segment '{str(val_e.instance)[:100]}...': {val_e.message}"
+            
+            state.response = f"OpenAPI specification is invalid: {error_detail[:500]}" # Limit error length
+            logger.error(f"OpenAPI Validation/Dereferencing failed: {error_detail}", exc_info=True)
+            state.next_step = "responder"
+        except Exception as e_deref:
+            state.openapi_schema = None
+            state.openapi_spec_string = None
+            state.response = f"Error during OpenAPI validation/dereferencing: {str(e_deref)[:200]}"
+            logger.error(f"Unexpected error during validation/dereferencing: {e_deref}", exc_info=True)
+            state.next_step = "responder"
+        
+        state.update_scratchpad_reason(tool_name, f"Parsing & Dereferencing status: {'Success' if state.openapi_schema else 'Failed'}. Response: {state.response}")
         return state
 
     def _generate_llm_schema_summary(self, state: BotState):
@@ -111,7 +187,7 @@ class OpenAPICoreLogic:
         state.update_scratchpad_reason(tool_name, f"Summary status: {'Success' if state.schema_summary and not state.schema_summary.startswith('Error') else 'Failed'}")
 
     def _identify_apis_from_schema(self, state: BotState):
-        # (This method remains the same)
+        # (This method remains the same, as it operates on the parsed schema which is now dereferenced)
         tool_name = "_identify_apis_from_schema"; state.response = "Identifying API operations..."; state.update_scratchpad_reason(tool_name, "Identifying APIs.")
         if not state.openapi_schema: state.identified_apis = []; logger.warning("No schema to identify APIs from."); state.response = "Cannot identify APIs: No schema loaded."; return
         apis = []; paths = state.openapi_schema.get('paths', {})
@@ -125,8 +201,7 @@ class OpenAPICoreLogic:
         state.identified_apis = apis; logger.info(f"Identified {len(apis)} API operations."); state.response = f"Identified {len(apis)} API operations."; state.update_scratchpad_reason(tool_name, f"Identified {len(apis)} APIs.")
 
     def _generate_payload_descriptions(self, state: BotState, target_apis: Optional[List[str]] = None, context_override: Optional[str] = None):
-        # (This method's prompt already emphasizes realistic values, so it's largely okay.
-        # The main focus for payload accuracy is _generate_execution_graph's node.payload)
+        # (This method benefits significantly from a dereferenced schema as requestBody and response schemas will be fully resolved)
         tool_name = "_generate_payload_descriptions"; state.response = "Creating payload and response examples..."; state.update_scratchpad_reason(tool_name, f"Generating payload descriptions. Targets: {target_apis or 'subset'}. Context: {bool(context_override)}")
         if not state.identified_apis: logger.warning("No APIs identified, cannot generate payload descriptions."); state.response = "Cannot create payload examples: No APIs identified."; return
         payload_descs = state.payload_descriptions or {} 
@@ -144,27 +219,39 @@ class OpenAPICoreLogic:
             for p_idx, p_detail in enumerate(api_op.get('parameters', [])):
                 if p_idx >= 5: params_summary_list.append("..."); break
                 param_name = p_detail.get('name', 'N/A'); param_in = p_detail.get('in', 'N/A'); param_type = "N/A"
+                # Schema for parameters should now be dereferenced if it was a $ref
                 if 'schema' in p_detail and isinstance(p_detail['schema'], dict): param_type = p_detail['schema'].get('type', 'object'); 
                 if param_type == 'array' and 'items' in p_detail['schema'] and isinstance(p_detail['schema']['items'], dict): param_type = f"array of {p_detail['schema']['items'].get('type', 'object')}"
                 params_summary_list.append(f"{param_name}({param_in}, type: {param_type})")
             params_summary_str = ", ".join(params_summary_list) if params_summary_list else "None"
+            
             request_body_schema_str = "N/A"
-            if api_op.get('requestBody') and isinstance(api_op['requestBody'], dict): content = api_op['requestBody'].get('content', {}); json_content = content.get('application/json', {}); schema = json_content.get('schema', {}); 
-            if schema: request_body_schema_str = json.dumps(schema, indent=2)[:500] + "..." 
+            # requestBody schema will be dereferenced
+            if api_op.get('requestBody') and isinstance(api_op['requestBody'], dict): 
+                content = api_op['requestBody'].get('content', {}); 
+                json_content = content.get('application/json', {}); 
+                schema = json_content.get('schema', {}); 
+                if schema: request_body_schema_str = json.dumps(schema, indent=2)[:500] + "..." # Show more if dereferenced
+            
             success_response_schema_str = "N/A"; responses = api_op.get('responses', {})
+            # Response schemas will also be dereferenced
             for status_code, resp_details in responses.items():
-                if status_code.startswith('2') and isinstance(resp_details, dict): content = resp_details.get('content', {}); json_content = content.get('application/json', {}); schema = json_content.get('schema', {}); 
-                if schema: success_response_schema_str = json.dumps(schema, indent=2)[:300] + "..."; break 
+                if status_code.startswith('2') and isinstance(resp_details, dict): 
+                    content = resp_details.get('content', {}); 
+                    json_content = content.get('application/json', {}); 
+                    schema = json_content.get('schema', {}); 
+                    if schema: success_response_schema_str = json.dumps(schema, indent=2)[:300] + "..."; break 
+            
             context_str = f" User Context: {context_override}." if context_override else ""
             prompt = (
                 f"API Operation: {op_id} ({api_op['method']} {api_op['path']})\n"
                 f"Summary: {api_op.get('summary', 'N/A')}\n{context_str}\n"
                 f"Parameters: {params_summary_str}\n"
-                f"Request Body Schema (if application/json): {request_body_schema_str}\n"
-                f"Successful (2xx) Response Schema (sample, if application/json): {success_response_schema_str}\n\n"
+                f"Request Body Schema (if application/json, now fully resolved):\n```json\n{request_body_schema_str}\n```\n"
+                f"Successful (2xx) Response Schema (sample, if application/json, now fully resolved):\n```json\n{success_response_schema_str}\n```\n\n"
                 f"Task: Provide a concise, typical, and REALISTIC JSON example for the request payload (if applicable for this method and API design). "
-                f"Use plausible, real-world example values based on the parameter names, types, and API summary. For example, if a field is 'email', use 'user@example.com'. If 'count', use a number like 5. "
-                f"Also, provide a brief description of the expected JSON response structure for a successful call. "
+                f"Use plausible, real-world example values based on the parameter names, types, and the fully resolved API schema. For example, if a field is 'email', use 'user@example.com'. If 'count', use a number like 5. "
+                f"Also, provide a brief description of the expected JSON response structure for a successful call, based on the resolved schema. "
                 f"Focus on key fields. If no request payload is typically needed (e.g., for GET with only path/query params), state 'No request payload needed.' clearly. "
                 f"Format clearly:\n"
                 f"Request Payload Example:\n```json\n{{\"key\": \"realistic_value\", \"another_key\": 123}}\n```\n"
@@ -185,6 +272,7 @@ class OpenAPICoreLogic:
         state.update_scratchpad_reason(tool_name, f"Payload descriptions updated for {processed_count} of {len(apis_to_process)} targeted APIs.")
 
     def _generate_execution_graph(self, state: BotState, goal: Optional[str] = None) -> BotState:
+        # (This method also benefits as the API summaries passed to LLM will be based on dereferenced schemas)
         tool_name = "_generate_execution_graph"
         current_goal = goal or state.plan_generation_goal or "General API workflow overview"
         state.response = f"Building API workflow graph for goal: '{current_goal[:70]}...'"
@@ -210,23 +298,22 @@ class OpenAPICoreLogic:
             params_str_parts = []
             if api.get('parameters'):
                 for p_idx, p_detail in enumerate(api['parameters']):
-                    if p_idx >= 3: params_str_parts.append("..."); break # Show more param details
+                    if p_idx >= 3: params_str_parts.append("..."); break 
                     param_name = p_detail.get('name', 'N/A')
                     param_in = p_detail.get('in', 'N/A')
-                    param_schema = p_detail.get('schema', {})
+                    param_schema = p_detail.get('schema', {}) # Schema is now dereferenced
                     param_type = param_schema.get('type', 'unknown') if isinstance(param_schema, dict) else 'unknown'
                     params_str_parts.append(f"{param_name}({param_in}, {param_type})")
             params_str = f"Params: {', '.join(params_str_parts)}" if params_str_parts else "No explicit params listed."
             
-            # Add requestBody schema info if available
             req_body_info = ""
+            # requestBody schema is now dereferenced
             if api.get('requestBody') and isinstance(api['requestBody'], dict):
                 content = api['requestBody'].get('content', {})
                 json_schema = content.get('application/json', {}).get('schema', {})
                 if json_schema and isinstance(json_schema, dict) and json_schema.get('properties'):
-                    props = list(json_schema.get('properties', {}).keys())[:3] # First 3 property names
-                    req_body_info = f" ReqBody fields (sample): {', '.join(props)}{'...' if len(json_schema.get('properties', {})) > 3 else ''}."
-
+                    props = list(json_schema.get('properties', {}).keys())[:3] 
+                    req_body_info = f" ReqBody fields (sample from resolved schema): {', '.join(props)}{'...' if len(json_schema.get('properties', {})) > 3 else ''}."
 
             api_summaries_for_prompt.append(
                 f"- operationId: {api['operationId']} ({api['method']} {api['path']}), "
@@ -238,7 +325,7 @@ class OpenAPICoreLogic:
         
         prompt = f"""
         Goal: "{current_goal}". {feedback_str}
-        Available API Operations (summary with parameters and sample request body fields):\n{apis_str}
+        Available API Operations (summary with parameters and sample request body fields from resolved schemas):\n{apis_str}
 
         Design a logical and runnable API execution graph as a JSON object. The graph must achieve the specified Goal.
         Consider typical API workflow patterns. For example:
@@ -251,8 +338,8 @@ class OpenAPICoreLogic:
         Node: {{ ... "payload": {{ "template_key": "realistic_example_value or {{{{placeholder_from_output_mapping}}}}" }} ... }} 
         (See previous prompts for full Node, Edge, GraphOutput model details if needed)
 
-        CRITICAL INSTRUCTIONS FOR `payload` FIELD in Nodes (for POST, PUT, PATCH):
-        1.  **Accuracy is Key:** The `payload` dictionary MUST ONLY contain fields that are actually defined by the specific API's request body schema (as hinted in 'ReqBody fields (sample)' in the API summary above or from your knowledge of the API if not fully summarized).
+        CRITICAL INSTRUCTIONS FOR `payload` FIELD in Nodes (for POST, PUT, PATCH), using the RESOLVED schema information provided:
+        1.  **Accuracy is Key:** The `payload` dictionary MUST ONLY contain fields that are actually defined by the specific API's request body schema (as hinted in 'ReqBody fields (sample from resolved schema)' or from your knowledge of the fully resolved API).
         2.  **Do Not Invent Fields:** Do NOT include any fields in the `payload` that are not part of the API's expected request body.
         3.  **Realistic Values:** Use realistic example values for fields (e.g., for "name": "Example Product", for "email": "test@example.com").
         4.  **Placeholders for Dynamic Data:** If a field's value should come from a previous step's output (via `OutputMapping`), use a placeholder like `{{{{key_from_output_mapping}}}}`. Ensure this placeholder matches a `target_data_key` from an `OutputMapping` of a preceding node.
@@ -325,23 +412,64 @@ class OpenAPICoreLogic:
 
     def process_schema_pipeline(self, state: BotState) -> BotState:
         tool_name = "process_schema_pipeline"; state.response = "Starting API analysis pipeline..."; state.update_scratchpad_reason(tool_name, "Starting schema pipeline.")
-        if not state.openapi_schema: state.response = "Cannot run pipeline: No schema loaded."; state.next_step = "handle_unknown"; return state
-        state.schema_summary = None; state.identified_apis = []; state.payload_descriptions = {}; state.execution_graph = None; state.graph_refinement_iterations = 0; state.plan_generation_goal = state.plan_generation_goal or "Provide a general overview workflow."; state.scratchpad['graph_gen_attempts'] = 0; state.scratchpad['refinement_validation_failures'] = 0 
+        if not state.openapi_schema: # This is now the dereferenced schema
+            state.response = "Cannot run pipeline: No valid (or dereferenced) schema loaded."
+            state.next_step = "handle_unknown"
+            return state
+        
+        # Reset relevant fields for a new pipeline run
+        state.schema_summary = None
+        state.identified_apis = []
+        state.payload_descriptions = {}
+        state.execution_graph = None
+        state.graph_refinement_iterations = 0
+        state.plan_generation_goal = state.plan_generation_goal or "Provide a general overview workflow."
+        state.scratchpad['graph_gen_attempts'] = 0
+        state.scratchpad['refinement_validation_failures'] = 0 
+        
         self._generate_llm_schema_summary(state)
-        if state.schema_summary and ("Error generating summary: 429" in state.schema_summary or "quota" in state.schema_summary.lower()): logger.warning("API limit hit during schema summary. Stopping pipeline."); state.response = state.schema_summary; state.next_step = "responder"; return state
-        self._identify_apis_from_schema(state)
-        if not state.identified_apis: state.response = (state.response or "") + " No API operations were identified from the schema. Cannot generate payload examples or an execution graph."; state.next_step = "responder"; return state
-        self._generate_payload_descriptions(state) 
-        if any("Error generating description: 429" in desc for desc in state.payload_descriptions.values()) or any("quota" in desc.lower() for desc in state.payload_descriptions.values()): logger.warning("API limit hit during payload description generation."); 
-        if "Hit API limits" not in (state.response or ""): state.response = (state.response or "") + " Partial success: Hit API limits while generating some payload examples."
-        self._generate_execution_graph(state, goal=state.plan_generation_goal)
-        if state.openapi_schema and state.schema_cache_key and SCHEMA_CACHE and state.execution_graph and state.next_step not in ["handle_unknown", "responder_with_error_from_pipeline"]: 
-            full_analysis_data = {'openapi_schema': state.openapi_schema, 'schema_summary': state.schema_summary, 'identified_apis': state.identified_apis, 'payload_descriptions': state.payload_descriptions, 'execution_graph': state.execution_graph.model_dump() if state.execution_graph and isinstance(state.execution_graph, GraphOutput) else None, 'plan_generation_goal': state.plan_generation_goal}
-            save_schema_to_cache(f"{state.schema_cache_key}_full_analysis", full_analysis_data); logger.info(f"Saved full analysis to cache for key: {state.schema_cache_key}_full_analysis")
+        if state.schema_summary and ("Error generating summary: 429" in state.schema_summary or "quota" in state.schema_summary.lower()): 
+            logger.warning("API limit hit during schema summary. Stopping pipeline.")
+            state.response = state.schema_summary
+            state.next_step = "responder"
+            return state
+            
+        self._identify_apis_from_schema(state) # Operates on the (now dereferenced) schema
+        if not state.identified_apis: 
+            state.response = (state.response or "") + " No API operations were identified from the schema. Cannot generate payload examples or an execution graph."
+            state.next_step = "responder"
+            return state
+            
+        self._generate_payload_descriptions(state) # Benefits from dereferenced schema
+        if any("Error generating description: 429" in desc for desc in state.payload_descriptions.values()) or \
+           any("quota" in desc.lower() for desc in state.payload_descriptions.values()):
+            logger.warning("API limit hit during payload description generation.")
+            if "Hit API limits" not in (state.response or ""):
+                 state.response = (state.response or "") + " Partial success: Hit API limits while generating some payload examples."
+
+        self._generate_execution_graph(state, goal=state.plan_generation_goal) # Benefits from dereferenced schema context
+        
+        # Cache the full analysis, now including the dereferenced schema
+        if state.openapi_schema and state.schema_cache_key and SCHEMA_CACHE and \
+           state.execution_graph and state.next_step not in ["handle_unknown", "responder_with_error_from_pipeline"]: 
+            
+            full_analysis_data = {
+                'openapi_schema': state.openapi_schema, # This is the dereferenced schema
+                'schema_summary': state.schema_summary, 
+                'identified_apis': state.identified_apis, 
+                'payload_descriptions': state.payload_descriptions, 
+                'execution_graph': state.execution_graph.model_dump() if state.execution_graph and isinstance(state.execution_graph, GraphOutput) else None, 
+                'plan_generation_goal': state.plan_generation_goal
+            }
+            cached_full_analysis_key = f"{state.schema_cache_key}_full_analysis_dereferenced"
+            save_schema_to_cache(cached_full_analysis_key, full_analysis_data)
+            logger.info(f"Saved fully analyzed and dereferenced data to cache: {cached_full_analysis_key}")
+            
         state.update_scratchpad_reason(tool_name, f"Schema processing pipeline initiated. Next step determined by _generate_execution_graph: {state.next_step}")
         return state
 
     def verify_graph(self, state: BotState) -> BotState:
+        # (This method remains the same)
         tool_name = "verify_graph"; state.response = "Verifying API workflow graph..."; state.update_scratchpad_reason(tool_name, "Verifying graph structure and integrity.")
         if not state.execution_graph or not isinstance(state.execution_graph, GraphOutput): state.response = state.response or "No execution graph to verify (possibly due to generation error or wrong type)."; state.graph_regeneration_reason = state.graph_regeneration_reason or "No graph was generated to verify."; logger.warning(f"verify_graph: No graph found or invalid type. Reason: {state.graph_regeneration_reason}. Routing to _generate_execution_graph for regeneration."); state.next_step = "_generate_execution_graph"; return state
         issues = []
@@ -379,27 +507,30 @@ class OpenAPICoreLogic:
         return state
 
     def refine_api_graph(self, state: BotState) -> BotState:
+        # (This method also benefits as the API summaries and current graph passed to LLM will be based on dereferenced schemas)
         tool_name = "refine_api_graph"; iteration = state.graph_refinement_iterations + 1; state.response = f"Refining API workflow graph (Attempt {iteration}/{state.max_refinement_iterations})..."; state.update_scratchpad_reason(tool_name, f"Refining graph. Iteration: {iteration}. Reason: {state.graph_regeneration_reason or 'General refinement request.'}")
         if not state.execution_graph or not isinstance(state.execution_graph, GraphOutput): state.response = "No graph to refine or invalid graph type. Please generate a graph first."; logger.warning("refine_api_graph: No execution_graph found or invalid type."); state.next_step = "_generate_execution_graph"; return state
         if iteration > state.max_refinement_iterations: state.response = (f"Max refinement iterations ({state.max_refinement_iterations}) reached. Using current graph (description: {state.execution_graph.description or 'N/A'}). Please try a new goal or manually edit if needed."); logger.warning("Max refinement iterations reached. Proceeding with current graph."); state.next_step = "describe_graph"; return state
         try: current_graph_json = state.execution_graph.model_dump_json(indent=2)
         except Exception as e: logger.error(f"Error serializing current graph for refinement prompt: {e}"); state.response = "Error preparing current graph for refinement. Cannot proceed."; state.next_step = "handle_unknown"; return state
+        
         api_summaries_for_prompt = []
         num_apis_to_summarize = MAX_APIS_IN_PROMPT_SUMMARY_SHORT; truncate_threshold = MAX_TOTAL_APIS_THRESHOLD_FOR_TRUNCATION_SHORT
-        for idx, api in enumerate(state.identified_apis):
+        for idx, api in enumerate(state.identified_apis): # identified_apis are based on dereferenced schema
             if idx >= num_apis_to_summarize and len(state.identified_apis) > truncate_threshold: api_summaries_for_prompt.append(f"- ...and {len(state.identified_apis) - num_apis_to_summarize} more operations."); break
             likely_confirmation = api['method'].upper() in ["POST", "PUT", "DELETE", "PATCH"]
             api_summaries_for_prompt.append(f"- opId: {api['operationId']} ({api['method']} {api['path']}), summary: {api.get('summary', 'N/A')[:70]}, confirm: {'yes' if likely_confirmation else 'no'}")
         apis_ctx = "\n".join(api_summaries_for_prompt)
+        
         prompt = f"""
         User's Overall Goal: "{state.plan_generation_goal or 'General workflow'}"
         Feedback for Refinement: "{state.graph_regeneration_reason or 'General request to improve the graph.'}"
-        Current Graph (JSON to be refined):\n```json\n{current_graph_json}\n```
-        Available API Operations (sample for context):\n{apis_ctx}
+        Current Graph (JSON to be refined, based on fully resolved schemas):\n```json\n{current_graph_json}\n```
+        Available API Operations (sample for context, from resolved schemas):\n{apis_ctx}
 
         Task: Refine the current graph based on the feedback. Ensure the refined graph:
         1.  Strictly adheres to the Pydantic model structure for GraphOutput, Node, Edge, InputMapping, OutputMapping.
-            - For `payload` in Nodes: ONLY include fields defined by the API's request body schema. DO NOT invent fields. Use realistic example values or placeholders like `{{{{key_from_output_mapping}}}}` if data comes from a prior step. Omit optional fields if value is unknown.
+            - For `payload` in Nodes: ONLY include fields defined by the API's (now fully resolved) request body schema. DO NOT invent fields. Use realistic example values or placeholders like `{{{{key_from_output_mapping}}}}` if data comes from a prior step. Omit optional fields if value is unknown.
         2.  Includes "START_NODE" and "END_NODE" correctly linked.
         3.  All node `operationId`s (or `display_name` if used as `effective_id`) in edges must exist in the `nodes` list.
         4.  Nodes intended for execution have `method` and `path` attributes.
@@ -431,6 +562,7 @@ class OpenAPICoreLogic:
         return state
 
     def describe_graph(self, state: BotState) -> BotState:
+        # (This method remains the same)
         tool_name = "describe_graph"; state.response = "Preparing graph description..."; state.update_scratchpad_reason(tool_name, "Preparing to describe the current execution graph.")
         if not state.execution_graph or not isinstance(state.execution_graph, GraphOutput): state.response = (state.response or "") + " No execution graph is currently available to describe or graph is invalid."; logger.warning("describe_graph: No execution_graph found in state or invalid type.")
         else:
@@ -455,6 +587,7 @@ class OpenAPICoreLogic:
         state.update_scratchpad_reason(tool_name, f"Graph description generated/retrieved. Response set: {state.response[:100]}..."); state.next_step = "responder"; return state
 
     def get_graph_json(self, state: BotState) -> BotState:
+        # (This method remains the same)
         tool_name = "get_graph_json"; state.response = "Fetching graph JSON..."; state.update_scratchpad_reason(tool_name, "Attempting to provide graph JSON.")
         if not state.execution_graph or not isinstance(state.execution_graph, GraphOutput): state.response = "No execution graph is currently available or graph is invalid."
         else:
@@ -463,13 +596,14 @@ class OpenAPICoreLogic:
         state.next_step = "responder"; return state
 
     def answer_openapi_query(self, state: BotState) -> BotState:
+        # (This method remains the same, but benefits from dereferenced schema context)
         tool_name = "answer_openapi_query"; state.response = "Thinking about your question..."; state.update_scratchpad_reason(tool_name, f"Attempting to answer user query: {state.user_input[:100] if state.user_input else 'N/A'}")
         if not state.openapi_schema and not (state.execution_graph and isinstance(state.execution_graph, GraphOutput)): state.response = "I don't have an OpenAPI specification loaded or a graph generated yet. Please provide one first."; state.next_step = "responder"; return state
         context_parts = []
         if state.user_input: context_parts.append(f"User Question: \"{state.user_input}\"")
-        if state.schema_summary: context_parts.append(f"\n### API Specification Summary\n{state.schema_summary}")
+        if state.schema_summary: context_parts.append(f"\n### API Specification Summary (from dereferenced schema)\n{state.schema_summary}")
         if state.identified_apis:
-            api_list_md = "\n### Identified API Operations (Sample - first few):\n"; num_apis_to_list = MAX_APIS_IN_PROMPT_SUMMARY_SHORT 
+            api_list_md = "\n### Identified API Operations (Sample - first few, from dereferenced schema):\n"; num_apis_to_list = MAX_APIS_IN_PROMPT_SUMMARY_SHORT 
             for i, api in enumerate(state.identified_apis[:num_apis_to_list]): api_list_md += f"- **{api.get('operationId', 'N/A')}**: {api.get('method', '?')} {api.get('path', '?')} - _{api.get('summary', 'No summary')[:70]}..._\n"
             if len(state.identified_apis) > num_apis_to_list: api_list_md += f"- ... and {len(state.identified_apis) - num_apis_to_list} more.\n"
             context_parts.append(api_list_md)
@@ -479,21 +613,22 @@ class OpenAPICoreLogic:
             context_parts.append(graph_desc_md)
         elif state.execution_graph and isinstance(state.execution_graph, GraphOutput): context_parts.append(f"\n### Current Workflow Graph ('{state.plan_generation_goal or 'General Purpose'}') exists but has no detailed description.")
         payload_info_md = ""
-        if state.user_input and state.payload_descriptions:
+        if state.user_input and state.payload_descriptions: # payload_descriptions are now based on dereferenced schema
             for op_id, desc_text in state.payload_descriptions.items():
-                if op_id.lower() in state.user_input.lower(): payload_info_md = f"\n### Payload/Response Example for '{op_id}':\n{desc_text}\n"; context_parts.append(payload_info_md); break 
+                if op_id.lower() in state.user_input.lower(): payload_info_md = f"\n### Payload/Response Example for '{op_id}' (from resolved schema):\n{desc_text}\n"; context_parts.append(payload_info_md); break 
         full_context = "\n".join(context_parts)
         if not full_context.strip(): full_context = "No specific API context available, but an OpenAPI spec might be loaded."
-        prompt = f"""You are an expert API assistant. Answer the user's question based on the provided context. Use Markdown for formatting (e.g., headings, lists, bolding, italics, and code blocks for JSON snippets).\n\n{full_context}\n\nPlease provide a clear, concise, and helpful answer to the User Question. If the information is not available in the context, state that clearly. If listing multiple items (like API operations), use bullet points. If showing example JSON, ensure it is in a Markdown code block (e.g., ```json ... ```). Focus only on answering the question. Do not add conversational fluff beyond the answer."""
+        prompt = f"""You are an expert API assistant. Answer the user's question based on the provided context (which is derived from a fully resolved/dereferenced OpenAPI schema). Use Markdown for formatting (e.g., headings, lists, bolding, italics, and code blocks for JSON snippets).\n\n{full_context}\n\nPlease provide a clear, concise, and helpful answer to the User Question. If the information is not available in the context, state that clearly. If listing multiple items (like API operations), use bullet points. If showing example JSON, ensure it is in a Markdown code block (e.g., ```json ... ```). Focus only on answering the question. Do not add conversational fluff beyond the answer."""
         try: state.response = llm_call_helper(self.worker_llm, prompt); logger.info("Successfully generated answer for OpenAPI query.")
         except Exception as e: logger.error(f"Error generating answer for OpenAPI query: {e}", exc_info=False); state.response = f"### Error Answering Query\nSorry, I encountered an error while trying to answer your question: {str(e)[:100]}..."
         state.update_scratchpad_reason(tool_name, f"Answered query. Response snippet: {state.response[:100]}..."); state.next_step = "responder"; return state
 
     def interactive_query_planner(self, state: BotState) -> BotState:
+        # (This method remains the same)
         tool_name = "interactive_query_planner"; state.response = "Planning how to address your interactive query..."; state.update_scratchpad_reason(tool_name, f"Entering interactive query planner for input: {state.user_input[:100] if state.user_input else 'N/A'}")
         state.scratchpad.pop('interactive_action_plan', None); state.scratchpad.pop('current_interactive_action_idx', None); state.scratchpad.pop('current_interactive_results', None)
         graph_summary = state.execution_graph.description[:150] + "..." if state.execution_graph and isinstance(state.execution_graph, GraphOutput) and state.execution_graph.description else "No graph currently generated."; payload_keys_sample = list(state.payload_descriptions.keys())[:3]
-        prompt = f"""User Query: "{state.user_input}"\n\nCurrent State Context:\n- API Spec Summary: {'Available' if state.schema_summary else 'Not available.'}\n- Identified APIs count: {len(state.identified_apis) if state.identified_apis else 0}. Example OpIDs: {", ".join([api['operationId'] for api in state.identified_apis[:3]])}...\n- Example Payload Descriptions available for OpIDs (sample): {payload_keys_sample}...\n- Current Execution Graph Goal: {state.plan_generation_goal or 'Not set.'}\n- Current Graph Description: {graph_summary}\n- Workflow Execution Status: {state.workflow_execution_status}\n\nAvailable Internal Actions (choose one or more in sequence, output as a JSON list):\n1.  `rerun_payload_generation`: Regenerate payload/response examples for specific APIs, possibly with new user-provided context.\n    Params: {{ "operation_ids_to_update": ["opId1", "opId2"], "new_context": "User's new context string for generation" }}\n2.  `contextualize_graph_descriptions`: Rewrite descriptions within the *existing* graph (overall, nodes, edges) to reflect new user context or focus. This does NOT change graph structure.\n    Params: {{ "new_context_for_graph": "User's new context/focus for descriptions" }}\n3.  `regenerate_graph_with_new_goal`: Create a *new* graph if the user states a completely different high-level goal OR requests a significant structural change (add/remove/reorder API steps).\n    Params: {{ "new_goal_string": "User's new goal, incorporating the structural change (e.g., 'Workflow to X, then Y, and then Z as the last step')" }}\n4.  `refine_existing_graph_structure`: For minor structural adjustments to the existing graph (e.g., "add API Z after Y but before END_NODE", "remove API X"). This implies the overall goal is similar but the sequence/nodes need adjustment. The LLM will be asked to refine the current graph JSON.\n    Params: {{ "refinement_instructions_for_structure": "User's specific feedback for structural refinement (e.g., 'Add operation Z after Y', 'Ensure X comes before Y')" }}\n5.  `answer_query_directly`: If the query can be answered using existing information (API summary, API list, current graph description, existing payload examples) without modifications to artifacts.\n    Params: {{ "query_for_synthesizer": "The original user query or a rephrased one for direct answering." }}\n6.  `setup_workflow_execution_interactive`: If the user asks to run/execute the current graph. This action prepares the system for execution.\n    Params: {{ "initial_parameters": {{ "param1": "value1" }} }} (Optional initial parameters for the workflow, if provided by user)\n7.  `resume_workflow_with_payload_interactive`: If the workflow is 'paused_for_confirmation' and the user provides the necessary payload/confirmation to continue.\n    Params: {{ "confirmed_payload": {{...}} }} (The JSON payload confirmed or provided by the user)\n8.  `synthesize_final_answer`: (Usually the last step of a plan) Formulate a comprehensive answer to the user based on the outcomes of previous internal actions or if no other action is suitable.\n    Params: {{ "synthesis_prompt_instructions": "Instructions for the LLM on what to include in the final answer, summarizing actions taken or information gathered." }}\n\nTask:\n1. Analyze the user's query in the context of the current system state.\n2. Create a short, logical "interactive_action_plan" (a list of action objects, max 3-4 steps).\n   - For requests to run the graph, use `setup_workflow_execution_interactive`.\n   - If the graph is paused and user provides data, use `resume_workflow_with_payload_interactive`.\n   - For structural changes like "add X at the end", prefer `regenerate_graph_with_new_goal` or `refine_existing_graph_structure`.\n3. Provide a brief "user_query_understanding" (1-2 sentences).\n\nOutput ONLY a JSON object with this structure:\n{{\n  "user_query_understanding": "Brief interpretation of user's need.",\n  "interactive_action_plan": [\n    {{"action_name": "action_enum_value", "action_params": {{...}}, "description": "Briefly, why this action is chosen."}}\n  ]\n}}\nIf the query is very simple and can be answered directly, the plan might just be one "answer_query_directly" or "synthesize_final_answer" action.\nIf the query is ambiguous or cannot be handled by available actions, use "synthesize_final_answer" with instructions to inform the user."""
+        prompt = f"""User Query: "{state.user_input}"\n\nCurrent State Context:\n- API Spec Summary: {'Available (from dereferenced spec)' if state.schema_summary else 'Not available.'}\n- Identified APIs count: {len(state.identified_apis) if state.identified_apis else 0}. Example OpIDs: {", ".join([api['operationId'] for api in state.identified_apis[:3]])}...\n- Example Payload Descriptions available for OpIDs (sample, from dereferenced spec): {payload_keys_sample}...\n- Current Execution Graph Goal: {state.plan_generation_goal or 'Not set.'}\n- Current Graph Description: {graph_summary}\n- Workflow Execution Status: {state.workflow_execution_status}\n\nAvailable Internal Actions (choose one or more in sequence, output as a JSON list):\n1.  `rerun_payload_generation`: Regenerate payload/response examples for specific APIs, possibly with new user-provided context.\n    Params: {{ "operation_ids_to_update": ["opId1", "opId2"], "new_context": "User's new context string for generation" }}\n2.  `contextualize_graph_descriptions`: Rewrite descriptions within the *existing* graph (overall, nodes, edges) to reflect new user context or focus. This does NOT change graph structure.\n    Params: {{ "new_context_for_graph": "User's new context/focus for descriptions" }}\n3.  `regenerate_graph_with_new_goal`: Create a *new* graph if the user states a completely different high-level goal OR requests a significant structural change (add/remove/reorder API steps).\n    Params: {{ "new_goal_string": "User's new goal, incorporating the structural change (e.g., 'Workflow to X, then Y, and then Z as the last step')" }}\n4.  `refine_existing_graph_structure`: For minor structural adjustments to the existing graph (e.g., "add API Z after Y but before END_NODE", "remove API X"). This implies the overall goal is similar but the sequence/nodes need adjustment. The LLM will be asked to refine the current graph JSON.\n    Params: {{ "refinement_instructions_for_structure": "User's specific feedback for structural refinement (e.g., 'Add operation Z after Y', 'Ensure X comes before Y')" }}\n5.  `answer_query_directly`: If the query can be answered using existing information (API summary, API list, current graph description, existing payload examples) without modifications to artifacts.\n    Params: {{ "query_for_synthesizer": "The original user query or a rephrased one for direct answering." }}\n6.  `setup_workflow_execution_interactive`: If the user asks to run/execute the current graph. This action prepares the system for execution.\n    Params: {{ "initial_parameters": {{ "param1": "value1" }} }} (Optional initial parameters for the workflow, if provided by user)\n7.  `resume_workflow_with_payload_interactive`: If the workflow is 'paused_for_confirmation' and the user provides the necessary payload/confirmation to continue.\n    Params: {{ "confirmed_payload": {{...}} }} (The JSON payload confirmed or provided by the user)\n8.  `synthesize_final_answer`: (Usually the last step of a plan) Formulate a comprehensive answer to the user based on the outcomes of previous internal actions or if no other action is suitable.\n    Params: {{ "synthesis_prompt_instructions": "Instructions for the LLM on what to include in the final answer, summarizing actions taken or information gathered." }}\n\nTask:\n1. Analyze the user's query in the context of the current system state.\n2. Create a short, logical "interactive_action_plan" (a list of action objects, max 3-4 steps).\n   - For requests to run the graph, use `setup_workflow_execution_interactive`.\n   - If the graph is paused and user provides data, use `resume_workflow_with_payload_interactive`.\n   - For structural changes like "add X at the end", prefer `regenerate_graph_with_new_goal` or `refine_existing_graph_structure`.\n3. Provide a brief "user_query_understanding" (1-2 sentences).\n\nOutput ONLY a JSON object with this structure:\n{{\n  "user_query_understanding": "Brief interpretation of user's need.",\n  "interactive_action_plan": [\n    {{"action_name": "action_enum_value", "action_params": {{...}}, "description": "Briefly, why this action is chosen."}}\n  ]\n}}\nIf the query is very simple and can be answered directly, the plan might just be one "answer_query_directly" or "synthesize_final_answer" action.\nIf the query is ambiguous or cannot be handled by available actions, use "synthesize_final_answer" with instructions to inform the user."""
         try:
             llm_response_str = llm_call_helper(self.worker_llm, prompt)
             parsed_plan_data = parse_llm_json_output_with_model(llm_response_str) 
@@ -506,6 +641,7 @@ class OpenAPICoreLogic:
         return state
 
     def _internal_contextualize_graph_descriptions(self, state: BotState, new_context: str) -> str:
+        # (This method remains the same)
         tool_name = "_internal_contextualize_graph_descriptions"
         if not state.execution_graph or not isinstance(state.execution_graph, GraphOutput): return "No graph to contextualize or graph is invalid."
         if not new_context: return "No new context provided for contextualization."
@@ -525,6 +661,7 @@ class OpenAPICoreLogic:
         return f"Graph descriptions have been updated to reflect the context: '{new_context[:70]}...'."
 
     def interactive_query_executor(self, state: BotState) -> BotState:
+        # (This method remains the same)
         tool_name = "interactive_query_executor"; plan = state.scratchpad.get('interactive_action_plan', []); idx = state.scratchpad.get('current_interactive_action_idx', 0); results = state.scratchpad.get('current_interactive_results', []) 
         if not plan or idx >= len(plan):
             final_response_message = "Finished interactive processing. "; 
@@ -587,14 +724,17 @@ class OpenAPICoreLogic:
         return state
 
     def handle_unknown(self, state: BotState) -> BotState:
+        # (This method remains the same)
         tool_name = "handle_unknown"
         if not state.response or "error" not in str(state.response).lower(): state.response = "I'm not sure how to process that request. Could you please rephrase it, or provide an OpenAPI specification if you haven't already?"
         state.update_scratchpad_reason(tool_name, f"Handling unknown input or situation. Final response to be: {state.response}"); state.next_step = "responder"; return state
 
     def handle_loop(self, state: BotState) -> BotState:
+        # (This method remains the same)
         tool_name = "handle_loop"; state.response = "It seems we're stuck in a processing loop. Please try rephrasing your request or starting over with the OpenAPI specification."; state.loop_counter = 0; state.update_scratchpad_reason(tool_name, "Loop detected, routing to responder with a loop message."); state.next_step = "responder"; return state
 
     def setup_workflow_execution(self, state: BotState) -> BotState:
+        # (This method remains the same)
         tool_name = "setup_workflow_execution"; logger.info(f"[{state.session_id}] Setting up workflow execution based on current graph."); state.update_scratchpad_reason(tool_name, "Preparing for workflow execution.")
         if not state.execution_graph or not isinstance(state.execution_graph, GraphOutput): state.response = "No execution graph is available to run or graph is invalid. Please generate or load one first."; state.workflow_execution_status = "failed"; state.next_step = "responder"; return state
         if state.workflow_execution_status in ["running", "paused_for_confirmation", "pending_start"]: state.response = "A workflow is already running, paused, or pending. Please wait for it to complete or address the current state."; state.next_step = "responder"; return state
@@ -603,6 +743,7 @@ class OpenAPICoreLogic:
         state.next_step = "responder"; return state
 
     def resume_workflow_with_payload(self, state: BotState, confirmed_payload: Dict[str, Any]) -> BotState:
+        # (This method remains the same)
         tool_name = "resume_workflow_with_payload"; logger.info(f"[{state.session_id}] Preparing to resume workflow with confirmed_payload."); state.update_scratchpad_reason(tool_name, f"Payload received for workflow resumption: {str(confirmed_payload)[:100]}...")
         if state.workflow_execution_status != "paused_for_confirmation": state.response = (f"Workflow is not currently paused for confirmation (current status: {state.workflow_execution_status}). Cannot process resume payload at this time."); state.next_step = "responder"; return state
         state.scratchpad['pending_resume_payload'] = confirmed_payload; state.workflow_execution_status = "running"; state.response = "Confirmation payload received. System will attempt to resume workflow execution."; logger.info(f"[{state.session_id}] Confirmed payload stored in scratchpad. Workflow status set to 'running' (pending actual resume by main.py).")
