@@ -24,38 +24,19 @@
                     <div class="message agent-message">
                         <div class="message-sender">Agent</div>
                         <div class="message-content">
-                            <p>Welcome! I can help you plan and execute API workflows. Please provide an OpenAPI specification to begin, or ask a question if a spec is already loaded.</p>
+                            <p>Welcome! I can help you plan and execute API workflows. Please provide an OpenAPI specification to begin.</p>
                         </div>
                     </div>
                 </div>
                 <div class="chat-input-area">
-                    <div class="input-group spec-input-group">
-                        <textarea id="specInput" placeholder="Paste OpenAPI spec here..." rows="3" class="w-full p-2 border rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-shadow resize-y mb-2" title="Paste full OpenAPI/Swagger specification text here."></textarea>
-                        <div class="flex flex-col sm:flex-row gap-2 mb-2">
-                            <input type="text" id="specUrl" placeholder="Or enter Spec URL" class="flex-grow p-2 border rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-shadow" title="Enter a publicly accessible URL to an OpenAPI/Swagger specification.">
-                            <div class="file-input-wrapper">
-                                <input type="file" id="specFile" class="hidden" accept=".json, .yaml, .yml, .txt">
-                                <label for="specFile" class="action-button secondary-button file-input-label" title="Upload an OpenAPI/Swagger specification file (JSON, YAML, YML, TXT).">
-                                    <i class="fa-solid fa-upload"></i> <span>Upload File</span>
-                                </label>
-                            </div>
-                        </div>
-                        <button id="submitSpecButton" class="action-button primary-button w-full sm:w-auto" title="Submit the provided OpenAPI specification for processing.">
-                            <i class="fa-solid fa-cogs"></i> Process Specification
-                        </button>
-                    </div>
-                    <hr class="my-4 border-gray-300">
-                    <textarea id="userInput" placeholder="Ask a question or type your goal for the loaded API..." rows="3" class="w-full p-2 border rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-shadow resize-y mb-2" title="Interact with the agent regarding the loaded specification or current workflow."></textarea>
+                    <textarea id="userInput" placeholder="Paste OpenAPI spec, ask a question, or define a goal..." rows="3"></textarea>
                     <div class="chat-buttons">
-                        <button id="sendMessageButton" class="action-button primary-button" title="Send your message or query to the agent.">
+                        <button id="sendButton" class="action-button primary-button" onclick="sendMessage()" title="Send Message">
                             <i class="fa-solid fa-paper-plane"></i>
                             <span>Send</span>
-                        </button>
-                         <button id="runWorkflowButton" class="action-button secondary-button" onclick="runCurrentWorkflow()" title="Run the currently defined workflow graph. (Functionality may vary)">
+                            </button>
+                         <button id="runWorkflowButton" class="action-button secondary-button" onclick="runCurrentWorkflow()" title="Run Current Workflow">
                             <i class="fa-solid fa-gears"></i> <span>Run Workflow</span>
-                        </button>
-                        <button id="clearChatButton" class="action-button tertiary-button" title="Clear all messages from the chat and reset the graph view.">
-                            <i class="fa-solid fa-eraser"></i> Clear Chat
                         </button>
                     </div>
                 </div>
@@ -71,21 +52,12 @@
                         </div>
                     </div>
                     <div id="graphDagViewContent" class="tab-pane active">
-                        <div id="graphContainer" class="mermaid-container"></div>
+                        <div class="mermaid-container" id="mermaidDagDiagram">
+                            </div>
                     </div>
                     <div id="graphJsonViewContent" class="tab-pane">
-                        <pre id="graphJsonViewPre" class="bg-gray-800 text-white p-4 rounded-md overflow-auto max-h-[600px] text-xs">JSON representation of the graph will appear here.</pre>
+                        <pre id="graphJsonViewPre">JSON representation of the graph will appear here.</pre>
                     </div>
-                </div>
-                 <div id="apiResponseContainer" class="api-response-viewer hidden bg-white p-4 rounded-lg shadow-md mt-4 border border-gray-200">
-                    <div class="flex justify-between items-center mb-2">
-                        <h3 class="text-lg font-semibold text-gray-700">API Call Result</h3>
-                        <button id="closeApiResponse" class="text-gray-500 hover:text-red-600 transition-colors" title="Close API Response Viewer">
-                            <i class="fa-solid fa-xmark fa-lg"></i>
-                        </button>
-                    </div>
-                    <div id="apiResponseContent" class="text-sm">
-                        </div>
                 </div>
             </div>
         </main>
@@ -94,20 +66,18 @@
     <div id="confirmationModal" class="modal-overlay" style="display: none;">
         <div class="modal-content">
             <div class="modal-header">
-                <h3 id="modalTitle" class="text-xl font-semibold text-gray-800">Confirm Action</h3>
-                <button class="modal-close-button" onclick="hideConfirmationModal()" title="Close">
-                    <i class="fa-solid fa-xmark"></i>
-                </button>
+                <h3 id="modalTitle">Confirm Action</h3>
+                <button class="modal-close-button" onclick="hideConfirmationModal()" title="Close"><i class="fa-solid fa-xmark"></i></button>
             </div>
             <div class="modal-body">
-                <p class="mb-1"><strong>Operation ID:</strong> <span id="modalOperationId" class="font-mono text-sm text-indigo-600">N/A</span></p>
-                <p class="mb-1"><strong>Effective Node ID:</strong> <span id="modalEffectiveNodeId" class="font-mono text-sm text-indigo-600">N/A</span></p>
-                <p class="mb-1"><strong>Method:</strong> <span id="modalMethod" class="font-semibold text-sm">N/A</span></p>
-                <p class="mb-1"><strong>Path:</strong> <code id="modalPath" class="font-mono text-sm bg-gray-100 p-1 rounded">N/A</code></p>
-                <p class="mb-3"><strong>Graph Thread ID:</strong> <code id="modalGraph2ThreadId" class="font-mono text-sm bg-gray-100 p-1 rounded">N/A</code></p>
+                <p><strong>Operation ID:</strong> <span id="modalOperationId">N/A</span></p>
+                <p><strong>Effective Node ID:</strong> <span id="modalEffectiveNodeId">N/A</span></p>
+                <p><strong>Method:</strong> <span id="modalMethod">N/A</span></p>
+                <p><strong>Path:</strong> <code id="modalPath">N/A</code></p>
+                <p><strong>Graph2 Thread ID:</strong> <code id="modalGraph2ThreadId">N/A</code></p>
                 <div class="payload-editor">
-                    <label for="modalPayload" class="block mb-1 font-semibold text-sm text-gray-700">Request Payload (JSON):</label>
-                    <textarea id="modalPayload" rows="10" class="w-full p-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-shadow text-xs font-mono" placeholder="Enter or modify JSON payload..."></textarea>
+                    <label for="modalPayload"><strong>Request Payload (JSON):</strong></label>
+                    <textarea id="modalPayload" rows="10" placeholder="Enter or modify JSON payload..."></textarea>
                 </div>
             </div>
             <div class="modal-actions">
@@ -117,39 +87,25 @@
         </div>
     </div>
 
-    <div id="thinkingIndicatorContainer" class="fixed bottom-6 right-6 z-50 transition-opacity duration-300 ease-in-out opacity-0 pointer-events-none">
-        <div class="bg-indigo-600 text-white p-3 rounded-xl shadow-xl flex items-center space-x-3">
-            <svg class="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-            </svg>
-            <span id="thinkingIndicatorText" class="text-sm font-medium">Processing...</span>
-        </div>
-    </div>
-
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
-    <script src="https://unpkg.com/@popperjs/core@2"></script>
-    <script src="https://unpkg.com/tippy.js@6"></script>
-    
     <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
     <script>
         if (typeof mermaid !== 'undefined') {
             mermaid.initialize({ 
                 startOnLoad: false, 
-                theme: 'base',
-                themeVariables: {
-                    primaryColor: '#f0f2f5',
-                    primaryTextColor: '#333',
-                    primaryBorderColor: '#007bff',
-                    lineColor: '#555e68',
-                    secondaryColor: '#f0f2f5',
-                    tertiaryColor: '#fff'
+                theme: 'base', // Using 'base' for more CSS control
+                themeVariables: { // Example of customizing base theme
+                    primaryColor: '#f0f2f5',    // Background of nodes (light)
+                    primaryTextColor: '#333',    // Text on nodes
+                    primaryBorderColor: '#007bff',// Border of nodes
+                    lineColor: '#555e68',        // Edge lines
+                    secondaryColor: '#f0f2f5',   // Cluster background (if used)
+                    tertiaryColor: '#fff'        // Actor borders (if used)
                 },
                 fontFamily: '"Inter", sans-serif',
-                securityLevel: 'loose'
+                securityLevel: 'loose' // Allow HTML in labels if needed for icons, but sanitize carefully
             });
         } else {
-            console.warn("Mermaid.js library not loaded. Any Mermaid diagrams will not render.");
+            console.error("Mermaid.js library not loaded.");
         }
     </script>
     <script src="/static/script.js"></script>
