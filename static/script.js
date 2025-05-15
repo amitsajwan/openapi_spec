@@ -1,6 +1,8 @@
 // OpenAPI Agent script.js
 
 document.addEventListener('DOMContentLoaded', () => {
+    console.log('[DEBUG] DOMContentLoaded event fired.');
+
     // DOM Elements
     const chatMessagesDiv = document.getElementById('chatMessages');
     const userInput = document.getElementById('userInput');
@@ -26,16 +28,18 @@ document.addEventListener('DOMContentLoaded', () => {
     const modalConfirmButton = document.getElementById('modalConfirmButton');
     const modalCancelButton = document.getElementById('modalCancelButton');
 
+    // State Variables
     let ws;
     let currentGraphData = null;
     const initialSendButtonHTML = sendButton.innerHTML;
-
     let currentConfirmationContext = {
         graph2ThreadId: null,
         confirmationKey: null,
         operationId: null,
         effectiveNodeId: null
     };
+
+    // --- Function Declarations ---
 
     /**
      * Updates the state of the send button and related UI elements.
@@ -88,18 +92,22 @@ document.addEventListener('DOMContentLoaded', () => {
      * @param {string} [sourceGraph="graph1_planning"] - The source of the message.
      */
     function addMessageToChat(sender, content, type, sourceGraph = "graph1_planning") {
+        if (typeof addMessageToChat !== 'function') {
+            console.error('[FATAL] addMessageToChat is not a function within its own body! This should not happen.');
+            return;
+        }
+        // console.log(`[DEBUG] addMessageToChat called by: ${sender}, type: ${type}, source: ${sourceGraph}`);
+
         const lastMessageElement = chatMessagesDiv.lastElementChild;
         let shouldAppend = false;
-
-        // Define types that are generally intermediate and might be appended for Planner
-        const appendablePlannerTypes = ["status", "intermediate", "info"]; // Add other types if needed
+        const appendablePlannerTypes = ["status", "intermediate", "info"];
 
         if (lastMessageElement &&
-            lastMessageElement.dataset.source === "graph1_planning" && // Last message was from Planner
-            sourceGraph === "graph1_planning" && // Current message is also from Planner
-            appendablePlannerTypes.includes(lastMessageElement.dataset.type) && // Last message was an appendable type
-            appendablePlannerTypes.includes(type) && // Current message is also an appendable type
-            type !== "final" && type !== "error") { // Do not append final or error messages
+            lastMessageElement.dataset.source === "graph1_planning" &&
+            sourceGraph === "graph1_planning" &&
+            appendablePlannerTypes.includes(lastMessageElement.dataset.type) &&
+            appendablePlannerTypes.includes(type) &&
+            type !== "final" && type !== "error") {
             shouldAppend = true;
         }
 
@@ -108,23 +116,19 @@ document.addEventListener('DOMContentLoaded', () => {
             messageContentText = content;
         } else if (typeof content === 'object' && content !== null && content.message) {
             messageContentText = content.message;
-            if (content.details) { // If there are details, maybe don't append or handle differently
-                shouldAppend = false; // For simplicity, if there are details, make it a new message
+            if (content.details) {
+                shouldAppend = false;
             }
         } else if (typeof content === 'object' && content !== null) {
-            // For complex objects from Planner, usually better to show as a new message unless it's a simple status.
-            // This logic can be refined. For now, if it's not a simple string/message, treat as new.
             shouldAppend = false;
         } else {
             messageContentText = String(content);
         }
 
-
         if (shouldAppend && lastMessageElement) {
             const lastContentElement = lastMessageElement.querySelector('.message-content');
             if (lastContentElement) {
                 const newParagraph = document.createElement('p');
-                // Basic Markdown-like formatting for the appended text
                 let formattedAppendedText = messageContentText.replace(/```([\s\S]*?)```/g, (match, code) => {
                     return `<pre><code>${escapeHtml(code.trim())}</code></pre>`;
                 });
@@ -132,10 +136,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 formattedAppendedText = formattedAppendedText.replace(/\*(.*?)\*/g, '<em>$1</em>');
                 newParagraph.innerHTML = formattedAppendedText;
                 lastContentElement.appendChild(newParagraph);
-                lastMessageElement.dataset.type = type; // Update type if it changed slightly but still appendable
+                lastMessageElement.dataset.type = type;
             }
         } else {
-            // Create a new message element
             const messageElement = document.createElement('div');
             let senderClass = 'agent-message';
             let senderName = sender;
@@ -154,7 +157,6 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             messageElement.classList.add('message', senderClass);
-            // Store source and type for potential appending later
             messageElement.dataset.source = sourceGraph;
             messageElement.dataset.type = type;
 
@@ -165,7 +167,6 @@ document.addEventListener('DOMContentLoaded', () => {
             const senderElement = document.createElement('div');
             senderElement.classList.add('message-sender');
             senderElement.textContent = senderName;
-
             const contentElement = document.createElement('div');
             contentElement.classList.add('message-content');
 
@@ -230,8 +231,20 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         chatMessagesDiv.scrollTop = chatMessagesDiv.scrollHeight;
     }
+    console.log('[DEBUG] addMessageToChat defined, type:', typeof addMessageToChat);
 
+
+    /**
+     * Establishes and manages the WebSocket connection.
+     */
     function connectWebSocket() {
+        console.log('[DEBUG] connectWebSocket called. typeof addMessageToChat:', typeof addMessageToChat);
+        if (typeof addMessageToChat !== 'function') {
+            console.error('[FATAL] addMessageToChat is not available in connectWebSocket!');
+            alert('Critical error: Chat functionality unavailable. Please refresh.');
+            return;
+        }
+
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}/ws/openapi_agent`;
 
@@ -239,6 +252,9 @@ document.addEventListener('DOMContentLoaded', () => {
         ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {
+            if (typeof addMessageToChat !== 'function') {
+                 console.error('[FATAL] addMessageToChat is not available in ws.onopen!'); return;
+            }
             addMessageToChat('System', 'Successfully connected to the agent.', 'info', 'system');
             updateSendButtonState(false);
             runWorkflowButton.disabled = true;
@@ -246,29 +262,29 @@ document.addEventListener('DOMContentLoaded', () => {
         };
 
         ws.onmessage = (event) => {
+            if (typeof addMessageToChat !== 'function') {
+                console.error('[FATAL] addMessageToChat is not available in ws.onmessage!'); return;
+            }
             try {
                 const data = JSON.parse(event.data);
                 console.log("WS RX:", data);
 
                 let sender = 'Agent';
-                let messageContent = data.content; // Keep original content for addMessageToChat
+                let messageContent = data.content;
                 let messageType = data.type;
                 let sourceGraph = data.source || "unknown_source";
 
-                // Special handling for graph_update from planner - don't treat its content as a chat message directly
                 if (sourceGraph === 'graph1_planning' && data.type === "graph_update") {
                     currentGraphData = data.content;
                     graphJsonViewPre.textContent = JSON.stringify(currentGraphData, null, 2);
-                    addMessageToChat('System', 'Execution graph has been updated.', 'info', 'system'); // System message for graph update
+                    addMessageToChat('System', 'Execution graph has been updated.', 'info', 'system');
                     updateGraphViewEmptyState(false);
                     if (graphDagViewContent.classList.contains('active')) {
                         renderMermaidGraphUI(currentGraphData);
                     }
                 } else {
-                     // For all other messages, add them to chat
                     addMessageToChat(sender, messageContent, messageType, sourceGraph);
                 }
-
 
                 let shouldStopThinking = false;
                 if (data.source === "graph1_planning") {
@@ -305,6 +321,9 @@ document.addEventListener('DOMContentLoaded', () => {
         };
 
         ws.onerror = (error) => {
+            if (typeof addMessageToChat !== 'function') {
+                console.error('[FATAL] addMessageToChat is not available in ws.onerror!'); return;
+            }
             console.error('WebSocket Error:', error);
             addMessageToChat('System', 'WebSocket connection error. Check console.', 'error', 'system');
             updateSendButtonState(false);
@@ -312,6 +331,9 @@ document.addEventListener('DOMContentLoaded', () => {
         };
 
         ws.onclose = (event) => {
+            if (typeof addMessageToChat !== 'function') {
+                console.error('[FATAL] addMessageToChat is not available in ws.onclose!'); return;
+            }
             addMessageToChat('System', `WebSocket disconnected. Code: ${event.code}. Attempting to reconnect in 5 seconds...`, 'system', 'system');
             updateSendButtonState(false);
             runWorkflowButton.disabled = true;
@@ -319,35 +341,10 @@ document.addEventListener('DOMContentLoaded', () => {
         };
     }
 
-    window.sendMessage = () => {
-        const messageText = userInput.value.trim();
-        if (!messageText) return;
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-            addMessageToChat('System', 'Not connected. Please wait or try refreshing.', 'error', 'system');
-            return;
-        }
-        addMessageToChat('You', messageText, 'user', 'user_input');
-        ws.send(messageText);
-        userInput.value = '';
-        userInput.style.height = 'auto';
-        updateSendButtonState(true);
-    };
-
-    window.runCurrentWorkflow = () => {
-        if (!currentGraphData) {
-            addMessageToChat('System', 'No workflow graph loaded to run.', 'error', 'system');
-            return;
-        }
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-            addMessageToChat('System', 'Not connected. Cannot run workflow.', 'error', 'system');
-            return;
-        }
-        const command = "run workflow";
-        addMessageToChat('You', command, 'user', 'user_input');
-        ws.send(command);
-        updateSendButtonState(true);
-    };
-
+    /**
+     * Updates the empty state message for graph views.
+     * @param {boolean} isEmpty - True if no graph data is available.
+     */
     function updateGraphViewEmptyState(isEmpty) {
         const dagTabPane = graphDagViewContent;
         const jsonTabPane = graphJsonViewContent;
@@ -365,36 +362,18 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    window.showGraphTab = (tabName) => {
-        graphJsonViewContent.style.display = 'none';
-        graphDagViewContent.style.display = 'none';
-        graphJsonViewContent.classList.remove('active');
-        graphDagViewContent.classList.remove('active');
-        jsonTabButton.classList.remove('active');
-        dagTabButton.classList.remove('active');
-
-        if (tabName === 'json') {
-            graphJsonViewContent.style.display = 'flex';
-            graphJsonViewContent.classList.add('active');
-            jsonTabButton.classList.add('active');
-        } else if (tabName === 'dag') {
-            graphDagViewContent.style.display = 'flex';
-            graphDagViewContent.classList.add('active');
-            dagTabButton.classList.add('active');
-            renderMermaidGraphUI(currentGraphData);
-        }
-        updateGraphViewEmptyState(!currentGraphData);
-    };
-
+    /**
+     * Generates the Mermaid syntax definition for the graph.
+     * @param {object|null} graph - The graph data object, or null if no graph.
+     * @returns {string} The Mermaid graph definition string.
+     */
     function generateMermaidDefinition(graph) {
         const emptyFill = '#fcfcfc';
         const emptyStroke = '#e0e0e0';
         const emptyColor = '#7f8c8d';
-
         const defaultNodeFill = '#ECEFF1';
         const defaultNodeStroke = '#90A4AE';
         const defaultNodeTextColor = '#37474F';
-
         const startEndFill = '#546E7A';
         const startEndStroke = '#37474F';
         const apiNodeFill = 'var(--primary-color)';
@@ -432,9 +411,7 @@ document.addEventListener('DOMContentLoaded', () => {
             } else {
                 labelText = `<b>${escapeHtml(node.operationId)}</b><br/><small>(${escapeHtml(node.effective_id || node.operationId)})</small>`;
             }
-
             def += `    ${id}("${labelText.replace(/"/g, '#quot;')}");\n`;
-
             let nodeClass = 'apiNode';
             if (node.operationId === "START_NODE" || node.operationId === "END_NODE") {
                 nodeClass = 'startEnd';
@@ -450,18 +427,20 @@ document.addEventListener('DOMContentLoaded', () => {
             const label = edge.description ? `|"${escapeHtml(edge.description.substring(0, 50)).replace(/"/g, '#quot;')}"|` : "";
             def += `    ${from} -->${label} ${to};\n`;
         });
-        console.log("Generated Mermaid Definition:\n", def);
+        // console.log("Generated Mermaid Definition:\n", def); // Keep for debugging if needed
         return def;
     }
 
+    /**
+     * Renders the Mermaid graph in the UI.
+     * @param {object|null} graphData - The graph data object, or null.
+     */
     async function renderMermaidGraphUI(graphData) {
         if (typeof mermaid === 'undefined') {
             mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder error'><i class='fas fa-exclamation-triangle'></i><p>Mermaid.js library not loaded.</p><p>Cannot render graph visualization.</p></div>";
             return;
         }
-
         const definition = generateMermaidDefinition(graphData);
-
         if (!graphData) {
             try {
                 mermaidDagContainer.classList.add('rendering-placeholder');
@@ -480,7 +459,6 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             return;
         }
-
         mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder loading'><i class='fas fa-spinner fa-spin'></i><p>Rendering graph...</p></div>";
         try {
             if (graphDagViewContent.offsetParent === null) {
@@ -492,41 +470,36 @@ document.addEventListener('DOMContentLoaded', () => {
             if (svgElement) {
                 svgElement.style.cursor = 'grab';
             }
-
         } catch (error) {
             console.error("Mermaid rendering error:", error, "\nProblematic Definition:", definition);
             mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder error'><i class='fas fa-exclamation-triangle'></i><p>Error rendering DAG.</p><p>Check console for details and the problematic definition.</p></div>";
         }
     }
 
-    window.hideConfirmationModal = () => {
-        confirmationModal.style.display = 'none';
-        currentConfirmationContext.graph2ThreadId = null;
-        currentConfirmationContext.confirmationKey = null;
-        currentConfirmationContext.operationId = null;
-        currentConfirmationContext.effectiveNodeId = null;
-        modalPayload.value = '';
-    };
-
+    /**
+     * Shows the confirmation modal with details of the action.
+     * @param {object} details - Details for the confirmation (operationId, path, payload, etc.).
+     * @param {string} graph2ThreadId - The thread ID of the Graph 2 execution.
+     */
     function showConfirmationModal(details, graph2ThreadId) {
+        if (typeof addMessageToChat !== 'function') {
+            console.error('[FATAL] addMessageToChat is not available in showConfirmationModal!'); return;
+        }
         if (!details) {
             console.error("No details provided for confirmation modal.");
             addMessageToChat('System', 'Error: Missing details for confirmation modal.', 'error', 'system');
             return;
         }
-
         currentConfirmationContext.graph2ThreadId = graph2ThreadId;
         currentConfirmationContext.confirmationKey = details.confirmation_key;
         currentConfirmationContext.operationId = details.operationId;
         currentConfirmationContext.effectiveNodeId = details.effective_node_id;
-
         modalTitle.textContent = details.prompt || `Confirm API Call: ${details.operationId}`;
         modalOperationId.textContent = details.operationId || 'N/A';
         modalEffectiveNodeId.textContent = details.effective_node_id || 'N/A';
         modalMethod.textContent = details.method || 'N/A';
         modalPath.textContent = details.path || 'N/A';
         modalGraph2ThreadId.textContent = graph2ThreadId || 'N/A';
-
         let payloadToDisplay = "";
         if (details.payload_to_confirm !== undefined && details.payload_to_confirm !== null) {
             try {
@@ -540,7 +513,78 @@ document.addEventListener('DOMContentLoaded', () => {
         confirmationModal.style.display = 'flex';
     }
 
+
+    // --- Global Assignments & Event Listeners ---
+
+    window.sendMessage = () => {
+        if (typeof addMessageToChat !== 'function') {
+            console.error('[FATAL] addMessageToChat is not available in window.sendMessage!'); return;
+        }
+        const messageText = userInput.value.trim();
+        if (!messageText) return;
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            addMessageToChat('System', 'Not connected. Please wait or try refreshing.', 'error', 'system');
+            return;
+        }
+        addMessageToChat('You', messageText, 'user', 'user_input');
+        ws.send(messageText);
+        userInput.value = '';
+        userInput.style.height = 'auto';
+        updateSendButtonState(true);
+    };
+
+    window.runCurrentWorkflow = () => {
+        if (typeof addMessageToChat !== 'function') {
+            console.error('[FATAL] addMessageToChat is not available in window.runCurrentWorkflow!'); return;
+        }
+        if (!currentGraphData) {
+            addMessageToChat('System', 'No workflow graph loaded to run.', 'error', 'system');
+            return;
+        }
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            addMessageToChat('System', 'Not connected. Cannot run workflow.', 'error', 'system');
+            return;
+        }
+        const command = "run workflow";
+        addMessageToChat('You', command, 'user', 'user_input');
+        ws.send(command);
+        updateSendButtonState(true);
+    };
+
+    window.showGraphTab = (tabName) => {
+        graphJsonViewContent.style.display = 'none';
+        graphDagViewContent.style.display = 'none';
+        graphJsonViewContent.classList.remove('active');
+        graphDagViewContent.classList.remove('active');
+        jsonTabButton.classList.remove('active');
+        dagTabButton.classList.remove('active');
+
+        if (tabName === 'json') {
+            graphJsonViewContent.style.display = 'flex';
+            graphJsonViewContent.classList.add('active');
+            jsonTabButton.classList.add('active');
+        } else if (tabName === 'dag') {
+            graphDagViewContent.style.display = 'flex';
+            graphDagViewContent.classList.add('active');
+            dagTabButton.classList.add('active');
+            renderMermaidGraphUI(currentGraphData);
+        }
+        updateGraphViewEmptyState(!currentGraphData);
+    };
+
+    window.hideConfirmationModal = () => {
+        confirmationModal.style.display = 'none';
+        currentConfirmationContext.graph2ThreadId = null;
+        currentConfirmationContext.confirmationKey = null;
+        currentConfirmationContext.operationId = null;
+        currentConfirmationContext.effectiveNodeId = null;
+        modalPayload.value = '';
+    };
+
     modalConfirmButton.onclick = () => {
+        if (typeof addMessageToChat !== 'function') {
+            console.error('[FATAL] addMessageToChat is not available in modalConfirmButton.onclick!'); return;
+        }
         if (!currentConfirmationContext.graph2ThreadId || !currentConfirmationContext.confirmationKey) {
             addMessageToChat('System', 'Error: Missing context for confirmation. Cannot send resume command.', 'error', 'system');
             hideConfirmationModal();
@@ -561,13 +605,15 @@ document.addEventListener('DOMContentLoaded', () => {
             effectiveNodeId: currentConfirmationContext.effectiveNodeId
         };
         const wsMessage = `resume_exec ${currentConfirmationContext.graph2ThreadId} ${JSON.stringify(resumeData)}`;
-
         addMessageToChat(`You (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Confirming: ${currentConfirmationContext.operationId || 'action'}`, 'user', 'user_input');
         ws.send(wsMessage);
         hideConfirmationModal();
     };
 
     modalCancelButton.onclick = () => {
+        if (typeof addMessageToChat !== 'function') {
+            console.error('[FATAL] addMessageToChat is not available in modalCancelButton.onclick!'); return;
+        }
         if (!currentConfirmationContext.graph2ThreadId || !currentConfirmationContext.confirmationKey) {
             addMessageToChat('System', 'Error: Missing context for cancellation.', 'error', 'system');
             hideConfirmationModal();
@@ -597,43 +643,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
+    // Initial Setup Calls
     showGraphTab('dag');
-    connectWebSocket();
-});
-```
-
-**Key Changes in `addMessageToChat` for Appending:**
-
-1.  **Identify Last Message and Check Conditions:**
-    * It now gets `chatMessagesDiv.lastElementChild`.
-    * `shouldAppend` is set to `true` if:
-        * There is a `lastMessageElement`.
-        * Both the last message and the current message have `sourceGraph === "graph1_planning"`.
-        * Both the last message's type (read from `lastMessageElement.dataset.type`) and the current message's `type` are in a new `appendablePlannerTypes` array (e.g., "status", "intermediate", "info").
-        * The current message `type` is not "final" or "error".
-
-2.  **Extract Plain Text for Appending:**
-    * A new variable `messageContentText` tries to extract a simple string from the `content` (either `content` itself if it's a string, or `content.message`).
-    * If `content.details` exists or if `content` is a more complex object that isn't just a string or `{message: "..."}`, `shouldAppend` is set to `false` to simplify logic and ensure complex data gets a new bubble. This part can be made more sophisticated.
-
-3.  **Append Logic:**
-    * If `shouldAppend` is true, it finds the `.message-content` div within the `lastMessageElement`.
-    * It creates a new `<p>` element, applies some basic Markdown-like formatting to the `messageContentText`, and appends this new paragraph to the `lastContentElement`.
-    * It also updates `lastMessageElement.dataset.type = type;` in case the type changed slightly but was still considered appendable (e.g., from "status" to "info").
-
-4.  **Create New Message Element (Else Block):**
-    * The original logic for creating a new message element is now in the `else` block of the `if (shouldAppend)` condition.
-    * When a new message element is created, it now stores `messageElement.dataset.source = sourceGraph;` and `messageElement.dataset.type = type;`. This is crucial for the next message to be able to check the source and type of this "last message."
-
-5.  **`ws.onmessage` Change for `addMessageToChat`:**
-    * When `graph_update` occurs, it now explicitly calls `addMessageToChat('System', 'Execution graph has been updated.', 'info', 'system');` to log this event, instead of trying to pass the graph object itself to `addMessageToChat`. The graph object is handled separately for display.
-    * For all other messages, the original `messageContent` (which might be an object) is passed to `addMessageToChat`.
-
-**Important Considerations for This Appending Logic:**
-
-* **Simplicity:** This is a basic implementation. More advanced logic might be needed for different sources or types, or to handle HTML content within messages more gracefully when appending.
-* **Definition of "Same Type":** The `appendablePlannerTypes` array defines what's considered "similar enough" to append. This might need adjustment.
-* **Content Complexity:** The current appending logic works best for simple text strings. If "Planner" messages start containing complex HTML or structured data that needs to be preserved distinctly, this appending logic would need to be smarter or disabled for those cases.
-* **User Experience:** While this addresses the visual repetition, observe if appending makes the chat harder to read in other ways (e.g., very long message blocks).
-
-This should give you the appending behavior for sequential "Planner" status messages. Remember to clear your browser cache after updating the scri
+    connectWebSocket(); // This will call addMessageToChat
+}); 
