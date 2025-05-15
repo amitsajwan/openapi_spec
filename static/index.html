@@ -56,7 +56,7 @@
                             </div>
                     </div>
                     <div id="graphJsonViewContent" class="tab-pane">
-                        <pre id="graphJsonViewPre">JSON representation of the graph will appear here.</pre>
+                        <pre id="graphJsonViewPre" class="is-empty">JSON representation of the graph will appear here.</pre>
                     </div>
                 </div>
             </div>
@@ -81,7 +81,7 @@
                 </div>
             </div>
             <div class="modal-actions">
-                <button id="modalCancelButton" class="action-button tertiary-button">Cancel</button> 
+                <button id="modalCancelButton" class="action-button tertiary-button">Cancel</button>
                 <button id="modalConfirmButton" class="action-button primary-button">Confirm & Proceed</button>
             </div>
         </div>
@@ -89,23 +89,24 @@
 
     <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
     <script>
+        // Initialize Mermaid.js
         if (typeof mermaid !== 'undefined') {
-            mermaid.initialize({ 
-                startOnLoad: false, 
-                theme: 'base', // Using 'base' for more CSS control
-                themeVariables: { // Example of customizing base theme
-                    primaryColor: '#f0f2f5',    // Background of nodes (light)
-                    primaryTextColor: '#333',    // Text on nodes
-                    primaryBorderColor: '#007bff',// Border of nodes
-                    lineColor: '#555e68',        // Edge lines
-                    secondaryColor: '#f0f2f5',   // Cluster background (if used)
-                    tertiaryColor: '#fff'        // Actor borders (if used)
+            mermaid.initialize({
+                startOnLoad: false, // We will render manually
+                theme: 'base',      // Using 'base' for more CSS control via style.css
+                themeVariables: {   // These are examples if you want to override base theme directly
+                    primaryColor: 'var(--panel-background-color)', // Example: node background
+                    primaryTextColor: 'var(--text-color)',         // Example: node text
+                    primaryBorderColor: 'var(--primary-color)',    // Example: node border
+                    lineColor: 'var(--text-muted-color)',          // Example: edge lines
+                    secondaryColor: 'var(--background-color)',     // Example: cluster background
+                    tertiaryColor: 'var(--panel-background-color)' // Example: actor borders
                 },
                 fontFamily: '"Inter", sans-serif',
-                securityLevel: 'loose' // Allow HTML in labels if needed for icons, but sanitize carefully
+                securityLevel: 'loose' // Allow HTML in labels for icons, but ensure content is sanitized if from user
             });
         } else {
-            console.error("Mermaid.js library not loaded.");
+            console.error("Mermaid.js library not loaded. Graph visualization will not work.");
         }
     </script>
     <script src="/static/script.js"></script>
