@@ -1,32 +1,30 @@
 # main.py
 import logging
 import uuid
-# import json # Not directly used here, but often useful
 import os
 import sys
 import asyncio
-from typing import Any, Dict, Optional # Removed Callable, Awaitable, Literal as they are not directly used here
+from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, WebSocket # WebSocketDisconnect also imported but not directly used
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi import FastAPI, WebSocket
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-# from starlette.websockets import WebSocketState # Not directly used here
 
 # Models and Core Components
-# from models import BotState, GraphOutput as PlanSchema, ExecutionGraphState # Not directly used here
+from models import APIExecutor # Ensure APIExecutor is imported
 from graph import build_graph
-from llm_config import initialize_llms # Now returns three LLMs
-from execution_graph_definition import ExecutionGraphDefinition # For type hinting if needed
-from execution_manager import GraphExecutionManager # For type hinting if needed
-from api_executor import APIExecutor as UserAPIExecutor
-from utils import SCHEMA_CACHE
+from llm_config import initialize_llms
+from execution_graph_definition import ExecutionGraphDefinition # For type hinting
+from execution_manager import GraphExecutionManager # For type hinting
+# from api_executor import APIExecutor as UserAPIExecutor # Already imported as APIExecutor
+from utils import SCHEMA_CACHE # For shutdown
 
 # Refactored WebSocket handling logic
-from websocket_helpers import handle_websocket_connection, send_websocket_message_helper
+from websocket_helpers import handle_websocket_connection #, send_websocket_message_helper (not used directly in main)
 
 # --- Logging Configuration ---
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(), # Allow configuring log level via ENV
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
     stream=sys.stdout,
     format='%(asctime)s - %(name)s - %(levelname)s - %(threadName)s - %(message)s'
 )
@@ -37,13 +35,14 @@ app = FastAPI()
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 if not os.path.exists(STATIC_DIR):
     logger.warning(f"Static directory {STATIC_DIR} does not exist. Frontend might not load.")
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+else:
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # --- Global Application State ---
 langgraph_planning_app: Optional[Any] = None
-api_executor_instance: Optional[UserAPIExecutor] = None
-# No need to store utility_llm globally if it's only passed down once at startup
+api_executor_instance: Optional[APIExecutor] = None # Use the imported APIExecutor
 
+# These dictionaries track single Graph 2 instances, not load test workers directly
 active_graph2_executors: Dict[str, GraphExecutionManager] = {}
 active_graph2_definitions: Dict[str, ExecutionGraphDefinition] = {}
 
@@ -55,25 +54,24 @@ async def startup_event():
     global langgraph_planning_app, api_executor_instance
     logger.info("FastAPI application startup...")
     try:
-        # initialize_llms now returns router_llm, worker_llm, utility_llm
         router_llm, worker_llm, utility_llm = initialize_llms()
-        
-        api_executor_instance = UserAPIExecutor(
+
+        api_executor_instance = APIExecutor( # Use the imported APIExecutor
             base_url=os.getenv("DEFAULT_API_BASE_URL", None),
             timeout=float(os.getenv("API_TIMEOUT", "30.0"))
         )
-        
-        # Pass all three LLMs to build_graph
+
         langgraph_planning_app = build_graph(
             router_llm=router_llm,
             worker_llm=worker_llm,
-            utility_llm=utility_llm, # New utility LLM
-            api_executor_instance=api_executor_instance,
-            checkpointer=None # No checkpointer for Graph 1 state persistence
+            utility_llm=utility_llm,
+            api_executor_instance=api_executor_instance, # Pass the created instance
+            checkpointer=None # No checkpointer for Graph 1 state persistence in this setup
         )
-        logger.info("Main Planning LangGraph (Graph 1) built successfully with all LLMs.")
+        logger.info("Main Planning LangGraph (Graph 1) built successfully.")
     except Exception as e:
         logger.critical(f"CRITICAL FAILURE during application startup: {e}", exc_info=True)
+        # Ensure these are None if startup fails, so WebSocket handler knows
         langgraph_planning_app = None
         api_executor_instance = None
 
@@ -86,19 +84,27 @@ async def shutdown_event():
         if asyncio.iscoroutinefunction(getattr(api_executor_instance, 'close')):
             await api_executor_instance.close()
         else:
+            # This path might not be hit if close is always async, but good for robustness
             getattr(api_executor_instance, 'close')() # type: ignore
         logger.info("APIExecutor closed.")
-    if SCHEMA_CACHE:
-        SCHEMA_CACHE.close()
-        logger.info("Schema cache closed.")
-    
-    logger.info(f"Cleaning up {len(active_graph2_executors)} active Graph 2 executors (if any)...")
+
+    if SCHEMA_CACHE and hasattr(SCHEMA_CACHE, 'close'): # Check if SCHEMA_CACHE is not None and has close
+        try:
+            SCHEMA_CACHE.close() # For diskcache or similar
+            logger.info("Schema cache closed.")
+        except Exception as e_cache_close:
+            logger.warning(f"Error closing schema cache: {e_cache_close}")
+
+
+    logger.info(f"Cleaning up {len(active_graph2_executors)} active single Graph 2 executors (if any)...")
+    # This cleans up single G2 instances, load test workers are managed by the orchestrator
     for exec_id, executor in list(active_graph2_executors.items()):
-        logger.info(f"Potentially cleaning up executor for G2_Thread_ID: {exec_id}")
-        # Add executor.cleanup() or similar if GraphExecutionManager needs explicit cleanup
+        logger.info(f"Potentially cleaning up single G2 executor for G2_Thread_ID: {exec_id}")
+        # If GraphExecutionManager has a cleanup method, call it here
+        # e.g., if executor.cleanup(): await executor.cleanup()
         active_graph2_executors.pop(exec_id, None)
-        active_graph2_definitions.pop(exec_id, None)
-    logger.info("Graph 2 executor cleanup attempt complete.")
+        active_graph2_definitions.pop(exec_id, None) # Also clear its definition
+    logger.info("Single Graph 2 executor cleanup attempt complete.")
 
 
 # --- WebSocket Endpoint ---
@@ -106,27 +112,28 @@ async def shutdown_event():
 async def websocket_endpoint(websocket: WebSocket):
     """Handles new WebSocket connections for the OpenAPI agent."""
     await websocket.accept()
-    session_id = str(uuid.uuid4()) 
-    logger.info(f"WebSocket connection accepted. Assigned Session ID (Graph 1): {session_id}")
+    # G1 session ID, distinct from any G2 thread IDs
+    g1_session_id = str(uuid.uuid4())
+    logger.info(f"WebSocket connection accepted. Assigned G1 Session ID: {g1_session_id}")
 
     if not langgraph_planning_app or not api_executor_instance:
         logger.error(
-            f"[{session_id}] Cannot handle WebSocket connection: Backend services are not initialized."
+            f"[{g1_session_id}] Cannot handle WebSocket connection: Backend services (Planning Graph or API Executor) are not initialized."
         )
-        # Use the imported send_websocket_message_helper
-        await send_websocket_message_helper(
-            websocket=websocket,
-            msg_type="error",
-            content={"error": "Backend services are not initialized. Please try again later or contact support."},
-            session_id=session_id,
-            source_graph="system_critical"
-        )
-        await websocket.close(code=1011) 
+        # Use a simple send_json here as send_websocket_message_helper is in websocket_helpers
+        await websocket.send_json({
+            "type": "error",
+            "source": "system_critical",
+            "content": {"error": "Backend services are not initialized. Please try again later or contact support."},
+            "session_id": g1_session_id,
+        })
+        await websocket.close(code=1011) # Internal Error
         return
 
+    # Pass the global dictionaries for single G2 instance management
     await handle_websocket_connection(
         websocket=websocket,
-        session_id=session_id,
+        session_id=g1_session_id, # This is the G1 session ID
         langgraph_planning_app=langgraph_planning_app,
         api_executor_instance=api_executor_instance,
         active_graph2_executors=active_graph2_executors,
@@ -152,5 +159,5 @@ async def get_index_page():
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting Uvicorn server for local development...")
-    # Ensure the app is run as "main:app" where "main" is the filename and "app" is the FastAPI instance.
+    # Standard way to run Uvicorn for FastAPI
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
