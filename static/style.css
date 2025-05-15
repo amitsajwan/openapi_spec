@@ -1,643 +1,542 @@
-/* General Body and Font Styles */
-:root {
-    --primary-color: #007AFF; /* A vibrant, modern blue */
-    --primary-hover-color: #0056b3;
-    --primary-light-color: #e7f3ff;
+// OpenAPI Agent script.js
 
-    --secondary-color: #6c757d; /* Cool Gray */
-    --secondary-hover-color: #545b62;
+document.addEventListener('DOMContentLoaded', () => {
+    // DOM Elements
+    const chatMessagesDiv = document.getElementById('chatMessages');
+    const userInput = document.getElementById('userInput');
+    const sendButton = document.getElementById('sendButton');
+    // Spinner is now part of sendButton's dynamic HTML
+    const runWorkflowButton = document.getElementById('runWorkflowButton');
 
-    --accent-color: #17a2b8; /* Teal/Cyan for accents */
-    --success-color: #28a745; 
-    --error-color: #dc3545;   
-    --warning-color: #ffc107; 
-    --info-color: #17a2b8;    
+    const graphJsonViewPre = document.getElementById('graphJsonViewPre');
+    const mermaidDagContainer = document.getElementById('mermaidDagDiagram');
+    const jsonTabButton = document.getElementById('jsonTabButton');
+    const dagTabButton = document.getElementById('dagTabButton');
+    const graphJsonViewContent = document.getElementById('graphJsonViewContent');
+    const graphDagViewContent = document.getElementById('graphDagViewContent');
 
-    --background-color: #f0f4f8; /* Softer, slightly bluish background */
-    --panel-background-color: #ffffff;
-    --text-color: #2c3e50; /* Darker, more professional text */
-    --text-muted-color: #7f8c8d; /* Softer muted text */
-    --border-color: #e0e6ed; /* Softer border */
-    --input-border-color: #ced4da;
+    // Modal Elements
+    const confirmationModal = document.getElementById('confirmationModal');
+    const modalTitle = document.getElementById('modalTitle');
+    const modalOperationId = document.getElementById('modalOperationId');
+    const modalEffectiveNodeId = document.getElementById('modalEffectiveNodeId'); 
+    const modalMethod = document.getElementById('modalMethod');
+    const modalPath = document.getElementById('modalPath');
+    const modalGraph2ThreadId = document.getElementById('modalGraph2ThreadId'); 
+    const modalPayload = document.getElementById('modalPayload');
+    const modalConfirmButton = document.getElementById('modalConfirmButton');
+    const modalCancelButton = document.getElementById('modalCancelButton');
+
+    let ws;
+    let currentGraphData = null;
+    const initialSendButtonHTML = sendButton.innerHTML; 
+
+    let currentConfirmationContext = {
+        graph2ThreadId: null,
+        confirmationKey: null,
+        operationId: null, 
+        effectiveNodeId: null 
+    };
+
+    function updateSendButtonState(isThinking) {
+        if (isThinking) {
+            sendButton.classList.add('thinking');
+            sendButton.innerHTML = `<div class="spinner" style="display: inline-block;"></div> Thinking...`; 
+            sendButton.disabled = true;
+            userInput.disabled = true;
+        } else {
+            sendButton.classList.remove('thinking');
+            sendButton.innerHTML = initialSendButtonHTML; 
+            sendButton.disabled = false;
+            userInput.disabled = false;
+        }
+        runWorkflowButton.disabled = isThinking || !currentGraphData;
+    }
+
+
+    function escapeHtml(unsafe) {
+        if (typeof unsafe !== 'string') {
+            if (unsafe === null || unsafe === undefined) return '';
+            try { 
+                return JSON.stringify(unsafe, null, 2); 
+            } catch (e) { 
+                return String(unsafe); 
+            }
+        }
+        return unsafe
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
+
+    function addMessageToChat(sender, content, type, sourceGraph = "graph1_planning") {
+        const messageElement = document.createElement('div');
+        let senderClass = 'agent-message'; 
+        let senderName = sender;
+
+        if (sender === 'You') {
+            senderClass = 'user-message';
+        } else if (sourceGraph === "graph2_execution") {
+            senderClass = 'workflow-message'; 
+            senderName = `Workflow (${type})`; 
+        } else if (sourceGraph === "system" || sender === "System") {
+            senderClass = 'system-message';
+            senderName = 'System';
+        } else if (sender === 'Planner' || sourceGraph === 'graph1_planning') { // Catch all planner messages
+            senderClass = 'planner-message';
+            senderName = 'Planner'; // Standardize sender name for planner
+        }
+        
+        messageElement.classList.add('message', senderClass);
+        if (chatMessagesDiv.children.length > 1) { 
+             setTimeout(() => messageElement.classList.add('new-message-animation'), 50);
+        }
+
+        const senderElement = document.createElement('div');
+        senderElement.classList.add('message-sender');
+        senderElement.textContent = senderName;
+
+        const contentElement = document.createElement('div');
+        contentElement.classList.add('message-content');
+
+        // Original content formatting logic (before error handling)
+        if (typeof content === 'string') {
+            let formattedContent = content.replace(/```([\s\S]*?)```/g, (match, code) => {
+                return `<pre><code>${escapeHtml(code.trim())}</code></pre>`;
+            });
+            formattedContent = formattedContent.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+            formattedContent = formattedContent.replace(/\*(.*?)\*/g, '<em>$1</em>');
+            formattedContent = formattedContent.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+            contentElement.innerHTML = formattedContent.split('\n').map(line => `<p>${line}</p>`).join('');
+        } else if (typeof content === 'object' && content !== null) {
+            if (sourceGraph === "graph2_execution") {
+                 let detailsHtml = "";
+                 if (content.node_name) detailsHtml += `<strong>Node:</strong> ${escapeHtml(content.node_name)}<br>`;
+                 if (content.input_preview) detailsHtml += `Input Preview: <pre>${escapeHtml(content.input_preview)}</pre>`;
+                 if (content.status_code) detailsHtml += `Status: <span class="status-code status-${String(content.status_code).charAt(0)}xx">${escapeHtml(content.status_code)}</span> `;
+                 if (content.execution_time) detailsHtml += `(Took: ${escapeHtml(content.execution_time)}s)<br>`;
+                 if (content.response_preview) detailsHtml += `Response Preview: <pre>${escapeHtml(content.response_preview)}</pre>`;
+                 if (content.raw_output_from_node && type === "tool_end") { 
+                    detailsHtml += `Raw Output (State Update): <pre>${escapeHtml(content.raw_output_from_node)}</pre>`;
+                 }
+                 if (content.error) detailsHtml += `<strong style="color: var(--error-color);">Error:</strong> <pre>${escapeHtml(content.error)}</pre>`;
+                 
+                 if (content.message && (type === "execution_completed" || type === "execution_failed" || type === "workflow_timeout" || type === "info" || type === "error" )) {
+                    detailsHtml += `<p>${escapeHtml(content.message)}</p>`;
+                 }
+                 if (content.final_state && (type === "execution_completed" || type === "execution_failed")) {
+                    detailsHtml += `Final State (details): <pre>${escapeHtml(content.final_state)}</pre>`;
+                 }
+                 contentElement.innerHTML = detailsHtml || `<pre>${escapeHtml(content)}</pre>`; 
+            } else if (content.message) { // For planner or other object messages with a 'message' field
+                contentElement.innerHTML = `<p>${escapeHtml(content.message)}</p>`;
+                 if (content.details) { 
+                    contentElement.innerHTML += `<pre>${escapeHtml(content.details)}</pre>`;
+                 }
+            } else { // Fallback for other objects
+                contentElement.innerHTML = `<pre>${escapeHtml(content)}</pre>`;
+            }
+        } else {
+             contentElement.innerHTML = `<p>${escapeHtml(String(content))}</p>`;
+        }
+        
+        // Apply error styling based on type and source
+        if (type === 'error' || (typeof content === 'object' && content && content.error)) {
+            if (sourceGraph === 'graph1_planning') { // Planner-specific error handling
+                let errorPrefix = `<strong style="color: var(--error-color); font-weight: bold;">Planner Alert:</strong> `;
+                let currentContent = contentElement.innerHTML; // Get already formatted content
+
+                if (typeof content === 'object' && content.error) {
+                    // If error is in a sub-field, ensure it's displayed prominently
+                    contentElement.innerHTML = errorPrefix + `<pre>${escapeHtml(content.error)}</pre>`;
+                     if (content.message && content.message !== content.error) { // Add original message if different
+                        contentElement.innerHTML += `<p><em>Original message: ${escapeHtml(content.message)}</em></p>`;
+                    }
+                } else { // Error message is the main content (already formatted)
+                     contentElement.innerHTML = errorPrefix + currentContent;
+                }
+                // No 'error-message' class for background, relies on planner-message style
+            } else {
+                // For other sources (system, workflow), apply the full error styling (red background)
+                messageElement.classList.add('error-message');
+            }
+        }
+        
+        messageElement.appendChild(senderElement);
+        messageElement.appendChild(contentElement);
+        chatMessagesDiv.appendChild(messageElement);
+        chatMessagesDiv.scrollTop = chatMessagesDiv.scrollHeight;
+    }
+
+    function connectWebSocket() {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws/openapi_agent`;
+        
+        addMessageToChat('System', `Attempting to connect to ${wsUrl}...`, 'system', 'system');
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+            addMessageToChat('System', 'Successfully connected to the agent.', 'system', 'system');
+            updateSendButtonState(false);
+            runWorkflowButton.disabled = true; 
+            updateGraphViewEmptyState(true); 
+        };
+
+        ws.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                console.log("WS RX:", data); 
+                updateSendButtonState(false); 
+
+                let sender = 'Agent'; 
+                let messageContent = data.content;
+                let messageType = data.type; 
+                let sourceGraph = data.source || "unknown_source";
+
+                if (sourceGraph === 'graph1_planning') {
+                    sender = 'Planner'; // This will be used by addMessageToChat
+                    if (data.type === "graph_update") {
+                        currentGraphData = data.content;
+                        graphJsonViewPre.textContent = JSON.stringify(currentGraphData, null, 2);
+                        addMessageToChat('System', 'Execution graph has been updated.', 'system', 'system');
+                        updateGraphViewEmptyState(false); 
+                        if (graphDagViewContent.classList.contains('active')) {
+                            renderMermaidGraphUI(currentGraphData);
+                        }
+                        runWorkflowButton.disabled = !currentGraphData; 
+                        return; 
+                    }
+                    // For graph1, content can be {message: "..."} or a direct string if error
+                    messageContent = (typeof data.content === 'object' && data.content !== null && data.content.message) ? data.content.message : data.content;
+                     if (typeof data.content === 'object' && data.content !== null && data.content.error && !messageContent){
+                        messageContent = data.content.error; // If error is the primary content
+                    }
+
+                } else if (sourceGraph === 'graph2_execution') {
+                    // Sender name will be derived from type in addMessageToChat
+                    // messageContent is already data.content
+                    if (data.type === "execution_completed" || data.type === "execution_failed" || data.type === "workflow_timeout") {
+                        runWorkflowButton.disabled = !currentGraphData; 
+                    }
+                     if (data.type === "human_intervention_required") {
+                        showConfirmationModal(data.content.details_for_ui, data.graph2_thread_id);
+                        addMessageToChat(
+                            `Workflow (${data.content.node_name || 'N/A'})`, 
+                            `Paused. Requires confirmation for operation: ${data.content.details_for_ui.operationId}. Please use the modal.`,
+                            'human_intervention_required', 
+                            sourceGraph 
+                        );
+                        return; 
+                    }
+                } else if (sourceGraph === 'system' || sourceGraph === 'system_error' || sourceGraph === 'system_warning') {
+                    sender = 'System';
+                    messageContent = data.content.error || data.content.message || data.content;
+                }
+                addMessageToChat(sender, messageContent, messageType, sourceGraph);
+
+            } catch (error) {
+                console.error("Error processing WebSocket message:", error, "Raw data:", event.data);
+                addMessageToChat('System', 'Error processing message from server. Check console.', 'error', 'system');
+                updateSendButtonState(false);
+            }
+        };
+
+        ws.onerror = (error) => {
+            console.error('WebSocket Error:', error);
+            addMessageToChat('System', 'WebSocket connection error. Check console.', 'error', 'system');
+            updateSendButtonState(false);
+            runWorkflowButton.disabled = true;
+        };
+
+        ws.onclose = (event) => {
+            addMessageToChat('System', `WebSocket disconnected. Code: ${event.code}. Attempting to reconnect in 5 seconds...`, 'system', 'system');
+            updateSendButtonState(false);
+            runWorkflowButton.disabled = true;
+            setTimeout(connectWebSocket, 5000);
+        };
+    }
+
+    window.sendMessage = () => {
+        const messageText = userInput.value.trim();
+        if (!messageText) return;
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            addMessageToChat('System', 'Not connected. Please wait or try refreshing.', 'error', 'system');
+            return;
+        }
+        addMessageToChat('You', messageText, 'user', 'user_input'); 
+        ws.send(messageText);
+        userInput.value = '';
+        userInput.style.height = 'auto'; 
+        updateSendButtonState(true); 
+    };
+
+    window.runCurrentWorkflow = () => {
+        if (!currentGraphData) {
+            addMessageToChat('System', 'No workflow graph loaded to run.', 'error', 'system');
+            return;
+        }
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            addMessageToChat('System', 'Not connected. Cannot run workflow.', 'error', 'system');
+            return;
+        }
+        const command = "run workflow"; 
+        addMessageToChat('You', command, 'user', 'user_input');
+        ws.send(command);
+        addMessageToChat('System', "Requesting to run the current workflow...", 'status', 'system');
+        updateSendButtonState(true); 
+        runWorkflowButton.disabled = true; 
+    };
+
+    function updateGraphViewEmptyState(isEmpty) {
+        const dagTabPane = graphDagViewContent; 
+        const jsonTabPane = graphJsonViewContent;
+
+        if (isEmpty) {
+            dagTabPane.classList.add('is-empty');
+            jsonTabPane.classList.add('is-empty');
+            graphJsonViewPre.textContent = "JSON representation of the graph will appear here once a plan is generated.";
+            renderMermaidGraphUI(null); 
+        } else {
+            dagTabPane.classList.remove('is-empty');
+            jsonTabPane.classList.remove('is-empty');
+        }
+    }
+
+
+    window.showGraphTab = (tabName) => {
+        graphJsonViewContent.style.display = 'none';
+        graphDagViewContent.style.display = 'none';
+        graphJsonViewContent.classList.remove('active');
+        graphDagViewContent.classList.remove('active');
+        jsonTabButton.classList.remove('active');
+        dagTabButton.classList.remove('active');
+
+        if (tabName === 'json') {
+            graphJsonViewContent.style.display = 'flex'; 
+            graphJsonViewContent.classList.add('active');
+            jsonTabButton.classList.add('active');
+        } else if (tabName === 'dag') {
+            graphDagViewContent.style.display = 'flex'; 
+            graphDagViewContent.classList.add('active');
+            dagTabButton.classList.add('active');
+            renderMermaidGraphUI(currentGraphData); 
+        }
+        updateGraphViewEmptyState(!currentGraphData);
+    };
+
+    function generateMermaidDefinition(graph) {
+        const emptyFill = '#fcfcfc'; 
+        const emptyStroke = '#e0e0e0'; 
+        const emptyColor = '#7f8c8d'; 
+
+        const defaultNodeFill = '#ECEFF1'; 
+        const defaultNodeStroke = '#90A4AE'; 
+        const defaultNodeTextColor = '#37474F'; 
+        
+        const startEndFill = '#546E7A';
+        const startEndStroke = '#37474F';
+        const apiNodeFill = '#007AFF'; 
+        const apiNodeStroke = '#0056b3'; 
+        const confirmedNodeFill = '#28a745'; 
+        const confirmedNodeStroke = '#1E8E3E';
+        const skippedNodeFill = '#ffc107'; 
+        const skippedNodeStroke = '#F57F17';
+        const skippedNodeTextColor = '#212121';
+        const errorNodeFill = '#dc3545'; 
+        const errorNodeStroke = '#B71C1C';
+        const interruptNodeFill = '#17a2b8'; 
+        const interruptNodeStroke = '#0D8A9F';
+
+        if (!graph || !graph.nodes || !graph.edges) {
+            return `graph TD\n    empty[<i class='fas fa-drafting-compass icon-placeholder'></i><br/>No Workflow Graph Available<br/><small>Please provide an OpenAPI specification and define a goal to generate a visual workflow.</small>];\n    classDef empty fill:${emptyFill},stroke:${emptyStroke},color:${emptyColor},padding:30px,font-style:italic,text-align:center,rx:12px,ry:12px,font-size:14px,border-width:1px,border-style:dashed;`;
+        }
+        
+        let def = "graph TD;\n";
+        def += `    classDef default fill:${defaultNodeFill},stroke:${defaultNodeStroke},stroke-width:1.5px,color:${defaultNodeTextColor},rx:6px,ry:6px,padding:10px 15px,font-size:13px,font-family:'Inter';\n`; 
+        def += `    classDef startEnd fill:${startEndFill},stroke:${startEndStroke},color:white,font-weight:bold;\n`;
+        def += `    classDef apiNode fill:${apiNodeFill},stroke:${apiNodeStroke},color:white;\n`;
+        def += `    classDef confirmedNode fill:${confirmedNodeFill},stroke:${confirmedNodeStroke},color:white;\n`; 
+        def += `    classDef skippedNode fill:${skippedNodeFill},stroke:${skippedNodeStroke},color:${skippedNodeTextColor};\n`;
+        def += `    classDef errorNode fill:${errorNodeFill},stroke:${errorNodeStroke},color:white;\n`; 
+        def += `    classDef interruptNode fill:${interruptNodeFill},stroke:${interruptNodeStroke},color:white;\n`; 
+
+        const sanitizeId = (id) => String(id).replace(/[^a-zA-Z0-9_]/g, '_');
+
+        graph.nodes.forEach(node => {
+            const id = sanitizeId(node.effective_id || node.operationId);
+            let labelText = node.summary || node.operationId;
+            if (node.summary && node.summary !== node.operationId && node.operationId !== "START_NODE" && node.operationId !== "END_NODE") {
+                labelText = `${escapeHtml(node.summary)}<br/><small>(${escapeHtml(node.operationId)} / ${escapeHtml(node.effective_id)})</small>`;
+            } else {
+                labelText = `<b>${escapeHtml(node.operationId)}</b><br/><small>(${escapeHtml(node.effective_id)})</small>`;
+            }
+            
+            def += `    ${id}("${labelText.replace(/"/g, '#quot;')}");\n`; 
+             
+            let nodeClass = 'apiNode'; 
+            if (node.operationId === "START_NODE" || node.operationId === "END_NODE") {
+                nodeClass = 'startEnd';
+            } else if (node.requires_confirmation) { 
+                 nodeClass = 'interruptNode';
+            }
+            def += `    class ${id} ${nodeClass};\n`; 
+        });
+
+        graph.edges.forEach(edge => {
+            const from = sanitizeId(edge.from_node);
+            const to = sanitizeId(edge.to_node);
+            const label = edge.description ? `|"${escapeHtml(edge.description.substring(0, 50)).replace(/"/g, '#quot;')}"|` : "";
+            def += `    ${from} -->${label} ${to};\n`;
+        });
+        return def;
+    }
+
+    async function renderMermaidGraphUI(graphData) {
+        if (typeof mermaid === 'undefined') {
+            mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder error'><i class='fas fa-exclamation-triangle'></i><p>Mermaid.js library not loaded.</p><p>Cannot render graph visualization.</p></div>";
+            return;
+        }
+        
+        const definition = generateMermaidDefinition(graphData);
+
+        if (!graphData) {
+            try {
+                mermaidDagContainer.classList.add('rendering-placeholder');
+                const { svg } = await mermaid.render('mermaidGeneratedSvgPlaceholder', definition);
+                mermaidDagContainer.innerHTML = svg;
+                mermaidDagContainer.classList.remove('rendering-placeholder');
+                const placeholderSvg = mermaidDagContainer.querySelector('svg');
+                if(placeholderSvg) {
+                    placeholderSvg.style.maxWidth = '350px'; 
+                    placeholderSvg.style.maxHeight = '250px';
+                    placeholderSvg.style.margin = 'auto'; 
+                }
+            } catch (error) {
+                 console.error("Mermaid rendering error for placeholder:", error, "\nDefinition:", definition);
+                 mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder error'><i class='fas fa-exclamation-triangle'></i><p>Error rendering placeholder.</p><p>Check console for details.</p></div>";
+            }
+            return;
+        }
+
+        mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder loading'><i class='fas fa-spinner fa-spin'></i><p>Rendering graph...</p></div>"; 
+        try {
+            if (graphDagViewContent.offsetParent === null) { 
+                console.warn("Mermaid container is hidden, rendering might be suboptimal. Ensure tab is active.");
+            }
+            const { svg } = await mermaid.render('mermaidGeneratedSvg', definition);
+            mermaidDagContainer.innerHTML = svg;
+            const svgElement = mermaidDagContainer.querySelector('svg');
+            if (svgElement) {
+                svgElement.style.cursor = 'grab';
+            }
+
+        } catch (error) {
+            console.error("Mermaid rendering error:", error, "\nDefinition:", definition);
+            mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder error'><i class='fas fa-exclamation-triangle'></i><p>Error rendering DAG.</p><p>Check console for details.</p></div>";
+        }
+    }
     
-    --header-bg: #ffffff; /* White header for a cleaner look */
-    --header-text-color: var(--primary-color);
-    --header-icon-color: var(--primary-color);
-    --header-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    window.hideConfirmationModal = () => { 
+        confirmationModal.style.display = 'none';
+        currentConfirmationContext.graph2ThreadId = null;
+        currentConfirmationContext.confirmationKey = null;
+        currentConfirmationContext.operationId = null;
+        currentConfirmationContext.effectiveNodeId = null;
+        modalPayload.value = ''; 
+    };
 
+    function showConfirmationModal(details, graph2ThreadId) { 
+        if (!details) {
+            console.error("No details provided for confirmation modal.");
+            addMessageToChat('System', 'Error: Missing details for confirmation modal.', 'error', 'system');
+            return;
+        }
+        
+        currentConfirmationContext.graph2ThreadId = graph2ThreadId;
+        currentConfirmationContext.confirmationKey = details.confirmation_key;
+        currentConfirmationContext.operationId = details.operationId;
+        currentConfirmationContext.effectiveNodeId = details.effective_node_id;
 
-    --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-    --code-font-family: 'SF Mono', Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+        modalTitle.textContent = details.prompt || `Confirm API Call: ${details.operationId}`;
+        modalOperationId.textContent = details.operationId || 'N/A';
+        modalEffectiveNodeId.textContent = details.effective_node_id || 'N/A';
+        modalMethod.textContent = details.method || 'N/A';
+        modalPath.textContent = details.path || 'N/A'; 
+        modalGraph2ThreadId.textContent = graph2ThreadId || 'N/A';
 
-    --border-radius-sm: 6px; 
-    --border-radius-md: 8px;  
-    --border-radius-lg: 12px; 
+        let payloadToDisplay = "";
+        if (details.payload_to_confirm !== undefined && details.payload_to_confirm !== null) {
+            try {
+                payloadToDisplay = JSON.stringify(details.payload_to_confirm, null, 2);
+            } catch (e) {
+                payloadToDisplay = "Error: Could not format payload.";
+                console.error("Error stringifying payload_to_confirm:", details.payload_to_confirm, e);
+            }
+        }
+        modalPayload.value = payloadToDisplay;
+        confirmationModal.style.display = 'flex';
+    }
 
-    --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.04);
-    --shadow-md: 0 5px 15px rgba(0, 0, 0, 0.07);
-    --shadow-lg: 0 10px 25px rgba(0, 0, 0, 0.1);
-}
+    modalConfirmButton.onclick = () => {
+        if (!currentConfirmationContext.graph2ThreadId || !currentConfirmationContext.confirmationKey) {
+            addMessageToChat('System', 'Error: Missing context for confirmation. Cannot send resume command.', 'error', 'system');
+            hideConfirmationModal();
+            return;
+        }
+        let parsedPayload;
+        try {
+            parsedPayload = modalPayload.value.trim() === "" ? {} : JSON.parse(modalPayload.value);
+        } catch (e) {
+            alert('Invalid JSON in payload textarea: ' + e.message);
+            return;
+        }
+        const resumeData = {
+            confirmation_key: currentConfirmationContext.confirmationKey,
+            decision: true,
+            modified_payload: parsedPayload,
+            operationId: currentConfirmationContext.operationId, 
+            effectiveNodeId: currentConfirmationContext.effectiveNodeId
+        };
+        const wsMessage = `resume_exec ${currentConfirmationContext.graph2ThreadId} ${JSON.stringify(resumeData)}`;
+        addMessageToChat(`You (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Confirming: ${currentConfirmationContext.operationId || 'action'}`, 'user', 'user_input');
+        ws.send(wsMessage);
+        addMessageToChat(`System (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Confirmation sent for ${currentConfirmationContext.effectiveNodeId}. Resuming...`, 'status', 'system');
+        hideConfirmationModal();
+        updateSendButtonState(true); 
+    };
 
-body {
-    font-family: var(--font-family);
-    margin: 0;
-    background-color: var(--background-color);
-    color: var(--text-color);
-    display: flex;
-    flex-direction: column;
-    height: 100vh;
-    line-height: 1.6;
-    font-size: 15px; /* Base font size */
-    overflow: hidden; 
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-}
+    modalCancelButton.onclick = () => {
+        if (!currentConfirmationContext.graph2ThreadId || !currentConfirmationContext.confirmationKey) {
+            addMessageToChat('System', 'Error: Missing context for cancellation.', 'error', 'system');
+            hideConfirmationModal();
+            return;
+        }
+        const resumeData = {
+            confirmation_key: currentConfirmationContext.confirmationKey,
+            decision: false, 
+            operationId: currentConfirmationContext.operationId,
+            effectiveNodeId: currentConfirmationContext.effectiveNodeId
+        };
+        const wsMessage = `resume_exec ${currentConfirmationContext.graph2ThreadId} ${JSON.stringify(resumeData)}`;
+        addMessageToChat(`You (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Cancelling confirmation for: ${currentConfirmationContext.operationId || 'action'}.`, 'user', 'user_input');
+        ws.send(wsMessage);
+        addMessageToChat(`System (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Cancellation sent for ${currentConfirmationContext.effectiveNodeId}.`, 'status', 'system');
+        hideConfirmationModal();
+    };
 
-.app-container {
-    display: flex;
-    flex-direction: column;
-    height: 100%;
-}
-
-.app-header {
-    background: var(--header-bg);
-    color: var(--header-text-color);
-    padding: 0.9rem 1.75rem; 
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    box-shadow: var(--header-shadow);
-    border-bottom: 1px solid var(--border-color);
-    flex-shrink: 0;
-    z-index: 100;
-}
-
-.app-header .logo-title {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-}
-.app-header .header-icon {
-    font-size: 1.6em; /* Slightly larger icon */
-    color: var(--header-icon-color);
-}
-.app-header h1 {
-    margin: 0;
-    font-size: 1.35em; 
-    font-weight: 600;
-}
-
-.main-content {
-    display: flex;
-    flex-grow: 1;
-    overflow: hidden;
-    padding: 1.25rem; 
-    gap: 1.25rem;
-}
-
-/* Panel Containers */
-.chat-panel-container,
-.graph-details-panel-container {
-    display: flex;
-    flex-direction: column;
-    background-color: var(--panel-background-color);
-    border-radius: var(--border-radius-lg);
-    box-shadow: var(--shadow-md);
-    overflow: hidden; /* Important for internal scrolling */
-}
-
-.chat-panel-container {
-    flex: 1 1 38%; /* Slightly less for chat */
-    min-width: 340px; 
-}
-
-.graph-details-panel-container {
-    flex: 1 1 62%; /* Slightly more for graph */
-    min-width: 480px;
-}
-
-.graph-view-panel {
-    padding: 1.25rem;
-    flex-grow: 1; 
-    display: flex;
-    flex-direction: column;
-}
-
-.panel-header { /* New class for graph panel header */
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 1rem;
-    padding-bottom: 0.75rem;
-    border-bottom: 1px solid var(--border-color);
-}
-
-.graph-view-panel h2 {
-    margin: 0; /* Removed from h2, handled by panel-header */
-    color: var(--text-color); 
-    font-size: 1.15em; /* Adjusted size */
-    font-weight: 600;
-}
-
-/* Tab Controls */
-.tab-controls {
-    display: flex;
-    /* margin-bottom: 1rem; */ /* Handled by panel-header */
-    /* border-bottom: 1px solid var(--border-color); */ /* Handled by panel-header */
-}
-
-.tab-button {
-    padding: 0.6rem 1rem; /* Slightly adjusted padding */
-    cursor: pointer;
-    border: none;
-    background-color: transparent;
-    color: var(--text-muted-color);
-    font-size: 0.85rem; /* Slightly smaller tab text */
-    font-weight: 500;
-    border-bottom: 2px solid transparent; /* Thinner border */
-    transition: color 0.2s ease, border-color 0.2s ease;
-    margin-left: 0.5rem; /* Spacing between tabs */
-}
-.tab-button:first-child {
-    margin-left: 0;
-}
-.tab-button:hover {
-    color: var(--primary-color);
-}
-.tab-button.active {
-    color: var(--primary-color);
-    border-bottom-color: var(--primary-color);
-    font-weight: 600;
-}
-
-.tab-pane {
-    display: none;
-    flex-grow: 1; 
-    overflow: auto; 
-    background-color: #fdfdff; /* Very light, almost white */
-    border-radius: var(--border-radius-md);
-    padding: 1rem;
-    border: 1px solid var(--border-color); /* Subtle border for tab content */
-}
-.tab-pane.active {
-    display: flex; 
-    flex-direction: column;
-}
-
-.tab-pane.is-empty {
-    min-height: 200px; 
-    display: flex; /* Ensure flex properties apply for centering */
-    justify-content: center; 
-    align-items: center;
-    border-style: dashed;
-    border-color: #d0d9e3;
-}
-
-#graphJsonViewPre {
-    margin: 0;
-    background-color: #263238 !important;  /* Material Dark Blue Grey */
-    color: #ECEFF1 !important; 
-    padding: 1.25rem !important; /* More padding */
-    border-radius: var(--border-radius-sm);
-    white-space: pre-wrap;
-    word-wrap: break-word;
-    font-family: var(--code-font-family);
-    font-size: 0.85em; /* Slightly smaller for density */
-    line-height: 1.6;
-    flex-grow: 1; 
-    overflow: auto; 
-    border: none; /* Remove extra border */
-}
-#graphJsonViewPre.is-empty {
-    background-color: #fdfdff !important; 
-    color: var(--text-muted-color) !important;
-    text-align: center;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-style: italic;
-    font-size: 0.9em;
-}
-
-.mermaid-container {
-    display: flex;
-    justify-content: center;
-    align-items: center; 
-    overflow: auto; 
-    padding: 15px; /* More padding */
-    background-color: var(--panel-background-color); 
-    border-radius: var(--border-radius-sm);
-    flex-grow: 1; 
-}
-.mermaid-container.is-empty {
-    min-height: 250px; 
-    /* border-style: dashed; Dashed border handled by tab-pane.is-empty */
-}
-
-.mermaid-container svg {
-    max-width: 100%;
-    height: auto;
-    display: block; 
-}
-
-.mermaid-placeholder {
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    align-items: center;
-    text-align: center;
-    color: var(--text-muted-color);
-    padding: 20px;
-    height: 100%; 
-    box-sizing: border-box;
-    font-size: 0.95em;
-}
-.mermaid-placeholder .fas { 
-    font-size: 3em; /* Larger icon */
-    margin-bottom: 1rem;
-    color: #bdcadd; /* Softer icon color */
-}
-.mermaid-placeholder.loading .fa-spinner {
-    color: var(--primary-color);
-}
-.mermaid-placeholder.error .fa-exclamation-triangle {
-    color: var(--error-color);
-}
-.mermaid-placeholder p {
-    margin: 0.3rem 0;
-}
-.mermaid-placeholder small {
-    font-size: 0.85em;
-    max-width: 320px; 
-    line-height: 1.5;
-}
-
-
-/* Chat Panel Specifics */
-.chat-messages-container {
-    flex-grow: 1;
-    padding: 1.25rem; /* More padding */
-    overflow-y: auto;
-    display: flex;
-    flex-direction: column;
-    gap: 1rem; /* Increased gap */
-}
-.message {
-    padding: 0.75rem 1.25rem; 
-    border-radius: var(--border-radius-lg);
-    max-width: 80%; /* Slightly reduced */
-    word-wrap: break-word;
-    line-height: 1.55;
-    font-size: 0.9em;
-    box-shadow: var(--shadow-sm);
-    position: relative;
-    opacity: 0; /* For fade-in animation */
-    animation: fadeInMessage 0.3s ease forwards;
-}
-
-@keyframes fadeInMessage {
-    to { opacity: 1; transform: translateY(0); }
-}
-.message:nth-child(odd) { transform: translateY(10px); } /* Stagger animation slightly */
-.message:nth-child(even) { transform: translateY(10px); animation-delay: 0.1s; }
-
-
-.message-sender {
-    font-weight: 600;
-    margin-bottom: 0.35rem;
-    font-size: 0.78em; 
-    color: var(--text-muted-color);
-    text-transform: capitalize;
-}
-
-.message.user-message {
-    background: linear-gradient(135deg, var(--primary-color) 0%, var(--primary-hover-color) 100%);
-    color: white;
-    align-self: flex-end;
-    border-bottom-right-radius: var(--border-radius-sm); 
-}
-.message.user-message .message-sender { color: rgba(255,255,255,0.9); text-align: right;}
-
-.message.agent-message, 
-.message.system-message, 
-.message.planner-message, 
-.message.workflow-message {
-    background-color: #EDF2F7; /* Lighter grey for contrast */
-    color: var(--text-color);
-    align-self: flex-start;
-    border-bottom-left-radius: var(--border-radius-sm); 
-}
-
-.message.agent-message .message-sender { color: var(--primary-color); }
-.message.system-message .message-sender { color: var(--secondary-color); }
-.message.planner-message { background-color: #FFF3E0; } /* Light orange for planner */
-.message.planner-message .message-sender { color: #E65100; } /* Darker Orange */
-.message.workflow-message { background-color: #E0F7FA; } /* Lighter cyan for workflow */
-.message.workflow-message .message-sender { color: var(--accent-color); }
-
-
-.message.error-message {
-    background-color: #FFEBEE; 
-    color: var(--error-color);
-    border: 1px solid #FFCDD2;
-}
-.message.error-message .message-sender { color: var(--error-color); font-weight: 700; }
-
-.message-content p { margin: 0 0 0.5em 0; }
-.message-content p:last-child { margin-bottom: 0; }
-.message-content ul, .message-content ol { margin: 0.5em 0; padding-left: 1.5em; }
-.message-content pre {
-    background-color: #2a2f3a; /* Slightly different dark for code */
-    color: #e0e6f1;
-    padding: 0.85em 1em;
-    border-radius: var(--border-radius-sm);
-    overflow-x: auto;
-    font-size: 0.825em; /* Slightly smaller code */
-    margin: 0.6em 0;
-    border: 1px solid #3a414d;
-}
-.message-content code:not(pre code) { 
-    background-color: rgba(44, 62, 80, 0.07); /* Darker inline code bg */
-    padding: 0.2em 0.4em;
-    border-radius: var(--border-radius-sm);
-    font-family: var(--code-font-family);
-    color: #2c3e50;
-}
-
-.chat-input-area {
-    display: flex;
-    padding: 1rem 1.25rem; 
-    border-top: 1px solid var(--border-color);
-    background-color: #e9edf0; /* Slightly darker input area bg */
-    flex-shrink: 0;
-    align-items: center; /* Center items vertically */
-    gap: 0.75rem;
-}
-#userInput {
-    flex-grow: 1;
-    padding: 0.75rem 1.1rem; 
-    border-radius: var(--border-radius-md);
-    border: 1px solid var(--input-border-color);
-    resize: none; 
-    min-height: 48px; 
-    max-height: 130px;
-    overflow-y: auto;
-    font-size: 0.925em;
-    line-height: 1.5;
-    background-color: var(--panel-background-color);
-    box-shadow: inset 0 1px 3px rgba(0,0,0,0.05);
-    transition: border-color 0.2s ease, box-shadow 0.2s ease;
-}
-#userInput:focus {
-    border-color: var(--primary-color);
-    box-shadow: 0 0 0 3px rgba(0,123,255,.1);
-    outline: none;
-}
-
-.chat-buttons {
-    display: flex;
-    gap: 0.65rem; 
-    align-items: center; 
-}
-.action-button {
-    padding: 0 1.25rem; 
-    height: 48px; 
-    border: none;
-    border-radius: var(--border-radius-md);
-    cursor: pointer;
-    font-size: 0.9em;
-    font-weight: 500;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: background-color 0.2s ease, box-shadow 0.2s ease, transform 0.1s ease, opacity 0.2s ease;
-    gap: 0.6rem; 
-    min-width: 110px; 
-    text-align: center;
-}
-.action-button i {
-    font-size: 1.05em; 
-    line-height: 1; 
-}
-.action-button span {
-    line-height: 1;
-}
-
-
-.action-button.primary-button {
-    background-color: var(--primary-color);
-    color: white;
-    box-shadow: 0 2px 5px rgba(0, 123, 255, 0.2);
-}
-.action-button.primary-button:hover:not(:disabled) {
-    background-color: var(--primary-hover-color);
-    box-shadow: 0 3px 7px rgba(0, 90, 179, 0.3);
-}
-.action-button.secondary-button {
-    background-color: var(--secondary-color);
-    color: white;
-    box-shadow: 0 2px 5px rgba(108, 117, 125, 0.2);
-}
-.action-button.secondary-button:hover:not(:disabled) {
-    background-color: var(--secondary-hover-color);
-    box-shadow: 0 3px 7px rgba(84, 91, 98, 0.3);
-}
-.action-button.tertiary-button {
-    background-color: #f8f9fa; /* Lighter tertiary */
-    color: var(--text-color);
-    border: 1px solid var(--border-color);
-}
-.action-button.tertiary-button:hover:not(:disabled) {
-    background-color: #e9ecef;
-    border-color: #ced4da;
-}
-.action-button:disabled {
-    background-color: #adb5bd !important; 
-    cursor: not-allowed !important;
-    box-shadow: none !important;
-    opacity: 0.6 !important;
-}
-.action-button:active:not(:disabled) {
-    transform: translateY(1px);
-    box-shadow: none;
-}
-
-.action-button.thinking {
-    background-color: var(--primary-hover-color); 
-    opacity: 0.9;
-    cursor: default; 
-}
-.action-button.thinking .spinner { 
-    display: inline-block;
-    width: 16px; height: 16px;
-    border-width: 2.5px;
-}
-.action-button.thinking span { /* Hide text when spinner is shown */
-    display: none; 
-}
-.action-button.thinking i {
-    display: none;
-}
-
-
-.spinner {
-    width: 14px; height: 14px; 
-    border: 2px solid rgba(255,255,255,0.3);
-    border-top-color: #ffffff;
-    border-radius: 50%;
-    animation: spin 0.7s linear infinite; /* Faster spin */
-    display: none; 
-    margin-right: 0.6rem; 
-}
-@keyframes spin { to { transform: rotate(360deg); } }
-
-
-/* Modal Styling */
-.modal-overlay {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    background-color: rgba(30, 40, 50, 0.7); /* Darker, slightly blue backdrop */
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    z-index: 1000;
-    padding: 1rem;
-    box-sizing: border-box;
-    opacity: 0;
-    animation: fadeInModalOverlay 0.3s ease forwards;
-}
-@keyframes fadeInModalOverlay { to { opacity: 1; } }
-
-.modal-content {
-    background-color: var(--panel-background-color);
-    padding: 0; 
-    border-radius: var(--border-radius-lg);
-    box-shadow: var(--shadow-lg);
-    width: 100%;
-    max-width: 700px; /* Wider modal */
-    max-height: 90vh;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden; 
-    transform: scale(0.95);
-    opacity: 0;
-    animation: zoomInModalContent 0.3s 0.1s ease forwards;
-}
-@keyframes zoomInModalContent { 
-    to { opacity: 1; transform: scale(1); } 
-}
-
-.modal-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 1.25rem 1.75rem;
-    border-bottom: 1px solid var(--border-color);
-}
-.modal-header h3 {
-    margin: 0;
-    color: var(--text-color);
-    font-size: 1.25em;
-    font-weight: 600;
-}
-.modal-close-button {
-    background: none;
-    border: none;
-    font-size: 1.3em;
-    color: var(--text-muted-color);
-    cursor: pointer;
-    padding: 0.3rem;
-    line-height: 1;
-    transition: color 0.2s ease;
-}
-.modal-close-button:hover {
-    color: var(--error-color);
-}
-
-.modal-body {
-    padding: 1.5rem 1.75rem;
-    overflow-y: auto; 
-    flex-grow: 1;
-}
-.modal-body p {
-    margin: 0.6rem 0; 
-    color: var(--text-color);
-    font-size: 0.925em;
-}
-.modal-body p strong {
-    color: var(--text-color);
-    font-weight: 500;
-    min-width: 160px; 
-    display: inline-block;
-}
-.modal-body code {
-    background-color: #f0f4f8; 
-    padding: 0.25em 0.5em;
-    border-radius: var(--border-radius-sm);
-    font-family: var(--code-font-family);
-    color: var(--primary-hover-color); 
-    font-size: 0.9em;
-    border: 1px solid #e0e6ed;
-}
-.payload-editor {
-    margin-top: 1.25rem;
-}
-.payload-editor label {
-    display: block;
-    margin-bottom: 0.6rem;
-    font-weight: 600;
-    color: var(--text-color);
-    font-size: 0.95em;
-}
-#modalPayload {
-    width: 100%;
-    box-sizing: border-box;
-    padding: 0.85rem 1rem;
-    border: 1px solid var(--input-border-color);
-    border-radius: var(--border-radius-md);
-    font-family: var(--code-font-family);
-    font-size: 0.875em;
-    min-height: 160px; 
-    resize: vertical;
-    background-color: #fdfdff; /* Slightly off-white for textarea */
-    line-height: 1.6;
-}
-#modalPayload:focus {
-    border-color: var(--primary-color);
-    box-shadow: 0 0 0 3px rgba(0,123,255,.1);
-    outline: none;
-}
-.modal-actions {
-    padding: 1.25rem 1.75rem;
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.85rem;
-    border-top: 1px solid var(--border-color);
-    background-color: #f8f9fc; 
-}
-
-/* Scrollbar styling */
-::-webkit-scrollbar {
-    width: 9px;
-    height: 9px;
-}
-::-webkit-scrollbar-track {
-    background: #f0f2f5; 
-    border-radius: 10px;
-}
-::-webkit-scrollbar-thumb {
-    background: #c5cdd3; 
-    border-radius: 10px;
-    border: 2px solid #f0f2f5; /* Creates padding around thumb */
-}
-::-webkit-scrollbar-thumb:hover {
-    background: #adb5bd; 
-}
-
-.tab-pane, .chat-messages-container, .modal-body {
-    scrollbar-width: thin; 
-    scrollbar-color: #c5cdd3 #f0f2f5; 
-}
+    userInput.addEventListener('input', () => { 
+        userInput.style.height = 'auto';
+        userInput.style.height = (userInput.scrollHeight) + 'px';
+    });
+    userInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendMessage();
+        }
+    });
+    
+    showGraphTab('dag'); 
+    connectWebSocket(); 
+});
