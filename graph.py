@@ -3,10 +3,11 @@ import logging
 from typing import Any, Dict, Optional
 
 from langgraph.graph import StateGraph, START, END
+import asyncio # Required for async lambda if not already imported
 
 from models import BotState
 from router import OpenAPIRouter
-from api_executor import APIExecutor 
+from api_executor import APIExecutor
 
 from core_logic.spec_processor import SpecProcessor
 from core_logic.graph_generator import GraphGenerator
@@ -46,7 +47,7 @@ def finalize_response(state: BotState) -> BotState:
 
     state.response = None
     state.intent = None
-    state.next_step = None 
+    state.next_step = None
 
     state.update_scratchpad_reason(
         tool_name, f"Final response set in state: {str(state.final_response)[:200]}..."
@@ -62,9 +63,9 @@ def finalize_response(state: BotState) -> BotState:
 def build_graph(
     router_llm: Any,
     worker_llm: Any,
-    utility_llm: Any, # New parameter for the utility LLM
+    utility_llm: Any,
     api_executor_instance: APIExecutor,
-    checkpointer: Optional[Any] 
+    checkpointer: Optional[Any]
 ) -> Any:
     logger.info("Building LangGraph (Planning Graph - Graph 1) with refactored core logic and utility LLM...")
     if checkpointer:
@@ -72,12 +73,10 @@ def build_graph(
     else:
         logger.info("Compiling Planning Graph WITHOUT checkpointer.")
 
-    # Instantiate core logic components, passing the appropriate LLMs
-    spec_processor = SpecProcessor(worker_llm=worker_llm, utility_llm=utility_llm) # Pass utility_llm here
-    graph_generator = GraphGenerator(worker_llm=worker_llm) 
+    spec_processor = SpecProcessor(worker_llm=worker_llm, utility_llm=utility_llm)
+    graph_generator = GraphGenerator(worker_llm=worker_llm)
     interaction_handler = InteractionHandler(
         worker_llm=worker_llm,
-        # utility_llm=utility_llm, # Pass if InteractionHandler also needs it for some tasks
         graph_generator_instance=graph_generator,
         spec_processor_instance=spec_processor,
         api_executor_instance=api_executor_instance
@@ -87,15 +86,38 @@ def build_graph(
 
     builder = StateGraph(BotState)
 
-    # Add nodes
     builder.add_node("router", router_instance.route)
     builder.add_node("parse_openapi_spec", spec_processor.parse_openapi_spec)
+
+    # MODIFIED: The lambda for process_schema_pipeline is now async, and the call is awaited
     builder.add_node(
         "process_schema_pipeline",
-        lambda st: spec_processor.process_schema_pipeline(
+        # This lambda is now async and awaits the async process_schema_pipeline method
+        lambda st: asyncio.create_task(spec_processor.process_schema_pipeline(
             st, graph_generator_func=graph_generator._generate_execution_graph
-        ),
+        )) if hasattr(asyncio, 'create_task') else spec_processor.process_schema_pipeline( # Fallback for older Pythons or specific environments
+            st, graph_generator_func=graph_generator._generate_execution_graph
+        )
     )
+    # A more robust way for LangGraph to handle async nodes is to pass the async function directly
+    # If the lambda approach causes issues with how LangGraph schedules tasks,
+    # consider defining a standalone async function wrapper if necessary,
+    # or ensure LangGraph version fully supports async lambdas for nodes.
+    # For now, let's try with a direct async method if lambda causes issues.
+    # A simpler way if the lambda can be directly async:
+    # async def process_schema_pipeline_node(state: BotState) -> BotState:
+    #     return await spec_processor.process_schema_pipeline(
+    #         state, graph_generator_func=graph_generator._generate_execution_graph
+    #     )
+    # builder.add_node("process_schema_pipeline", process_schema_pipeline_node)
+    # Reverting to a slightly simpler lambda structure that should work if LangGraph handles async callables
+    async def _process_schema_pipeline_wrapper(state: BotState) -> BotState:
+        return await spec_processor.process_schema_pipeline(
+            state, graph_generator_func=graph_generator._generate_execution_graph
+        )
+    builder.add_node("process_schema_pipeline", _process_schema_pipeline_wrapper)
+
+
     builder.add_node("_generate_execution_graph", graph_generator._generate_execution_graph)
     builder.add_node("verify_graph", graph_generator.verify_graph)
     builder.add_node("refine_api_graph", graph_generator.refine_api_graph)
@@ -109,12 +131,11 @@ def build_graph(
     builder.add_node("handle_loop", error_handlers.handle_loop)
     builder.add_node("responder", finalize_response)
 
-    # Define Edges (logic remains the same as your previous version)
     builder.add_edge(START, "router")
     router_targetable_intents: Dict[str, str] = {
         str(intent_val): str(intent_val)
         for intent_val in OpenAPIRouter.AVAILABLE_INTENTS.__args__ # type: ignore
-        if str(intent_val) in builder.nodes 
+        if str(intent_val) in builder.nodes
     }
     for intent_val_literal in OpenAPIRouter.AVAILABLE_INTENTS.__args__: # type: ignore
         intent_val_str = str(intent_val_literal)
