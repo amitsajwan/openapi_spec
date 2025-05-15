@@ -1,523 +1,542 @@
-// static/script.js
+// OpenAPI Agent script.js
 
-// Ensure this runs after the DOM is fully loaded
 document.addEventListener('DOMContentLoaded', () => {
-    const specInput = document.getElementById('specInput');
-    const specUrlInput = document.getElementById('specUrl');
-    const specFileInput = document.getElementById('specFile');
-    const submitSpecButton = document.getElementById('submitSpecButton');
-    const chatMessages = document.getElementById('chatMessages');
-    const graphContainer = document.getElementById('graphContainer'); // Assuming this is for Cytoscape
+    // DOM Elements
+    const chatMessagesDiv = document.getElementById('chatMessages');
     const userInput = document.getElementById('userInput');
-    const sendMessageButton = document.getElementById('sendMessageButton');
-    const clearChatButton = document.getElementById('clearChatButton');
-    const thinkingIndicatorContainer = document.getElementById('thinkingIndicatorContainer');
-    const thinkingIndicatorText = document.getElementById('thinkingIndicatorText');
-    const apiResponseContainer = document.getElementById('apiResponseContainer');
-    const apiResponseContent = document.getElementById('apiResponseContent');
-    const closeApiResponseButton = document.getElementById('closeApiResponse');
-    const runWorkflowButton = document.getElementById('runWorkflowButton'); // From your HTML
+    const sendButton = document.getElementById('sendButton');
+    // Spinner is now part of sendButton's dynamic HTML
+    const runWorkflowButton = document.getElementById('runWorkflowButton');
+
+    const graphJsonViewPre = document.getElementById('graphJsonViewPre');
+    const mermaidDagContainer = document.getElementById('mermaidDagDiagram');
+    const jsonTabButton = document.getElementById('jsonTabButton');
+    const dagTabButton = document.getElementById('dagTabButton');
+    const graphJsonViewContent = document.getElementById('graphJsonViewContent');
+    const graphDagViewContent = document.getElementById('graphDagViewContent');
+
+    // Modal Elements
+    const confirmationModal = document.getElementById('confirmationModal');
+    const modalTitle = document.getElementById('modalTitle');
+    const modalOperationId = document.getElementById('modalOperationId');
+    const modalEffectiveNodeId = document.getElementById('modalEffectiveNodeId'); 
+    const modalMethod = document.getElementById('modalMethod');
+    const modalPath = document.getElementById('modalPath');
+    const modalGraph2ThreadId = document.getElementById('modalGraph2ThreadId'); 
+    const modalPayload = document.getElementById('modalPayload');
+    const modalConfirmButton = document.getElementById('modalConfirmButton');
+    const modalCancelButton = document.getElementById('modalCancelButton');
 
     let ws;
-    let isThinking = false; // Global state for thinking indicator
-    let currentGraph = null; // To store the current graph data for re-rendering
+    let currentGraphData = null;
+    const initialSendButtonHTML = sendButton.innerHTML; 
 
-    // Function to show the thinking indicator
-    function startThinking(message = "Processing...") {
-        if (isThinking) { // If already thinking, just update message if different
-            if (thinkingIndicatorText && thinkingIndicatorText.textContent !== message) {
-                thinkingIndicatorText.textContent = message;
-            }
-            return;
-        }
-        isThinking = true;
-        if (thinkingIndicatorText) thinkingIndicatorText.textContent = message;
-        if (thinkingIndicatorContainer) {
-            thinkingIndicatorContainer.classList.remove('opacity-0', 'pointer-events-none');
-            thinkingIndicatorContainer.classList.add('opacity-100');
-        }
-        if (submitSpecButton) submitSpecButton.disabled = true;
-        if (sendMessageButton) sendMessageButton.disabled = true;
-        if (runWorkflowButton) runWorkflowButton.disabled = true;
-        console.log("UI: Thinking started - ", message);
-    }
-
-    // Function to hide the thinking indicator
-    function stopThinking(message = "Done.") {
-        if (!isThinking) return;
-        isThinking = false;
-        if (thinkingIndicatorContainer) {
-            thinkingIndicatorContainer.classList.add('opacity-0', 'pointer-events-none');
-            thinkingIndicatorContainer.classList.remove('opacity-100');
-        }
-        // Re-enable buttons based on whether a spec/graph is loaded
-        const specOrGraphLoaded = currentGraph !== null;
-        if (submitSpecButton) submitSpecButton.disabled = false;
-        if (sendMessageButton) sendMessageButton.disabled = !specOrGraphLoaded;
-        if (runWorkflowButton) runWorkflowButton.disabled = !specOrGraphLoaded;
-        console.log("UI: Thinking stopped - ", message);
-    }
-
-    function connectWebSocket() {
-        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${wsProtocol}//${window.location.host}/ws/openapi_agent`;
-
-        ws = new WebSocket(wsUrl);
-
-        ws.onopen = function(event) {
-            console.log("WebSocket connection established.");
-            addMessageToChat('status', "Connected to the agent.", "connection_status");
-            stopThinking("Connected."); // Reset UI
-            // Initial button states
-            if (sendMessageButton) sendMessageButton.disabled = true;
-            if (runWorkflowButton) runWorkflowButton.disabled = true;
-        };
-
-        ws.onmessage = function(event) {
-            try {
-                const parsed_event_data = JSON.parse(event.data);
-                console.log("WebSocket message received:", parsed_event_data);
-
-                const messageType = parsed_event_data.type;
-                const data = parsed_event_data.content || parsed_event_data.data || {};
-                const source = parsed_event_data.source || 'assistant';
-
-                switch (messageType) {
-                    case 'status': // General status from backend (not for thinking indicator)
-                    case 'info':
-                    case 'warning':
-                        addMessageToChat(source, data.message || 'Status update.', messageType);
-                        break;
-                    case 'intermediate':
-                    case 'intermediate_message':
-                        addMessageToChat(source, data.message, messageType);
-                        // Update thinking indicator text with the latest intermediate message
-                        if (isThinking && data.message && thinkingIndicatorText) {
-                            thinkingIndicatorText.textContent = data.message.length > 70 ? data.message.substring(0, 67) + "..." : data.message;
-                        }
-                        break;
-                    case 'graph_update':
-                        if (data.graph || data.nodes || data.elements) {
-                            currentGraph = data.graph || data;
-                            renderGraph(currentGraph);
-                            addMessageToChat('status', "Workflow graph updated.", messageType);
-                            if (sendMessageButton) sendMessageButton.disabled = false;
-                            if (runWorkflowButton) runWorkflowButton.disabled = false;
-                        } else {
-                            console.warn("Received graph_update without graph data:", data);
-                        }
-                        break;
-                    case 'api_response':
-                        displayApiResponse(data);
-                        // An api_response might be intermediate. Rely on 'final' or 'error' to stop thinking.
-                        break;
-                    case 'final': // Final response from Graph 1 or other processes
-                    case 'final_response':
-                        addMessageToChat(source, data.message || "Processing complete.", messageType);
-                        if (data.graph) {
-                            currentGraph = data.graph;
-                            renderGraph(currentGraph);
-                        }
-                        stopThinking(data.message || "Task complete."); // Stop thinking
-                        if (currentGraph) { // Re-enable buttons if graph is present
-                            if (sendMessageButton) sendMessageButton.disabled = false;
-                            if (runWorkflowButton) runWorkflowButton.disabled = false;
-                        }
-                        break;
-                    case 'error':
-                        addMessageToChat('error', `Error: ${data.error || data.message || 'Unknown error.'}`, messageType);
-                        stopThinking("An error occurred."); // Stop thinking
-                        // Buttons are re-enabled by stopThinking based on currentGraph
-                        break;
-
-                    // Graph 2 specific events
-                    case 'human_intervention_required':
-                        addMessageToChat(source, data.message || `Action required for node ${data.node_id}`, messageType);
-                        // Potentially show modal here
-                        // If this is the end of a flow waiting for user, we might stop thinking here too.
-                        // For now, assume a 'final' or 'error' will eventually come, or user action restarts thinking.
-                        break;
-                    case 'execution_update':
-                    case 'tool_start':
-                    case 'tool_end':
-                    case 'llm_start':
-                    case 'llm_stream':
-                    case 'llm_end':
-                        addMessageToChat(source, data.message || `Execution update: ${messageType}`, messageType);
-                        if (isThinking && data.message && thinkingIndicatorText) {
-                            thinkingIndicatorText.textContent = data.message.length > 70 ? data.message.substring(0, 67) + "..." : data.message;
-                        }
-                        break;
-                    case 'execution_completed':
-                    case 'execution_failed':
-                    case 'workflow_timeout':
-                        addMessageToChat(source, data.message || `Workflow ${messageType}.`, messageType);
-                        stopThinking(`Workflow ${messageType}.`); // Stop thinking
-                        break;
-
-                    default:
-                        addMessageToChat('unknown', `Received unhandled type '${messageType}': ${(event.data || "").substring(0,150)}...`, messageType);
-                }
-            } catch (e) {
-                console.error("Error processing WebSocket message:", e, "Raw data:", event.data);
-                addMessageToChat('error', "Received an unparseable message from server.", "parse_error");
-                stopThinking("Error processing server message."); // Stop thinking on parse error
-            }
-        };
-
-        ws.onclose = function(event) {
-            console.log("WebSocket connection closed.", event.reason, "Code:", event.code);
-            addMessageToChat('status', "Connection closed. Attempting to reconnect in 5 seconds...", "connection_status");
-            stopThinking("Connection lost.");
-            isThinking = false; // Explicitly set
-            setTimeout(connectWebSocket, 5000);
-        };
-
-        ws.onerror = function(error) {
-            console.error("WebSocket error:", error);
-            addMessageToChat('error', "WebSocket connection error. Check console for details.", "ws_error");
-            // onclose will usually follow, which calls stopThinking
-        };
-    }
-
-    function addMessageToChat(source, message, wsMessageType, isHtml = false) {
-        if (!chatMessages) return;
-
-        const lastMessageElement = chatMessages.lastElementChild;
-        let appendToLast = false;
-
-        if (lastMessageElement &&
-            lastMessageElement.dataset.source === source &&
-            lastMessageElement.dataset.wsMessageType === wsMessageType &&
-            (source === 'assistant' || source === 'graph1_planning' || source === 'graph2_execution' || source === 'agent') &&
-            (wsMessageType === 'intermediate' || wsMessageType === 'intermediate_message' || wsMessageType === 'llm_stream' || wsMessageType === 'status' || wsMessageType === 'execution_update')
-           ) {
-            appendToLast = true;
-        }
-        
-        let sanitizedMessage = message;
-        if (!isHtml && typeof message === 'string') { // Ensure message is a string before textContent
-            const tempDiv = document.createElement('div');
-            tempDiv.textContent = message;
-            sanitizedMessage = tempDiv.innerHTML.replace(/\n/g, '<br>');
-        } else if (!isHtml && message === undefined) {
-            sanitizedMessage = ""; // Handle undefined message
-        } else if (isHtml) {
-            sanitizedMessage = message; // Trust pre-formatted HTML
-        }
-
-
-        if (appendToLast && lastMessageElement) {
-            const contentSpan = lastMessageElement.querySelector('.message-text-content');
-            if (contentSpan) {
-                contentSpan.innerHTML += '<br>' + sanitizedMessage;
-            } else { 
-                lastMessageElement.innerHTML += '<br>' + sanitizedMessage;
-            }
-        } else {
-            const messageElement = document.createElement('div');
-            messageElement.classList.add('mb-2', 'p-3', 'rounded-lg', 'max-w-2xl', 'break-words', 'text-sm', 'shadow-sm');
-            messageElement.dataset.source = source;
-            messageElement.dataset.wsMessageType = wsMessageType;
-
-            let sourcePrefix = "";
-            let prefixClasses = "font-semibold message-sender-tag";
-
-            if (source === 'user') {
-                messageElement.classList.add('bg-blue-500', 'text-white', 'self-end', 'ml-auto');
-                sourcePrefix = 'You:';
-            } else if (source === 'assistant' || source === 'graph1_planning' || source === 'graph2_execution' || source === 'agent') {
-                messageElement.classList.add('bg-gray-200', 'text-gray-800', 'self-start', 'mr-auto');
-                sourcePrefix = 'Agent:';
-                 if(source === 'graph1_planning') sourcePrefix = 'Planner:';
-                 if(source === 'graph2_execution') sourcePrefix = 'Executor:';
-            } else if (source === 'status' || source === 'system' || source === 'system_critical' || source === 'system_warning') {
-                messageElement.classList.add('bg-yellow-100', 'text-yellow-800', 'self-center', 'text-xs', 'italic', 'text-center', 'py-1', 'px-2');
-                sourcePrefix = 'Status:';
-                if(source === 'system_critical') {messageElement.classList.replace('bg-yellow-100','bg-red-200'); messageElement.classList.replace('text-yellow-800','text-red-800');}
-            } else if (source === 'error' || source === 'system_error') {
-                messageElement.classList.add('bg-red-100', 'text-red-700', 'self-start', 'mr-auto', 'font-semibold');
-                sourcePrefix = 'Error:';
-            } else { 
-                messageElement.classList.add('bg-gray-50', 'text-gray-500', 'self-center', 'text-xs', 'italic');
-                sourcePrefix = 'System:';
-            }
-            
-            messageElement.innerHTML = `<strong class="${prefixClasses}">${sourcePrefix}</strong> <span class="message-text-content">${sanitizedMessage}</span>`;
-            chatMessages.appendChild(messageElement);
-        }
-        chatMessages.scrollTop = chatMessages.scrollHeight;
-    }
-
-    function sendWebSocketMessage(type, payload) {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            // Client-managed thinking: Start thinking indicator *before* sending.
-            startThinking("Sending request..."); 
-            
-            const message = JSON.stringify({ type: type, ...payload }); 
-            ws.send(message);
-            console.log("Sent to WS:", message);
-        } else {
-            addMessageToChat('error', "WebSocket is not connected. Cannot send message.", "ws_error_send");
-            console.error("WebSocket is not connected.");
-            stopThinking("Connection error."); // Stop thinking if WS is not open
-        }
-    }
-
-    if (submitSpecButton) {
-        submitSpecButton.addEventListener('click', () => {
-            let specData = specInput.value.trim();
-            const url = specUrlInput.value.trim();
-            const file = specFileInput.files[0];
-            let userMessage = "";
-            let payload = { source: 'text' }; // Default source
-
-            if (file) {
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    specData = e.target.result;
-                    payload.source = 'file';
-                    payload.openapi_spec_string = specData;
-                    payload.file_name = file.name;
-                    userMessage = `Submitted OpenAPI Spec from file: ${file.name}`;
-                    addMessageToChat('user', userMessage, "user_spec_submission");
-                    sendWebSocketMessage('process_openapi_spec', payload);
-                };
-                reader.onerror = function(e) {
-                    addMessageToChat('error', 'Error reading file.', "file_error");
-                    console.error("File reading error:", e);
-                    stopThinking("File error."); // Stop thinking if file read fails
-                };
-                reader.readAsText(file);
-            } else if (url) {
-                payload.source = 'url';
-                payload.openapi_spec_url = url;
-                userMessage = `Submitted OpenAPI Spec from URL: ${url}`;
-                addMessageToChat('user', userMessage, "user_spec_submission");
-                sendWebSocketMessage('process_openapi_spec', payload);
-            } else if (specData) {
-                payload.source = 'text';
-                payload.openapi_spec_string = specData;
-                userMessage = `Submitted OpenAPI Spec (text input)`;
-                addMessageToChat('user', userMessage, "user_spec_submission");
-                sendWebSocketMessage('process_openapi_spec', payload);
-            } else {
-                addMessageToChat('error', 'Please provide an OpenAPI spec (text, URL, or file).', "input_error");
-                return; 
-            }
-        });
-    }
-
-    if (sendMessageButton) {
-        sendMessageButton.addEventListener('click', () => {
-            const messageText = userInput.value.trim();
-            if (messageText) {
-                addMessageToChat('user', messageText, "user_interaction");
-                sendWebSocketMessage('user_interaction', { 
-                    text: messageText, 
-                    current_graph_elements: currentGraph ? currentGraph.elements : null,
-                });
-                userInput.value = '';
-            }
-        });
-    }
-    
-    if (userInput) {
-        userInput.addEventListener('keypress', function(event) {
-            if (event.key === 'Enter' && !event.shiftKey) {
-                event.preventDefault(); 
-                sendMessageButton.click();
-            }
-        });
-    }
-
-    if (clearChatButton) {
-        clearChatButton.addEventListener('click', () => {
-            if (chatMessages) chatMessages.innerHTML = '';
-            if (graphContainer) graphContainer.innerHTML = ''; 
-            currentGraph = null;
-            if (apiResponseContainer) apiResponseContainer.classList.add('hidden');
-            addMessageToChat('status', 'Chat and graph cleared.', "ui_action");
-            if(sendMessageButton) sendMessageButton.disabled = true;
-            if(runWorkflowButton) runWorkflowButton.disabled = true;
-        });
-    }
-    
-    if (closeApiResponseButton) {
-        closeApiResponseButton.addEventListener('click', () => {
-            if (apiResponseContainer) apiResponseContainer.classList.add('hidden');
-        });
-    }
-    
-    window.runCurrentWorkflow = function() {
-        if (!currentGraph || (!currentGraph.elements && (!currentGraph.nodes || !currentGraph.edges))) { 
-            addMessageToChat('error', "No workflow graph is loaded or graph is empty.", "workflow_error");
-            return;
-        }
-        addMessageToChat('user', "Attempting to run the current workflow...", "user_action");
-        sendWebSocketMessage('user_interaction', { 
-            text: "run workflow", 
-        });
+    let currentConfirmationContext = {
+        graph2ThreadId: null,
+        confirmationKey: null,
+        operationId: null, 
+        effectiveNodeId: null 
     };
 
-
-    function displayApiResponse(data) {
-        if (!apiResponseContainer || !apiResponseContent) return;
-        
-        let contentHtml = `<h3 class="text-lg font-semibold mb-2">${data.operation_id || data.node_id || 'API Response'}</h3>`;
-        contentHtml += `<p class="text-sm mb-1"><span class="font-semibold">Status:</span> ${data.status_code || 'N/A'}</p>`;
-        
-        if (data.headers) {
-            contentHtml += '<p class="text-sm mb-1"><span class="font-semibold">Headers:</span></p>';
-            contentHtml += `<pre class="bg-gray-100 p-2 rounded text-xs overflow-x-auto max-h-32"><code>${escapeHtml(JSON.stringify(data.headers, null, 2))}</code></pre>`;
+    function updateSendButtonState(isThinking) {
+        if (isThinking) {
+            sendButton.classList.add('thinking');
+            sendButton.innerHTML = `<div class="spinner" style="display: inline-block;"></div> Thinking...`; 
+            sendButton.disabled = true;
+            userInput.disabled = true;
+        } else {
+            sendButton.classList.remove('thinking');
+            sendButton.innerHTML = initialSendButtonHTML; 
+            sendButton.disabled = false;
+            userInput.disabled = false;
         }
-        if (data.body || data.error) { 
-            contentHtml += `<p class="text-sm mt-2 mb-1"><span class="font-semibold">${data.error ? 'Error Body:' : 'Body:'}</span></p>`;
-            let bodyContent = data.body || data.error; 
-            
-            try {
-                const parsedBody = (typeof bodyContent === 'string') ? JSON.parse(bodyContent) : bodyContent;
-                bodyContent = JSON.stringify(parsedBody, null, 2);
-            } catch (e) {
-                if (typeof bodyContent !== 'string') { 
-                   bodyContent = String(bodyContent);
-                }
-            }
-            contentHtml += `<pre class="bg-gray-100 p-2 rounded text-xs overflow-x-auto max-h-60"><code>${escapeHtml(bodyContent)}</code></pre>`;
-        }
-        
-        apiResponseContent.innerHTML = contentHtml;
-        apiResponseContainer.classList.remove('hidden');
+        runWorkflowButton.disabled = isThinking || !currentGraphData;
     }
+
 
     function escapeHtml(unsafe) {
         if (typeof unsafe !== 'string') {
-            try {
-                unsafe = String(unsafe); 
-            } catch (e) {
-                return ''; 
+            if (unsafe === null || unsafe === undefined) return '';
+            try { 
+                return JSON.stringify(unsafe, null, 2); 
+            } catch (e) { 
+                return String(unsafe); 
             }
         }
         return unsafe
-             .replace(/&/g, "&amp;")
-             .replace(/</g, "&lt;")
-             .replace(/>/g, "&gt;")
-             .replace(/"/g, "&quot;")
-             .replace(/'/g, "&#039;");
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
     }
 
-    function renderGraph(graphData) { 
-        if (!graphContainer || !window.cytoscape) {
-            console.error("Graph container or Cytoscape library not found.");
-            if (!window.cytoscape) addMessageToChat('error', "Cytoscape library not loaded. Cannot render graph.", "graph_error");
+    function addMessageToChat(sender, content, type, sourceGraph = "graph1_planning") {
+        const messageElement = document.createElement('div');
+        let senderClass = 'agent-message'; 
+        let senderName = sender;
+
+        if (sender === 'You') {
+            senderClass = 'user-message';
+        } else if (sourceGraph === "graph2_execution") {
+            senderClass = 'workflow-message'; 
+            senderName = `Workflow (${type})`; 
+        } else if (sourceGraph === "system" || sender === "System") {
+            senderClass = 'system-message';
+            senderName = 'System';
+        } else if (sender === 'Planner' || sourceGraph === 'graph1_planning') { // Catch all planner messages
+            senderClass = 'planner-message';
+            senderName = 'Planner'; // Standardize sender name for planner
+        }
+        
+        messageElement.classList.add('message', senderClass);
+        if (chatMessagesDiv.children.length > 1) { 
+             setTimeout(() => messageElement.classList.add('new-message-animation'), 50);
+        }
+
+        const senderElement = document.createElement('div');
+        senderElement.classList.add('message-sender');
+        senderElement.textContent = senderName;
+
+        const contentElement = document.createElement('div');
+        contentElement.classList.add('message-content');
+
+        // Original content formatting logic (before error handling)
+        if (typeof content === 'string') {
+            let formattedContent = content.replace(/```([\s\S]*?)```/g, (match, code) => {
+                return `<pre><code>${escapeHtml(code.trim())}</code></pre>`;
+            });
+            formattedContent = formattedContent.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+            formattedContent = formattedContent.replace(/\*(.*?)\*/g, '<em>$1</em>');
+            formattedContent = formattedContent.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+            contentElement.innerHTML = formattedContent.split('\n').map(line => `<p>${line}</p>`).join('');
+        } else if (typeof content === 'object' && content !== null) {
+            if (sourceGraph === "graph2_execution") {
+                 let detailsHtml = "";
+                 if (content.node_name) detailsHtml += `<strong>Node:</strong> ${escapeHtml(content.node_name)}<br>`;
+                 if (content.input_preview) detailsHtml += `Input Preview: <pre>${escapeHtml(content.input_preview)}</pre>`;
+                 if (content.status_code) detailsHtml += `Status: <span class="status-code status-${String(content.status_code).charAt(0)}xx">${escapeHtml(content.status_code)}</span> `;
+                 if (content.execution_time) detailsHtml += `(Took: ${escapeHtml(content.execution_time)}s)<br>`;
+                 if (content.response_preview) detailsHtml += `Response Preview: <pre>${escapeHtml(content.response_preview)}</pre>`;
+                 if (content.raw_output_from_node && type === "tool_end") { 
+                    detailsHtml += `Raw Output (State Update): <pre>${escapeHtml(content.raw_output_from_node)}</pre>`;
+                 }
+                 if (content.error) detailsHtml += `<strong style="color: var(--error-color);">Error:</strong> <pre>${escapeHtml(content.error)}</pre>`;
+                 
+                 if (content.message && (type === "execution_completed" || type === "execution_failed" || type === "workflow_timeout" || type === "info" || type === "error" )) {
+                    detailsHtml += `<p>${escapeHtml(content.message)}</p>`;
+                 }
+                 if (content.final_state && (type === "execution_completed" || type === "execution_failed")) {
+                    detailsHtml += `Final State (details): <pre>${escapeHtml(content.final_state)}</pre>`;
+                 }
+                 contentElement.innerHTML = detailsHtml || `<pre>${escapeHtml(content)}</pre>`; 
+            } else if (content.message) { // For planner or other object messages with a 'message' field
+                contentElement.innerHTML = `<p>${escapeHtml(content.message)}</p>`;
+                 if (content.details) { 
+                    contentElement.innerHTML += `<pre>${escapeHtml(content.details)}</pre>`;
+                 }
+            } else { // Fallback for other objects
+                contentElement.innerHTML = `<pre>${escapeHtml(content)}</pre>`;
+            }
+        } else {
+             contentElement.innerHTML = `<p>${escapeHtml(String(content))}</p>`;
+        }
+        
+        // Apply error styling based on type and source
+        if (type === 'error' || (typeof content === 'object' && content && content.error)) {
+            if (sourceGraph === 'graph1_planning') { // Planner-specific error handling
+                let errorPrefix = `<strong style="color: var(--error-color); font-weight: bold;">Planner Alert:</strong> `;
+                let currentContent = contentElement.innerHTML; // Get already formatted content
+
+                if (typeof content === 'object' && content.error) {
+                    // If error is in a sub-field, ensure it's displayed prominently
+                    contentElement.innerHTML = errorPrefix + `<pre>${escapeHtml(content.error)}</pre>`;
+                     if (content.message && content.message !== content.error) { // Add original message if different
+                        contentElement.innerHTML += `<p><em>Original message: ${escapeHtml(content.message)}</em></p>`;
+                    }
+                } else { // Error message is the main content (already formatted)
+                     contentElement.innerHTML = errorPrefix + currentContent;
+                }
+                // No 'error-message' class for background, relies on planner-message style
+            } else {
+                // For other sources (system, workflow), apply the full error styling (red background)
+                messageElement.classList.add('error-message');
+            }
+        }
+        
+        messageElement.appendChild(senderElement);
+        messageElement.appendChild(contentElement);
+        chatMessagesDiv.appendChild(messageElement);
+        chatMessagesDiv.scrollTop = chatMessagesDiv.scrollHeight;
+    }
+
+    function connectWebSocket() {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws/openapi_agent`;
+        
+        addMessageToChat('System', `Attempting to connect to ${wsUrl}...`, 'system', 'system');
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+            addMessageToChat('System', 'Successfully connected to the agent.', 'system', 'system');
+            updateSendButtonState(false);
+            runWorkflowButton.disabled = true; 
+            updateGraphViewEmptyState(true); 
+        };
+
+        ws.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                console.log("WS RX:", data); 
+                updateSendButtonState(false); 
+
+                let sender = 'Agent'; 
+                let messageContent = data.content;
+                let messageType = data.type; 
+                let sourceGraph = data.source || "unknown_source";
+
+                if (sourceGraph === 'graph1_planning') {
+                    sender = 'Planner'; // This will be used by addMessageToChat
+                    if (data.type === "graph_update") {
+                        currentGraphData = data.content;
+                        graphJsonViewPre.textContent = JSON.stringify(currentGraphData, null, 2);
+                        addMessageToChat('System', 'Execution graph has been updated.', 'system', 'system');
+                        updateGraphViewEmptyState(false); 
+                        if (graphDagViewContent.classList.contains('active')) {
+                            renderMermaidGraphUI(currentGraphData);
+                        }
+                        runWorkflowButton.disabled = !currentGraphData; 
+                        return; 
+                    }
+                    // For graph1, content can be {message: "..."} or a direct string if error
+                    messageContent = (typeof data.content === 'object' && data.content !== null && data.content.message) ? data.content.message : data.content;
+                     if (typeof data.content === 'object' && data.content !== null && data.content.error && !messageContent){
+                        messageContent = data.content.error; // If error is the primary content
+                    }
+
+                } else if (sourceGraph === 'graph2_execution') {
+                    // Sender name will be derived from type in addMessageToChat
+                    // messageContent is already data.content
+                    if (data.type === "execution_completed" || data.type === "execution_failed" || data.type === "workflow_timeout") {
+                        runWorkflowButton.disabled = !currentGraphData; 
+                    }
+                     if (data.type === "human_intervention_required") {
+                        showConfirmationModal(data.content.details_for_ui, data.graph2_thread_id);
+                        addMessageToChat(
+                            `Workflow (${data.content.node_name || 'N/A'})`, 
+                            `Paused. Requires confirmation for operation: ${data.content.details_for_ui.operationId}. Please use the modal.`,
+                            'human_intervention_required', 
+                            sourceGraph 
+                        );
+                        return; 
+                    }
+                } else if (sourceGraph === 'system' || sourceGraph === 'system_error' || sourceGraph === 'system_warning') {
+                    sender = 'System';
+                    messageContent = data.content.error || data.content.message || data.content;
+                }
+                addMessageToChat(sender, messageContent, messageType, sourceGraph);
+
+            } catch (error) {
+                console.error("Error processing WebSocket message:", error, "Raw data:", event.data);
+                addMessageToChat('System', 'Error processing message from server. Check console.', 'error', 'system');
+                updateSendButtonState(false);
+            }
+        };
+
+        ws.onerror = (error) => {
+            console.error('WebSocket Error:', error);
+            addMessageToChat('System', 'WebSocket connection error. Check console.', 'error', 'system');
+            updateSendButtonState(false);
+            runWorkflowButton.disabled = true;
+        };
+
+        ws.onclose = (event) => {
+            addMessageToChat('System', `WebSocket disconnected. Code: ${event.code}. Attempting to reconnect in 5 seconds...`, 'system', 'system');
+            updateSendButtonState(false);
+            runWorkflowButton.disabled = true;
+            setTimeout(connectWebSocket, 5000);
+        };
+    }
+
+    window.sendMessage = () => {
+        const messageText = userInput.value.trim();
+        if (!messageText) return;
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            addMessageToChat('System', 'Not connected. Please wait or try refreshing.', 'error', 'system');
             return;
         }
-        graphContainer.innerHTML = ''; 
+        addMessageToChat('You', messageText, 'user', 'user_input'); 
+        ws.send(messageText);
+        userInput.value = '';
+        userInput.style.height = 'auto'; 
+        updateSendButtonState(true); 
+    };
 
-        try {
-            let elementsToRender;
-            if (graphData && graphData.nodes && graphData.edges) { 
-                elementsToRender = { nodes: graphData.nodes, edges: graphData.edges };
-            } else if (graphData && graphData.elements) { 
-                 elementsToRender = graphData.elements;
+    window.runCurrentWorkflow = () => {
+        if (!currentGraphData) {
+            addMessageToChat('System', 'No workflow graph loaded to run.', 'error', 'system');
+            return;
+        }
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            addMessageToChat('System', 'Not connected. Cannot run workflow.', 'error', 'system');
+            return;
+        }
+        const command = "run workflow"; 
+        addMessageToChat('You', command, 'user', 'user_input');
+        ws.send(command);
+        addMessageToChat('System', "Requesting to run the current workflow...", 'status', 'system');
+        updateSendButtonState(true); 
+        runWorkflowButton.disabled = true; 
+    };
+
+    function updateGraphViewEmptyState(isEmpty) {
+        const dagTabPane = graphDagViewContent; 
+        const jsonTabPane = graphJsonViewContent;
+
+        if (isEmpty) {
+            dagTabPane.classList.add('is-empty');
+            jsonTabPane.classList.add('is-empty');
+            graphJsonViewPre.textContent = "JSON representation of the graph will appear here once a plan is generated.";
+            renderMermaidGraphUI(null); 
+        } else {
+            dagTabPane.classList.remove('is-empty');
+            jsonTabPane.classList.remove('is-empty');
+        }
+    }
+
+
+    window.showGraphTab = (tabName) => {
+        graphJsonViewContent.style.display = 'none';
+        graphDagViewContent.style.display = 'none';
+        graphJsonViewContent.classList.remove('active');
+        graphDagViewContent.classList.remove('active');
+        jsonTabButton.classList.remove('active');
+        dagTabButton.classList.remove('active');
+
+        if (tabName === 'json') {
+            graphJsonViewContent.style.display = 'flex'; 
+            graphJsonViewContent.classList.add('active');
+            jsonTabButton.classList.add('active');
+        } else if (tabName === 'dag') {
+            graphDagViewContent.style.display = 'flex'; 
+            graphDagViewContent.classList.add('active');
+            dagTabButton.classList.add('active');
+            renderMermaidGraphUI(currentGraphData); 
+        }
+        updateGraphViewEmptyState(!currentGraphData);
+    };
+
+    function generateMermaidDefinition(graph) {
+        const emptyFill = '#fcfcfc'; 
+        const emptyStroke = '#e0e0e0'; 
+        const emptyColor = '#7f8c8d'; 
+
+        const defaultNodeFill = '#ECEFF1'; 
+        const defaultNodeStroke = '#90A4AE'; 
+        const defaultNodeTextColor = '#37474F'; 
+        
+        const startEndFill = '#546E7A';
+        const startEndStroke = '#37474F';
+        const apiNodeFill = '#007AFF'; 
+        const apiNodeStroke = '#0056b3'; 
+        const confirmedNodeFill = '#28a745'; 
+        const confirmedNodeStroke = '#1E8E3E';
+        const skippedNodeFill = '#ffc107'; 
+        const skippedNodeStroke = '#F57F17';
+        const skippedNodeTextColor = '#212121';
+        const errorNodeFill = '#dc3545'; 
+        const errorNodeStroke = '#B71C1C';
+        const interruptNodeFill = '#17a2b8'; 
+        const interruptNodeStroke = '#0D8A9F';
+
+        if (!graph || !graph.nodes || !graph.edges) {
+            return `graph TD\n    empty[<i class='fas fa-drafting-compass icon-placeholder'></i><br/>No Workflow Graph Available<br/><small>Please provide an OpenAPI specification and define a goal to generate a visual workflow.</small>];\n    classDef empty fill:${emptyFill},stroke:${emptyStroke},color:${emptyColor},padding:30px,font-style:italic,text-align:center,rx:12px,ry:12px,font-size:14px,border-width:1px,border-style:dashed;`;
+        }
+        
+        let def = "graph TD;\n";
+        def += `    classDef default fill:${defaultNodeFill},stroke:${defaultNodeStroke},stroke-width:1.5px,color:${defaultNodeTextColor},rx:6px,ry:6px,padding:10px 15px,font-size:13px,font-family:'Inter';\n`; 
+        def += `    classDef startEnd fill:${startEndFill},stroke:${startEndStroke},color:white,font-weight:bold;\n`;
+        def += `    classDef apiNode fill:${apiNodeFill},stroke:${apiNodeStroke},color:white;\n`;
+        def += `    classDef confirmedNode fill:${confirmedNodeFill},stroke:${confirmedNodeStroke},color:white;\n`; 
+        def += `    classDef skippedNode fill:${skippedNodeFill},stroke:${skippedNodeStroke},color:${skippedNodeTextColor};\n`;
+        def += `    classDef errorNode fill:${errorNodeFill},stroke:${errorNodeStroke},color:white;\n`; 
+        def += `    classDef interruptNode fill:${interruptNodeFill},stroke:${interruptNodeStroke},color:white;\n`; 
+
+        const sanitizeId = (id) => String(id).replace(/[^a-zA-Z0-9_]/g, '_');
+
+        graph.nodes.forEach(node => {
+            const id = sanitizeId(node.effective_id || node.operationId);
+            let labelText = node.summary || node.operationId;
+            if (node.summary && node.summary !== node.operationId && node.operationId !== "START_NODE" && node.operationId !== "END_NODE") {
+                labelText = `${escapeHtml(node.summary)}<br/><small>(${escapeHtml(node.operationId)} / ${escapeHtml(node.effective_id)})</small>`;
             } else {
-                console.warn("Graph data is missing 'nodes'/'edges' or 'elements'. Attempting to use graphData directly if it's an array (legacy).", graphData);
-                elementsToRender = Array.isArray(graphData) ? graphData : {nodes: [], edges: []}; // Ensure it's an object for cytoscape
-                if (!Array.isArray(graphData) || graphData.length === 0) {
-                     addMessageToChat('status', 'Graph data is empty or in an unexpected format.', 'graph_status');
-                }
+                labelText = `<b>${escapeHtml(node.operationId)}</b><br/><small>(${escapeHtml(node.effective_id)})</small>`;
             }
             
-            // Ensure elementsToRender is always an object with nodes/edges arrays for Cytoscape
-            if (!elementsToRender || (typeof elementsToRender !== 'object')) {
-                 elementsToRender = {nodes: [], edges: []};
+            def += `    ${id}("${labelText.replace(/"/g, '#quot;')}");\n`; 
+             
+            let nodeClass = 'apiNode'; 
+            if (node.operationId === "START_NODE" || node.operationId === "END_NODE") {
+                nodeClass = 'startEnd';
+            } else if (node.requires_confirmation) { 
+                 nodeClass = 'interruptNode';
             }
-            if (!elementsToRender.nodes) elementsToRender.nodes = [];
-            if (!elementsToRender.edges) elementsToRender.edges = [];
+            def += `    class ${id} ${nodeClass};\n`; 
+        });
 
+        graph.edges.forEach(edge => {
+            const from = sanitizeId(edge.from_node);
+            const to = sanitizeId(edge.to_node);
+            const label = edge.description ? `|"${escapeHtml(edge.description.substring(0, 50)).replace(/"/g, '#quot;')}"|` : "";
+            def += `    ${from} -->${label} ${to};\n`;
+        });
+        return def;
+    }
 
-            const cy = window.cytoscape({
-                container: graphContainer,
-                elements: elementsToRender,
-                style: [
-                    {
-                        selector: 'node',
-                        style: {
-                            'background-color': (ele) => {
-                                const type = ele.data('type');
-                                if (type === 'llm_call') return '#FF69B4'; 
-                                if (type === 'api_call') return '#1E90FF'; 
-                                if (type === 'user_input') return '#FFD700'; 
-                                if (type === 'knowledge_base') return '#32CD32'; 
-                                if (type === 'start_node') return '#90EE90'; 
-                                if (type === 'end_node') return '#FA8072'; 
-                                return '#666'; 
-                            },
-                            'label': 'data(label)',
-                            'width': 'label', 'height': 'label', 'padding': '12px', 
-                            'text-valign': 'center', 'text-halign': 'center',
-                            'shape': 'round-rectangle', 'font-size': '10px', 
-                            'color': '#fff', 'text-outline-width': 1, 'text-outline-color': '#333', 
-                            'border-width': 2, 'border-color': '#4A5568' 
-                        }
-                    },
-                    {
-                        selector: 'edge',
-                        style: {
-                            'width': 2, 'line-color': '#9CA3AF', 
-                            'target-arrow-color': '#9CA3AF', 'target-arrow-shape': 'triangle',
-                            'curve-style': 'bezier', 'label': 'data(label)', 
-                            'font-size': '8px', 'color': '#4A5568',
-                            'text-rotation': 'autorotate', 'text-margin-y': -10
-                        }
-                    },
-                    { 
-                        selector: 'node:selected',
-                        style: { 'border-width': 3, 'border-color': '#F59E0B' }
-                    }
-                ],
-                layout: {
-                    name: 'dagre', rankDir: 'TB', spacingFactor: 1.3, padding: 30
+    async function renderMermaidGraphUI(graphData) {
+        if (typeof mermaid === 'undefined') {
+            mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder error'><i class='fas fa-exclamation-triangle'></i><p>Mermaid.js library not loaded.</p><p>Cannot render graph visualization.</p></div>";
+            return;
+        }
+        
+        const definition = generateMermaidDefinition(graphData);
+
+        if (!graphData) {
+            try {
+                mermaidDagContainer.classList.add('rendering-placeholder');
+                const { svg } = await mermaid.render('mermaidGeneratedSvgPlaceholder', definition);
+                mermaidDagContainer.innerHTML = svg;
+                mermaidDagContainer.classList.remove('rendering-placeholder');
+                const placeholderSvg = mermaidDagContainer.querySelector('svg');
+                if(placeholderSvg) {
+                    placeholderSvg.style.maxWidth = '350px'; 
+                    placeholderSvg.style.maxHeight = '250px';
+                    placeholderSvg.style.margin = 'auto'; 
                 }
-            });
+            } catch (error) {
+                 console.error("Mermaid rendering error for placeholder:", error, "\nDefinition:", definition);
+                 mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder error'><i class='fas fa-exclamation-triangle'></i><p>Error rendering placeholder.</p><p>Check console for details.</p></div>";
+            }
+            return;
+        }
 
-            cy.nodes().forEach(node => {
-                let content = `<strong>ID:</strong> ${node.id()}<br/><strong>Type:</strong> ${node.data('type') || 'N/A'}`;
-                if (node.data('description')) {
-                    content += `<br/><strong>Desc:</strong> ${escapeHtml(node.data('description'))}`;
-                }
-                if(node.data('status')) { 
-                    content += `<br/><strong>Status:</strong> ${node.data('status')}`;
-                }
-                
-                if (typeof tippy === 'function') {
-                    const tippyInstance = tippy(node.popperRef(), { 
-                        content: content, trigger: 'manual', allowHTML: true,
-                        placement: 'top', arrow: true, interactive: true, 
-                        theme: 'light-border', 
-                    });
-                    node.scratch('tippy', tippyInstance); 
-                    
-                    node.on('mouseover', (event) => { const tip = event.target.scratch('tippy'); if(tip) tip.show(); });
-                    node.on('mouseout', (event) => { const tip = event.target.scratch('tippy'); if(tip) tip.hide(); });
-                    node.on('tap', function(event) {
-                        console.log('Clicked node:', event.target.data());
-                        addMessageToChat('status', `Node clicked: ${event.target.data('label') || event.target.id()}`, "node_event");
-                    });
+        mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder loading'><i class='fas fa-spinner fa-spin'></i><p>Rendering graph...</p></div>"; 
+        try {
+            if (graphDagViewContent.offsetParent === null) { 
+                console.warn("Mermaid container is hidden, rendering might be suboptimal. Ensure tab is active.");
+            }
+            const { svg } = await mermaid.render('mermaidGeneratedSvg', definition);
+            mermaidDagContainer.innerHTML = svg;
+            const svgElement = mermaidDagContainer.querySelector('svg');
+            if (svgElement) {
+                svgElement.style.cursor = 'grab';
+            }
 
-                } else if (!window.tippyWarningShown) {
-                    console.warn("Tippy.js not loaded, tooltips will not be available for graph nodes.");
-                    window.tippyWarningShown = true; 
-                }
-            });
-            cy.fit(null, 30); 
-
-        } catch (e) {
-            console.error("Error rendering graph:", e, "Graph data used:", graphData);
-            addMessageToChat('error', "Failed to render workflow graph. Check console.", "graph_error");
-            if (graphContainer) graphContainer.innerHTML = '<p class="text-red-500 p-4">Error rendering graph. Please check the console for details.</p>';
+        } catch (error) {
+            console.error("Mermaid rendering error:", error, "\nDefinition:", definition);
+            mermaidDagContainer.innerHTML = "<div class='mermaid-placeholder error'><i class='fas fa-exclamation-triangle'></i><p>Error rendering DAG.</p><p>Check console for details.</p></div>";
         }
     }
     
-    connectWebSocket();
+    window.hideConfirmationModal = () => { 
+        confirmationModal.style.display = 'none';
+        currentConfirmationContext.graph2ThreadId = null;
+        currentConfirmationContext.confirmationKey = null;
+        currentConfirmationContext.operationId = null;
+        currentConfirmationContext.effectiveNodeId = null;
+        modalPayload.value = ''; 
+    };
+
+    function showConfirmationModal(details, graph2ThreadId) { 
+        if (!details) {
+            console.error("No details provided for confirmation modal.");
+            addMessageToChat('System', 'Error: Missing details for confirmation modal.', 'error', 'system');
+            return;
+        }
+        
+        currentConfirmationContext.graph2ThreadId = graph2ThreadId;
+        currentConfirmationContext.confirmationKey = details.confirmation_key;
+        currentConfirmationContext.operationId = details.operationId;
+        currentConfirmationContext.effectiveNodeId = details.effective_node_id;
+
+        modalTitle.textContent = details.prompt || `Confirm API Call: ${details.operationId}`;
+        modalOperationId.textContent = details.operationId || 'N/A';
+        modalEffectiveNodeId.textContent = details.effective_node_id || 'N/A';
+        modalMethod.textContent = details.method || 'N/A';
+        modalPath.textContent = details.path || 'N/A'; 
+        modalGraph2ThreadId.textContent = graph2ThreadId || 'N/A';
+
+        let payloadToDisplay = "";
+        if (details.payload_to_confirm !== undefined && details.payload_to_confirm !== null) {
+            try {
+                payloadToDisplay = JSON.stringify(details.payload_to_confirm, null, 2);
+            } catch (e) {
+                payloadToDisplay = "Error: Could not format payload.";
+                console.error("Error stringifying payload_to_confirm:", details.payload_to_confirm, e);
+            }
+        }
+        modalPayload.value = payloadToDisplay;
+        confirmationModal.style.display = 'flex';
+    }
+
+    modalConfirmButton.onclick = () => {
+        if (!currentConfirmationContext.graph2ThreadId || !currentConfirmationContext.confirmationKey) {
+            addMessageToChat('System', 'Error: Missing context for confirmation. Cannot send resume command.', 'error', 'system');
+            hideConfirmationModal();
+            return;
+        }
+        let parsedPayload;
+        try {
+            parsedPayload = modalPayload.value.trim() === "" ? {} : JSON.parse(modalPayload.value);
+        } catch (e) {
+            alert('Invalid JSON in payload textarea: ' + e.message);
+            return;
+        }
+        const resumeData = {
+            confirmation_key: currentConfirmationContext.confirmationKey,
+            decision: true,
+            modified_payload: parsedPayload,
+            operationId: currentConfirmationContext.operationId, 
+            effectiveNodeId: currentConfirmationContext.effectiveNodeId
+        };
+        const wsMessage = `resume_exec ${currentConfirmationContext.graph2ThreadId} ${JSON.stringify(resumeData)}`;
+        addMessageToChat(`You (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Confirming: ${currentConfirmationContext.operationId || 'action'}`, 'user', 'user_input');
+        ws.send(wsMessage);
+        addMessageToChat(`System (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Confirmation sent for ${currentConfirmationContext.effectiveNodeId}. Resuming...`, 'status', 'system');
+        hideConfirmationModal();
+        updateSendButtonState(true); 
+    };
+
+    modalCancelButton.onclick = () => {
+        if (!currentConfirmationContext.graph2ThreadId || !currentConfirmationContext.confirmationKey) {
+            addMessageToChat('System', 'Error: Missing context for cancellation.', 'error', 'system');
+            hideConfirmationModal();
+            return;
+        }
+        const resumeData = {
+            confirmation_key: currentConfirmationContext.confirmationKey,
+            decision: false, 
+            operationId: currentConfirmationContext.operationId,
+            effectiveNodeId: currentConfirmationContext.effectiveNodeId
+        };
+        const wsMessage = `resume_exec ${currentConfirmationContext.graph2ThreadId} ${JSON.stringify(resumeData)}`;
+        addMessageToChat(`You (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Cancelling confirmation for: ${currentConfirmationContext.operationId || 'action'}.`, 'user', 'user_input');
+        ws.send(wsMessage);
+        addMessageToChat(`System (to Workflow ${currentConfirmationContext.graph2ThreadId.slice(-4)})`, `Cancellation sent for ${currentConfirmationContext.effectiveNodeId}.`, 'status', 'system');
+        hideConfirmationModal();
+    };
+
+    userInput.addEventListener('input', () => { 
+        userInput.style.height = 'auto';
+        userInput.style.height = (userInput.scrollHeight) + 'px';
+    });
+    userInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendMessage();
+        }
+    });
+    
+    showGraphTab('dag'); 
+    connectWebSocket(); 
 });
